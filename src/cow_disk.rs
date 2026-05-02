@@ -7,9 +7,94 @@
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const SECTOR_SIZE: u64 = 512;
+
+/// Clone `src` to `dst` via filesystem-level CoW (APFS clonefile, Linux
+/// FICLONE) when supported; fall back to a regular byte copy otherwise. On a
+/// reflink-capable filesystem this is metadata-only — sub-millisecond for any
+/// size — which makes per-snapshot overlay capture essentially free.
+fn reflink_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
+    let _ = std::fs::remove_file(dst);
+    if try_reflink(src, dst).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(src, dst).map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn try_reflink(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let src_c = CString::new(src.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let dst_c = CString::new(dst.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let rc = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
+    if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+#[cfg(target_os = "linux")]
+fn try_reflink(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // FICLONE = _IOW(0x94, 9, int); see linux/fs.h.
+    const FICLONE: libc::c_ulong = 0x40049409;
+    let src_f = File::open(src)?;
+    let dst_f = OpenOptions::new().write(true).create(true).truncate(true).open(dst)?;
+    let rc = unsafe { libc::ioctl(dst_f.as_raw_fd(), FICLONE, src_f.as_raw_fd()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        let err = io::Error::last_os_error();
+        let _ = std::fs::remove_file(dst);
+        Err(err)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn try_reflink(_src: &Path, _dst: &Path) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "reflink not supported on this OS"))
+}
+
+/// Sidecar file holding the dirty sector list. Written next to the overlay
+/// (e.g. `foo.overlay.dirty`). Format: binary, `u64` little-endian count
+/// followed by that many `u64` sector LBAs, also LE. Compact enough that
+/// flushing it on shutdown or on a periodic schedule is cheap.
+fn dirty_sidecar_path(overlay_path: &str) -> PathBuf {
+    PathBuf::from(format!("{}.dirty", overlay_path))
+}
+
+fn load_dirty_sidecar(path: &Path) -> io::Result<HashSet<u64>> {
+    if !path.exists() { return Ok(HashSet::new()); }
+    let mut f = File::open(path)?;
+    let mut count_buf = [0u8; 8];
+    if f.read_exact(&mut count_buf).is_err() { return Ok(HashSet::new()); }
+    let count = u64::from_le_bytes(count_buf) as usize;
+    let mut set = HashSet::with_capacity(count);
+    let mut buf = [0u8; 8];
+    for _ in 0..count {
+        if f.read_exact(&mut buf).is_err() { break; }
+        set.insert(u64::from_le_bytes(buf));
+    }
+    Ok(set)
+}
+
+fn save_dirty_sidecar(path: &Path, dirty: &HashSet<u64>) -> io::Result<()> {
+    // Write atomically: write to a temp file then rename.
+    let tmp = path.with_extension("dirty.tmp");
+    {
+        let mut f = File::create(&tmp)?;
+        let count = dirty.len() as u64;
+        f.write_all(&count.to_le_bytes())?;
+        for &s in dirty {
+            f.write_all(&s.to_le_bytes())?;
+        }
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
 
 pub struct CowDisk {
     base: File,
@@ -33,16 +118,23 @@ impl CowDisk {
             .create(true)
             .open(overlay_path)?;
 
-        // Rebuild the dirty set from the overlay file size.
-        // The overlay is a sparse file with the same layout as the base.
-        // Any sector that has been written occupies space, but we can't easily
-        // detect sparse holes portably. Instead, track dirty sectors in memory
-        // and accept that a fresh start after crash loses the dirty set
-        // (overlay is deleted on state load anyway).
-        let dirty = HashSet::new();
+        // Recover the dirty set from our sidecar file (written on flush /
+        // shutdown by previous runs). If the sidecar is missing we start
+        // empty — any prior writes in the overlay file are effectively
+        // invisible until the sidecar gets written. This is deliberate:
+        // "dirty" means "the host finished writing this sector," not "the
+        // file has some bytes here" (sparse allocation can contain partial
+        // writes from an interrupted run, which can't be trusted).
+        let sidecar = dirty_sidecar_path(overlay_path);
+        let dirty = load_dirty_sidecar(&sidecar).unwrap_or_default();
 
-        eprintln!("iris: COW overlay active (base: {}, overlay: {})", base_path, overlay_path);
-        eprintln!("iris: to reset disk to clean state, delete {}", overlay_path);
+        eprintln!("iris: COW overlay active (base: {}, overlay: {}, dirty sectors: {})",
+                  base_path, overlay_path, dirty.len());
+        if dirty.is_empty() && std::fs::metadata(overlay_path).map(|m| m.len()).unwrap_or(0) > 0 {
+            eprintln!("iris: note: overlay file has data but no .dirty sidecar — prior writes are not in use");
+        }
+        eprintln!("iris: to reset disk to clean state, delete {} and {}",
+                  overlay_path, sidecar.display());
 
         Ok(Self {
             base,
@@ -153,7 +245,18 @@ impl CowDisk {
         self.dirty.clear();
         self.overlay.set_len(0)?;
         self.overlay.seek(SeekFrom::Start(0))?;
+        // Also clear the sidecar so we don't "remember" sectors that no
+        // longer exist after the truncation.
+        let _ = std::fs::remove_file(dirty_sidecar_path(&self.overlay_path));
         Ok(())
+    }
+
+    /// Flush the overlay file's data and persist the dirty sector set to
+    /// the sidecar. Call this on clean shutdown or before snapshot save so
+    /// a subsequent run can read back what we wrote.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.overlay.sync_all()?;
+        save_dirty_sidecar(&dirty_sidecar_path(&self.overlay_path), &self.dirty)
     }
 
     /// Number of dirty sectors in the overlay.
@@ -166,7 +269,7 @@ impl CowDisk {
     /// state — base + overlay — is captured consistently with RAM.
     pub fn export_overlay(&mut self, dest: &Path) -> io::Result<Vec<u64>> {
         self.overlay.sync_all()?;
-        std::fs::copy(&self.overlay_path, dest)?;
+        reflink_or_copy(Path::new(&self.overlay_path), dest)?;
         let mut dirty: Vec<u64> = self.dirty.iter().copied().collect();
         dirty.sort_unstable();
         Ok(dirty)
@@ -178,7 +281,7 @@ impl CowDisk {
     /// handles old snapshots without overlay data).
     pub fn import_overlay(&mut self, source: &Path, dirty: Vec<u64>) -> io::Result<()> {
         if source.exists() {
-            std::fs::copy(source, &self.overlay_path)?;
+            reflink_or_copy(source, Path::new(&self.overlay_path))?;
         } else {
             // Clear the overlay: nothing saved for this device.
             std::fs::File::create(&self.overlay_path)?;
@@ -192,5 +295,57 @@ impl CowDisk {
             .open(&self.overlay_path)?;
         self.dirty = dirty.into_iter().collect();
         Ok(())
+    }
+}
+
+impl Drop for CowDisk {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush() {
+            eprintln!("iris: COW flush on drop failed for {}: {} (writes may be lost)",
+                      self.overlay_path, e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn unique_tmp(tag: &str, ext: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("iris-cow-{}-{}.{}", tag, nanos, ext))
+    }
+
+    #[test]
+    fn reflink_or_copy_preserves_bytes() {
+        let src = unique_tmp("reflink-src", "bin");
+        let dst = unique_tmp("reflink-dst", "bin");
+        let payload: Vec<u8> = (0u8..=255).cycle().take(64 * 1024 + 17).collect();
+        {
+            let mut f = File::create(&src).unwrap();
+            f.write_all(&payload).unwrap();
+            f.sync_all().unwrap();
+        }
+        reflink_or_copy(&src, &dst).expect("reflink_or_copy");
+        let read_back = std::fs::read(&dst).unwrap();
+        assert_eq!(read_back, payload);
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn reflink_or_copy_overwrites_existing_dst() {
+        let src = unique_tmp("reflink-src2", "bin");
+        let dst = unique_tmp("reflink-dst2", "bin");
+        std::fs::write(&src, b"new content").unwrap();
+        std::fs::write(&dst, b"old content that is longer than the new one").unwrap();
+        reflink_or_copy(&src, &dst).expect("overwrite");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new content");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
     }
 }

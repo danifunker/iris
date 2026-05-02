@@ -1,0 +1,15 @@
+name: restore-smoke
+# Loads the snapshot you captured interactively and verifies the guest is
+# alive: send a CR and wait for an echo. Works regardless of whether the
+# snapshot is in PROM, the maintenance menu, or an IRIX shell — any of
+# them will echo a newline or re-display their prompt.
+snapshot: working2
+
+steps:
+  - type: sleep
+    seconds: 1
+
+  - type: serial
+    send: "\r"
+    expect: "\n"
+    timeout: 10

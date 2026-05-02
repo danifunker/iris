@@ -630,6 +630,16 @@ impl Tlb for MipsTlb {
                 self.vmap_fill(i);
             }
         }
+        // Reset MRU lists to canonical post-power-on order. Without this, two
+        // restores of the same snapshot can have different `tlbwr` victims if
+        // the prior session's MRU history leaks in.
+        for list in 0..MRU_LISTS {
+            self.mru_head[list] = 0;
+            for i in 0..TLB_NUM_ENTRIES - 1 {
+                self.mru_next[list][i] = (i + 1) as u8;
+            }
+            self.mru_next[list][TLB_NUM_ENTRIES - 1] = MRU_NONE;
+        }
         Ok(())
     }
 

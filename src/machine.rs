@@ -31,7 +31,7 @@ use crate::hpc3::Hpc3;
 use crate::ioc::Ioc;
 use crate::monitor::Monitor;
 use crate::rex3::Rex3;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION};
 use crate::hptimer::TimerManager;
 
 pub fn emulator_name() -> &'static str {
@@ -555,6 +555,12 @@ impl Machine {
         let snap = Snapshot::new(&dir);
         snap.ensure_dir().map_err(|e| e.to_string())?;
 
+        // Write the manifest first so `read_manifest` succeeds even if a later
+        // step crashes — the partial snapshot is at least diagnosable.
+        let mut manifest = Manifest::for_current_save();
+        manifest.parent = self.last_restore.clone();
+        snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
+
         // CPU + TLB
         let cpu_toml = self.cpu.save_state();
         snap.write_toml("cpu.toml", &cpu_toml).map_err(|e| e.to_string())?;
@@ -636,6 +642,13 @@ impl Machine {
     }
 
     /// Restore full machine snapshot from `saves/<name>/`.
+    ///
+    /// JIT-cache invariant: `self.stop()` exits the CPU thread, which drops
+    /// the `CodeCache` owned by `run_jit_dispatch`. The new thread spawned
+    /// by `self.cpu.start()` at the end builds a fresh cache. So no explicit
+    /// invalidation is needed here as long as that ownership pattern holds.
+    /// The persistent JIT profile uses content_hash to skip stale entries
+    /// (see `profile_stale` in dispatch.rs).
     pub fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
         self.stop();
 
@@ -644,6 +657,37 @@ impl Machine {
 
         let dir = std::path::PathBuf::from("saves").join(name);
         let snap = Snapshot::new(&dir);
+
+        // Validate the manifest before reading anything else. Legacy snapshots
+        // (no snapshot.toml) are accepted with a warning. Cross-arch loads are
+        // refused — FPU bit-layout differs between aarch64 and x86_64 and we
+        // don't have migration plumbing yet.
+        match snap.read_manifest()? {
+            Some(m) => {
+                if m.host_arch != std::env::consts::ARCH {
+                    return Err(format!(
+                        "snapshot host_arch '{}' does not match current host '{}'; cross-arch load is not supported",
+                        m.host_arch, std::env::consts::ARCH
+                    ));
+                }
+                if m.schema_version > SCHEMA_VERSION {
+                    return Err(format!(
+                        "snapshot schema_version {} is newer than this iris build supports ({})",
+                        m.schema_version, SCHEMA_VERSION
+                    ));
+                }
+                if let Some(rev) = &m.iris_git_rev {
+                    if let Some(my_rev) = option_env!("IRIS_GIT_REV") {
+                        if rev != my_rev {
+                            eprintln!("load_snapshot: snapshot was captured at iris {} but current build is {}", rev, my_rev);
+                        }
+                    }
+                }
+            }
+            None => {
+                eprintln!("load_snapshot: no snapshot.toml in {} — treating as legacy v0 (no manifest)", dir.display());
+            }
+        }
 
         // CPU + TLB
         let cpu_toml = snap.read_toml("cpu.toml").map_err(|e| e.to_string())?;

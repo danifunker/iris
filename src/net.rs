@@ -1057,26 +1057,39 @@ impl NatEngine {
 
     // ── NFS destination remapping ─────────────────────────────────────────────
     //
-    // IRIX talks to 192.168.0.1 on VM-visible NFS/mountd ports.  Rewrite the
-    // destination to 127.0.0.1 on the high host-side ports where unfsd listens.
+    // Rewrite guest outbound destination to a host-reachable address.
+    //
+    // IRIX sees the gateway at 192.168.0.1 but that's a virtual address iris
+    // doesn't actually bind to, so unmodified TcpStream::connect() fails. We
+    // rewrite any gateway-destined packet to 127.0.0.1. NFS ports additionally
+    // shift to the high host ports where unfsd listens.
     fn nfs_remap_dst(&self, dst_ip: Ipv4Addr, dport: u16) -> (Ipv4Addr, u16) {
-        let Some(nfs) = &self.config.nfs else { return (dst_ip, dport); };
         if dst_ip != self.config.gateway_ip { return (dst_ip, dport); }
-        match dport {
-            NFS_VM_PORT    => (Ipv4Addr::LOCALHOST, nfs.nfs_host_port),
-            MOUNTD_VM_PORT => (Ipv4Addr::LOCALHOST, nfs.mountd_host_port),
-            _              => (dst_ip, dport),
+        if let Some(nfs) = &self.config.nfs {
+            match dport {
+                NFS_VM_PORT    => return (Ipv4Addr::LOCALHOST, nfs.nfs_host_port),
+                MOUNTD_VM_PORT => return (Ipv4Addr::LOCALHOST, nfs.mountd_host_port),
+                _ => {}
+            }
         }
+        // Generic outbound: guest→gateway becomes guest→host loopback on
+        // the same port. Lets the guest reach any service the host is
+        // running on 127.0.0.1:<dport> (pyftpdlib on 2121, python -m
+        // http.server, etc.).
+        (Ipv4Addr::LOCALHOST, dport)
     }
 
-    // Reverse: translate (127.0.0.1, host_port) back to (192.168.0.1, vm_port)
-    // so replies to IRIX appear to come from the gateway on the standard NFS ports.
+    // Reverse: translate (127.0.0.1, host_port) back to the address the guest
+    // dialed, so replies look like they came from the gateway.
     fn nfs_unmap_src(&self, src_ip: Ipv4Addr, sport: u16) -> (Ipv4Addr, u16) {
-        let Some(nfs) = &self.config.nfs else { return (src_ip, sport); };
         if src_ip != Ipv4Addr::LOCALHOST { return (src_ip, sport); }
-        if sport == nfs.nfs_host_port    { return (self.config.gateway_ip, NFS_VM_PORT);    }
-        if sport == nfs.mountd_host_port { return (self.config.gateway_ip, MOUNTD_VM_PORT); }
-        (src_ip, sport)
+        if let Some(nfs) = &self.config.nfs {
+            if sport == nfs.nfs_host_port    { return (self.config.gateway_ip, NFS_VM_PORT);    }
+            if sport == nfs.mountd_host_port { return (self.config.gateway_ip, MOUNTD_VM_PORT); }
+        }
+        // Generic outbound: reply from host-side dport becomes gateway:dport
+        // to the guest.
+        (self.config.gateway_ip, sport)
     }
 
     // ── Portmap (port 111) — tiny inline RPC GETPORT responder ───────────────

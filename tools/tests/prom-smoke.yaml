@@ -1,0 +1,11 @@
+name: prom-smoke
+# Minimal sanity: cold-boot into PROM, wait for any banner output.
+# No snapshot — start the CPU fresh. Use --no-restore with iris-test.
+
+steps:
+  - type: sleep
+    seconds: 1
+
+  - type: serial
+    expect: "SGI"
+    timeout: 60

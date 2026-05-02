@@ -16,8 +16,100 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use toml::Value;
 
+/// On-disk schema version for the snapshot directory layout. Bumped when a
+/// device's save_state format changes incompatibly. Old snapshots without a
+/// manifest are treated as v0 (legacy, best-effort load).
+pub const SCHEMA_VERSION: u32 = 1;
+
+const MANIFEST_FILE: &str = "snapshot.toml";
+
 pub struct Snapshot {
     pub dir: PathBuf,
+}
+
+/// Top-level snapshot manifest. Lives at `saves/<name>/snapshot.toml`. Written
+/// first on save and read first on load so the rest of the pipeline can fail
+/// fast with a clear error before reading half a snapshot.
+#[derive(Debug, Clone)]
+pub struct Manifest {
+    pub schema_version: u32,
+    pub iris_git_rev: Option<String>,
+    pub host_arch: String,
+    pub created_at_unix: u64,
+    pub parent: Option<String>,
+    pub description: Option<String>,
+    pub installed_bundles: Vec<String>,
+}
+
+impl Manifest {
+    /// Build a manifest describing the current build/host, with no parent or
+    /// description. Caller can mutate fields before writing.
+    pub fn for_current_save() -> Self {
+        let created_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            schema_version: SCHEMA_VERSION,
+            iris_git_rev: option_env!("IRIS_GIT_REV").map(String::from),
+            host_arch: std::env::consts::ARCH.to_string(),
+            created_at_unix,
+            parent: None,
+            description: None,
+            installed_bundles: Vec::new(),
+        }
+    }
+
+    pub fn to_toml(&self) -> Value {
+        let mut tbl = toml::map::Map::new();
+        tbl.insert("schema_version".into(), Value::Integer(self.schema_version as i64));
+        if let Some(rev) = &self.iris_git_rev {
+            tbl.insert("iris_git_rev".into(), Value::String(rev.clone()));
+        }
+        tbl.insert("host_arch".into(), Value::String(self.host_arch.clone()));
+        tbl.insert("created_at_unix".into(), Value::Integer(self.created_at_unix as i64));
+        if let Some(parent) = &self.parent {
+            tbl.insert("parent".into(), Value::String(parent.clone()));
+        }
+        if let Some(d) = &self.description {
+            tbl.insert("description".into(), Value::String(d.clone()));
+        }
+        let bundles: Vec<Value> = self.installed_bundles.iter()
+            .map(|s| Value::String(s.clone())).collect();
+        tbl.insert("installed_bundles".into(), Value::Array(bundles));
+        Value::Table(tbl)
+    }
+
+    pub fn from_toml(v: &Value) -> Result<Self, String> {
+        let tbl = v.as_table().ok_or("manifest: not a table")?;
+        let schema_version = tbl.get("schema_version")
+            .and_then(|x| x.as_integer())
+            .ok_or("manifest: missing schema_version")? as u32;
+        let host_arch = tbl.get("host_arch")
+            .and_then(|x| x.as_str())
+            .ok_or("manifest: missing host_arch")?
+            .to_string();
+        let created_at_unix = tbl.get("created_at_unix")
+            .and_then(|x| x.as_integer())
+            .map(|i| i as u64)
+            .unwrap_or(0);
+        let iris_git_rev = tbl.get("iris_git_rev").and_then(|x| x.as_str()).map(String::from);
+        let parent = tbl.get("parent").and_then(|x| x.as_str()).map(String::from);
+        let description = tbl.get("description").and_then(|x| x.as_str()).map(String::from);
+        let installed_bundles = tbl.get("installed_bundles")
+            .and_then(|x| x.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        Ok(Self {
+            schema_version,
+            iris_git_rev,
+            host_arch,
+            created_at_unix,
+            parent,
+            description,
+            installed_bundles,
+        })
+    }
 }
 
 impl Snapshot {
@@ -58,6 +150,22 @@ impl Snapshot {
 
     pub fn ensure_dir(&self) -> std::io::Result<()> {
         fs::create_dir_all(&self.dir)
+    }
+
+    /// Write the manifest to `snapshot.toml`. Always called first on save.
+    pub fn write_manifest(&self, m: &Manifest) -> std::io::Result<()> {
+        self.write_toml(MANIFEST_FILE, &m.to_toml())
+    }
+
+    /// Read the manifest. Returns `Ok(None)` if `snapshot.toml` is absent
+    /// (legacy snapshots taken before this format was introduced).
+    pub fn read_manifest(&self) -> Result<Option<Manifest>, String> {
+        let path = self.dir.join(MANIFEST_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let v = self.read_toml(MANIFEST_FILE).map_err(|e| e.to_string())?;
+        Manifest::from_toml(&v).map(Some)
     }
 }
 
@@ -181,4 +289,98 @@ pub fn load_u8_slice(v: &Value, dst: &mut [u8]) {
 /// Get a field from a TOML table by key.
 pub fn get_field<'a>(table: &'a Value, key: &str) -> Option<&'a Value> {
     table.as_table()?.get(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!("iris-snap-test-{}-{}", tag, nanos));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn manifest_round_trip_full() {
+        let m = Manifest {
+            schema_version: 1,
+            iris_git_rev: Some("abc123".into()),
+            host_arch: "aarch64".into(),
+            created_at_unix: 1_700_000_000,
+            parent: Some("base/desktop".into()),
+            description: Some("post mogrix install".into()),
+            installed_bundles: vec!["grep-2.5.4".into(), "sed-4.2.2".into()],
+        };
+        let v = m.to_toml();
+        let m2 = Manifest::from_toml(&v).expect("parse");
+        assert_eq!(m2.schema_version, m.schema_version);
+        assert_eq!(m2.iris_git_rev, m.iris_git_rev);
+        assert_eq!(m2.host_arch, m.host_arch);
+        assert_eq!(m2.created_at_unix, m.created_at_unix);
+        assert_eq!(m2.parent, m.parent);
+        assert_eq!(m2.description, m.description);
+        assert_eq!(m2.installed_bundles, m.installed_bundles);
+    }
+
+    #[test]
+    fn manifest_round_trip_minimal() {
+        let m = Manifest {
+            schema_version: 1,
+            iris_git_rev: None,
+            host_arch: "x86_64".into(),
+            created_at_unix: 0,
+            parent: None,
+            description: None,
+            installed_bundles: vec![],
+        };
+        let v = m.to_toml();
+        let m2 = Manifest::from_toml(&v).expect("parse");
+        assert!(m2.iris_git_rev.is_none());
+        assert!(m2.parent.is_none());
+        assert!(m2.description.is_none());
+        assert!(m2.installed_bundles.is_empty());
+    }
+
+    #[test]
+    fn manifest_rejects_missing_schema_version() {
+        let mut tbl = toml::map::Map::new();
+        tbl.insert("host_arch".into(), Value::String("aarch64".into()));
+        let v = Value::Table(tbl);
+        assert!(Manifest::from_toml(&v).is_err());
+    }
+
+    #[test]
+    fn manifest_disk_round_trip() {
+        let dir = unique_tmp_dir("manifest");
+        let snap = Snapshot::new(&dir);
+        let m = Manifest::for_current_save();
+        snap.write_manifest(&m).expect("write");
+        let loaded = snap.read_manifest().expect("read").expect("present");
+        assert_eq!(loaded.schema_version, SCHEMA_VERSION);
+        assert_eq!(loaded.host_arch, std::env::consts::ARCH);
+        // cleanup
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manifest_absent_returns_none() {
+        let dir = unique_tmp_dir("missing");
+        let snap = Snapshot::new(&dir);
+        let loaded = snap.read_manifest().expect("read");
+        assert!(loaded.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn for_current_save_uses_runtime_arch() {
+        let m = Manifest::for_current_save();
+        assert_eq!(m.schema_version, SCHEMA_VERSION);
+        assert_eq!(m.host_arch, std::env::consts::ARCH);
+        assert!(m.parent.is_none());
+    }
 }

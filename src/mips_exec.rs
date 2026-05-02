@@ -5951,7 +5951,16 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Saveable for MipsCp
             ($f:ident) => { cp0.insert(stringify!($f).into(), hex_u64(c.$f)); }
         }
         cp0u32!(cp0_index); cp0u32!(cp0_random); cp0u32!(cp0_wired);
-        cp0u64!(cp0_count); cp0u64!(cp0_compare); cp0u32!(cp0_status); cp0u32!(cp0_cause);
+        cp0u64!(cp0_count); cp0u64!(cp0_compare);
+        // Timer calibration state. Without these, restore loses the kernel's
+        // learned tick rate and runs at the default count_step until IRIX
+        // touches Compare again — guest scheduler drifts noticeably for the
+        // first few seconds after every restore. compare_last_cycles and
+        // compare_last_instant are intentionally not saved: they're host-wall
+        // anchors, not calibrated state, and must be reset on load.
+        cp0u64!(count_step); cp0u64!(compare_delta_prev);
+        cp0u64!(compare_delta_slow); cp0u64!(compare_delta_fast);
+        cp0u32!(cp0_status); cp0u32!(cp0_cause);
         cp0u32!(cp0_prid); cp0u32!(cp0_config); cp0u32!(cp0_lladdr);
         cp0u32!(cp0_watchlo); cp0u32!(cp0_watchhi); cp0u32!(cp0_ecc); cp0u32!(cp0_cacheerr);
         cp0u32!(cp0_taglo); cp0u32!(cp0_taghi);
@@ -6005,6 +6014,19 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Saveable for MipsCp
             }}
             ld32!(cp0_index); ld32!(cp0_random); ld32!(cp0_wired);
             ld64!(cp0_count); ld64!(cp0_compare);
+            ld64!(count_step); ld64!(compare_delta_prev);
+            ld64!(compare_delta_slow); ld64!(compare_delta_fast);
+            // Mirror count_step into its atomic shadow (read by the display
+            // thread) so the live UI matches the restored core state.
+            c.count_step_atomic.store(c.count_step, std::sync::atomic::Ordering::Relaxed);
+            // Re-anchor the host-wall calibration timer. Setting cycles to 0
+            // forces the next CP0 Compare write to take the "first write"
+            // path (no calibration), which is what we want — dt_ns measured
+            // against an Instant from the previous run would be garbage. The
+            // saved count_step keeps the rate steady until calibration catches
+            // up over the next few Compare writes.
+            c.compare_last_cycles = 0;
+            c.compare_last_instant = std::time::Instant::now();
             ld32!(cp0_status); ld32!(cp0_cause); ld32!(cp0_prid);
             ld32!(cp0_config); ld32!(cp0_lladdr); ld32!(cp0_watchlo); ld32!(cp0_watchhi);
             ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld32!(cp0_taglo); ld32!(cp0_taghi);

@@ -80,9 +80,13 @@ pub struct MipsCore {
     /// Shared with the display refresh thread for status bar display.
     pub count_step_atomic: Arc<AtomicU64>,
     /// Cycle count when cp0_compare was last written (0 = never written yet).
-    compare_last_cycles: u64,
-    /// Wall-clock instant when cp0_compare was last written.
-    compare_last_instant: std::time::Instant,
+    /// `pub(crate)` so snapshot load in `mips_exec.rs` can re-anchor the
+    /// calibration after restoring CP0 fields.
+    pub(crate) compare_last_cycles: u64,
+    /// Wall-clock instant when cp0_compare was last written. Reset to
+    /// `Instant::now()` on snapshot load — Instants from a previous run are
+    /// meaningless across a restore.
+    pub(crate) compare_last_instant: std::time::Instant,
     /// Frequency map of CP0 Compare delta values (hardware counts, rounded to nearest 100).
     /// Key = `(delta >> 16) / 100 * 100`, value = number of occurrences.
     #[cfg(feature = "developer_ip7")]

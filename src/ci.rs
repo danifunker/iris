@@ -181,6 +181,7 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "ping" => Response::ok(),
         "quit" => cmd_quit(),
         "start" => cmd_start(server),
+        "save" => cmd_save(server, &req.args),
         "restore" => cmd_restore(server, &req.args),
         "rollback" => cmd_rollback(server),
         "serial-send" => cmd_serial_send(server, &req.args),
@@ -206,6 +207,17 @@ fn cmd_quit() -> Response {
 fn cmd_start(server: &CiServer) -> Response {
     server.with_machine(|m| m.cpu_start());
     Response::ok()
+}
+
+fn cmd_save(server: &CiServer, args: &Value) -> Response {
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return Response::err("save: missing 'name' arg"),
+    };
+    match server.with_machine(|m| m.save_snapshot(&name)) {
+        Ok(()) => Response::ok(),
+        Err(e) => Response::err(format!("save failed: {}", e)),
+    }
 }
 
 fn cmd_restore(server: &CiServer, args: &Value) -> Response {

@@ -1,0 +1,17 @@
+name: screenshot-smoke
+# Restores the IRIX snapshot and captures a screenshot. Verifies that:
+#   1. restore succeeded (snapshot machinery works end-to-end including overlay)
+#   2. REX3 is alive and rendering in --ci mode (no --headless)
+#   3. The framebuffer has plausible content (file size sanity check)
+#
+# This is the "GUI mode smoke" — doesn't rely on serial console output.
+snapshot: working3
+
+steps:
+  # Give REX3's refresh thread a beat to composite a frame after restore.
+  - type: sleep
+    seconds: 2
+
+  - type: screenshot
+    path: /tmp/iris-screenshot.png
+    min_bytes: 10240
