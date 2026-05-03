@@ -1332,4 +1332,48 @@ mod tests {
         // Read back via BusDevice
         { let _r = mc.read32(MC_BASE + REG_CPUCTRL0); assert!(_r.is_ok(), "Failed to read CPUCTRL0"); assert_eq!(_r.data, val); }
     }
+
+    /// Phase 1.7 round-trip: a fresh MC loaded from a captured save_state must
+    /// re-serialize byte-identically. Catches load_state forgetting a field
+    /// (regs, semaphores, GIO DMA registers) that save_state writes.
+    #[test]
+    fn save_load_round_trip() {
+        let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
+        let src = MemoryController::new(eeprom.clone(), true, [128, 128, 0, 0]);
+
+        // Mutate registers and DMA state so we're not testing all-default state.
+        let _ = src.write32(MC_BASE + REG_CPUCTRL0, 0xdead_beef);
+        {
+            let mut s = src.state.lock();
+            s.sys_semaphore = true;
+            s.user_semaphores[0] = true;
+            s.user_semaphores[7] = true;
+            s.user_semaphores[15] = true;
+        }
+        {
+            let mut d = src.giodma.state.lock();
+            d.gio_mask = 0x0000_00ff;
+            d.gio_sub  = 0x0000_0001;
+            d.cause    = 0x0000_0010;
+            d.ctl      = 0x4000_0000;
+            d.memadr   = 0x0800_0000;
+            d.size     = 0x0000_1000;
+            d.stride   = 0x0000_0040;
+            d.gio_adr  = 0x1f00_0000;
+            d.mode     = 0x0000_0007;
+            d.count    = 0x0000_0040;
+            d.run      = 0x0000_0001;
+            d.stdma    = 0x0000_0002;
+            d.tlb_hi[0] = 0xa5a5_a5a5;
+            d.tlb_lo[1] = 0x5a5a_5a5a;
+            d.run_real = true;
+        }
+        let v1 = src.save_state();
+
+        let dst = MemoryController::new(eeprom, true, [128, 128, 0, 0]);
+        dst.load_state(&v1).expect("load_state");
+        let v2 = dst.save_state();
+
+        assert_eq!(v1, v2, "MemoryController save_state mismatch after load_state round-trip");
+    }
 }

@@ -387,4 +387,25 @@ mod tests {
 
         assert_eq!(data, 0xABCD);
     }
+
+    /// Phase 1.7 round-trip: a fresh Eeprom loaded from a captured save_state
+    /// must re-serialize byte-identically. Catches load_state_mut forgetting a
+    /// field that save_state writes.
+    #[test]
+    fn save_load_round_trip() {
+        // Mutate a few words so we're not testing the all-default 0xFFFF value.
+        let mut src = Eeprom93c56::new();
+        src.write_enable = true;
+        src.data[0]   = 0xdead;
+        src.data[42]  = 0xbeef;
+        src.data[64]  = 0x1234;
+        src.data[127] = 0xcafe;
+        let v1 = src.save_state_owned();
+
+        let mut dst = Eeprom93c56::new();
+        dst.load_state_mut(&v1).expect("load_state_mut");
+        let v2 = dst.save_state_owned();
+
+        assert_eq!(v1, v2, "EEPROM save_state mismatch after load_state round-trip");
+    }
 }

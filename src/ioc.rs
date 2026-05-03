@@ -691,3 +691,41 @@ impl Saveable for Ioc {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase 1.7 round-trip: a fresh IOC loaded from a captured save_state must
+    /// re-serialize byte-identically. Catches load_state forgetting any of the
+    /// 16 register fields that save_state writes.
+    #[test]
+    fn save_load_round_trip() {
+        // new_ci uses null serial backends — avoids TCP port binding under
+        // concurrent test runs.
+        let src = Ioc::new_ci(true);
+        {
+            let mut s = src.state.lock();
+            s.l0_stat   = 0x12; s.l0_mask  = 0x34;
+            s.l1_stat   = 0x56; s.l1_mask  = 0x78;
+            s.map_stat  = 0x9a; s.map_mask0 = 0xbc; s.map_mask1 = 0xde;
+            s.map_pol   = 0xf0; s.err_stat = 0x01;
+            s.gc_select = 0x0f; s.gen_cntl = 0xa5; s.panel = 0x5a;
+            s.read_reg  = 0xff; s.dma_sel  = 0x33;
+            s.reset_reg = 0x77; s.write_reg = 0xee;
+            // load_state re-runs update_interrupts, so the saved snapshot must
+            // already reflect the cascade-derived bits (MAP_INT0/MAP_INT1) for
+            // v1 to round-trip cleanly. In a real save these are always
+            // up-to-date because the bus driver runs update_interrupts on
+            // every register write.
+            s.update_interrupts();
+        }
+        let v1 = src.save_state();
+
+        let dst = Ioc::new_ci(true);
+        dst.load_state(&v1).expect("load_state");
+        let v2 = dst.save_state();
+
+        assert_eq!(v1, v2, "Ioc save_state mismatch after load_state round-trip");
+    }
+}

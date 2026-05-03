@@ -394,3 +394,39 @@ impl Saveable for Ds1x86 {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase 1.7 round-trip: a fresh RTC loaded from a captured save_state must
+    /// re-serialize byte-identically. Save_state flushes the live host clock
+    /// into regs when TE is set, so we clear TE first to make the test stable.
+    #[test]
+    fn save_load_round_trip() {
+        let src = Ds1x86::new(8192);
+        // Disable transfer-enable so save_state doesn't tick the clock between
+        // calls; mutate a few NVRAM bytes outside the time-keeping registers.
+        {
+            let mut d = src.data.lock();
+            d.regs[CMD_REG_OFFSET] &= !TE_BIT;
+            d.regs[64]   = 0xa5;
+            d.regs[1024] = 0x5a;
+            d.regs[8190] = 0xff;
+        }
+        let v1 = src.save_state();
+
+        let dst = Ds1x86::new(8192);
+        dst.load_state(&v1).expect("load_state");
+        // Same: clear TE on dst before re-serializing so its save_state path
+        // matches src's behavior. (load_state preserves the TE bit from v1, so
+        // it should already be cleared, but be defensive.)
+        {
+            let mut d = dst.data.lock();
+            d.regs[CMD_REG_OFFSET] &= !TE_BIT;
+        }
+        let v2 = dst.save_state();
+
+        assert_eq!(v1, v2, "Ds1x86 save_state mismatch after load_state round-trip");
+    }
+}

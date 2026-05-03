@@ -985,3 +985,40 @@ impl SerialBackend for CiSerialBackend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase 1.7 round-trip: a fresh SCC loaded from a captured save_state must
+    /// re-serialize byte-identically. Use new_null so the test doesn't bind any
+    /// TCP ports.
+    #[test]
+    fn save_load_round_trip() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_a.0.lock();
+            ch.regs[0]  = 0x44;
+            ch.regs[1]  = 0x12;
+            ch.regs[3]  = 0xc1;
+            ch.regs[5]  = 0xea;
+            ch.reg_ptr  = 7;
+            ch.status   = 0x40;
+        }
+        {
+            let mut ch = src.channel_b.0.lock();
+            ch.regs[0]  = 0x88;
+            ch.regs[2]  = 0x10;
+            ch.regs[15] = 0x05;
+            ch.reg_ptr  = 3;
+            ch.status   = 0x80;
+        }
+        let v1 = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&v1).expect("load_state");
+        let v2 = dst.save_state();
+
+        assert_eq!(v1, v2, "Z85c30 save_state mismatch after load_state round-trip");
+    }
+}

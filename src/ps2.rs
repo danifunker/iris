@@ -910,6 +910,42 @@ impl Saveable for Ps2Controller {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase 1.7 round-trip: a fresh PS/2 controller loaded from a captured
+    /// save_state must re-serialize byte-identically. Mutates rx_queue,
+    /// command_state, and assorted flag/byte fields so the test exercises every
+    /// branch of load_state.
+    #[test]
+    fn save_load_round_trip() {
+        let src = Ps2Controller::new(None);
+        {
+            let mut s = src.state.lock();
+            s.rx_queue.push_back((0xfa, Ps2Source::Keyboard));
+            s.rx_queue.push_back((0x42, Ps2Source::Mouse));
+            s.rx_queue.push_back((0xee, Ps2Source::MouseCmd));
+            s.mouse_queue_bytes = 1;
+            s.next_write_is_mouse = true;
+            s.led_state = 0x07;
+            s.scancode_set = 1;
+            s.config = 0x65;
+            s.command_state = CommandState::SetTypematic;
+            s.scanning_enabled = true;
+            s.mouse_enabled = true;
+            s.last_read = 0x12;
+        }
+        let v1 = src.save_state();
+
+        let dst = Ps2Controller::new(None);
+        dst.load_state(&v1).expect("load_state");
+        let v2 = dst.save_state();
+
+        assert_eq!(v1, v2, "Ps2Controller save_state mismatch after load_state round-trip");
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum ScancodeSet1 {

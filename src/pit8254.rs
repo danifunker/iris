@@ -593,6 +593,25 @@ mod tests {
         assert!(delta < 1000,
             "count={} expected ~{} (delta={})", count, expected, delta);
     }
+
+    /// Phase 1.7 round-trip: program a few channels with non-default values,
+    /// save, load into a fresh PIT, save again, assert the two save_states are
+    /// byte-identical. Catches load_state forgetting a channel field.
+    #[test]
+    fn save_load_round_trip() {
+        let _lock = SERIAL.lock().unwrap();
+        let src = make_pit(1_000_000);
+        program_mode2(&src, 0, 0x1234);
+        program_mode2(&src, 1, 0x5678);
+        program_mode2(&src, 2, 0xabcd);
+        let v1 = src.save_state();
+
+        let dst = make_pit(1_000_000);
+        dst.load_state(&v1).expect("load_state");
+        let v2 = dst.save_state();
+
+        assert_eq!(v1, v2, "Pit8254 save_state mismatch after load_state round-trip");
+    }
 }
 
 impl Saveable for Pit8254 {

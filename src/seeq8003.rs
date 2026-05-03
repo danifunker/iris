@@ -805,3 +805,31 @@ impl Saveable for Seeq8003 {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase 1.7 round-trip: a fresh Seeq loaded from a captured save_state
+    /// must re-serialize byte-identically. Mutates station_addr and the four
+    /// rx/tx command/status registers.
+    #[test]
+    fn save_load_round_trip() {
+        let src = Seeq8003::new(None, None, None, Arc::new(AtomicU64::new(0)));
+        {
+            let mut st = src.state.lock();
+            st.station_addr = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
+            st.rx_cmd  = 0x18;
+            st.rx_stat = 0xa1;
+            st.tx_cmd  = 0x40;
+            st.tx_stat = 0x82;
+        }
+        let v1 = src.save_state();
+
+        let dst = Seeq8003::new(None, None, None, Arc::new(AtomicU64::new(0)));
+        dst.load_state(&v1).expect("load_state");
+        let v2 = dst.save_state();
+
+        assert_eq!(v1, v2, "Seeq8003 save_state mismatch after load_state round-trip");
+    }
+}
