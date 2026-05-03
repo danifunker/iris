@@ -196,6 +196,11 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "scratch-clear" => cmd_scratch_clear(server),
         "scratch-info"  => cmd_scratch_info(server),
         "validate"      => cmd_validate(server, &req.args),
+        "gc"            => cmd_gc(),
+        "diff"          => cmd_diff(&req.args),
+        "tree"          => cmd_tree(),
+        "pull"          => cmd_pull(&req.args),
+        "push"          => cmd_push(&req.args),
         other => Response::err(format!("unknown command: {}", other)),
     }
 }
@@ -651,5 +656,359 @@ fn cmd_validate(server: &CiServer, args: &Value) -> Response {
             "pc": format!("0x{:016x}", report.state_a.pc),
         })),
         Err(e) => Response::err(format!("validate: {}", e)),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Snapshot library: gc / diff / tree (Phase 3.2)
+// ----------------------------------------------------------------------------
+
+/// Walk every snapshot directory under `saves/`, parse each `chunks.bin`, and
+/// collect the set of referenced chunk hashes. Used by `gc` to figure out
+/// which chunks are still live.
+fn collect_live_chunks() -> std::io::Result<std::collections::HashSet<crate::chunk_store::ChunkHash>> {
+    use std::collections::HashSet;
+    let mut live: HashSet<crate::chunk_store::ChunkHash> = HashSet::new();
+    let root = std::path::Path::new("saves");
+    if !root.is_dir() {
+        return Ok(live);
+    }
+    let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir)?.flatten() {
+            let p = e.path();
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if name == ".cas" { continue; }
+            }
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if p.file_name().and_then(|n| n.to_str()) == Some("chunks.bin") {
+                if let Ok(bytes) = std::fs::read(&p) {
+                    if let Ok(m) = postcard::from_bytes::<crate::snapshot::ChunksManifest>(&bytes) {
+                        for h in m.referenced_hashes() {
+                            live.insert(*h);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(live)
+}
+
+fn cmd_gc() -> Response {
+    let live = match collect_live_chunks() {
+        Ok(l) => l,
+        Err(e) => return Response::err(format!("gc: collect live: {}", e)),
+    };
+    let store = crate::chunk_store::ChunkStore::new("saves");
+    let total_before = store.total_size().unwrap_or(0);
+    match store.gc(&live) {
+        Ok((removed, bytes)) => {
+            // Drop now-empty shard dirs so saves/.cas stays tidy.
+            if let Ok(entries) = std::fs::read_dir(store.root()) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        let empty = std::fs::read_dir(&p).map(|mut it| it.next().is_none()).unwrap_or(false);
+                        if empty {
+                            let _ = std::fs::remove_dir(&p);
+                        }
+                    }
+                }
+            }
+            Response::data(serde_json::json!({
+                "live_chunks": live.len(),
+                "removed_chunks": removed,
+                "bytes_freed": bytes,
+                "bytes_before": total_before,
+                "bytes_after": total_before.saturating_sub(bytes),
+            }))
+        }
+        Err(e) => Response::err(format!("gc: {}", e)),
+    }
+}
+
+/// Diff two snapshots: per-device state diffs, RAM chunk-level deltas, COW
+/// overlay sector deltas. Heavy lifting reuses BinValue's `PartialEq` (toml
+/// equality) for device state and ChunksManifest hashes for RAM/framebuffer
+/// regions.
+fn cmd_diff(args: &Value) -> Response {
+    let a = match args.get("a").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return Response::err("diff: missing 'a' arg"),
+    };
+    let b = match args.get("b").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return Response::err("diff: missing 'b' arg"),
+    };
+    if a.is_empty() || a.contains("..") || b.is_empty() || b.contains("..") {
+        return Response::err("diff: invalid name");
+    }
+
+    let dir_a = std::path::PathBuf::from("saves").join(&a);
+    let dir_b = std::path::PathBuf::from("saves").join(&b);
+    if !dir_a.is_dir() {
+        return Response::err(format!("diff: snapshot '{}' not found", a));
+    }
+    if !dir_b.is_dir() {
+        return Response::err(format!("diff: snapshot '{}' not found", b));
+    }
+
+    let snap_a = crate::snapshot::Snapshot::new(&dir_a);
+    let snap_b = crate::snapshot::Snapshot::new(&dir_b);
+
+    let sv_a = snap_a.read_manifest().ok().flatten().map(|m| m.schema_version).unwrap_or(0);
+    let sv_b = snap_b.read_manifest().ok().flatten().map(|m| m.schema_version).unwrap_or(0);
+
+    // Per-device state. The eight devices we track here are the ones every
+    // configuration writes; rex3 is optional so it's handled separately.
+    let device_bases = [
+        "cpu", "mc", "ioc", "scc", "pit", "ps2", "rtc",
+        "eeprom", "scsi", "seeq", "hpc3",
+    ];
+    let mut devices_changed: Vec<&'static str> = Vec::new();
+    let mut devices_unchanged: Vec<&'static str> = Vec::new();
+    for &base in &device_bases {
+        let va = snap_a.read_state(base, sv_a).ok();
+        let vb = snap_b.read_state(base, sv_b).ok();
+        match (va, vb) {
+            (Some(va), Some(vb)) => {
+                if va == vb { devices_unchanged.push(base); }
+                else        { devices_changed.push(base); }
+            }
+            _ => devices_changed.push(base),
+        }
+    }
+    // REX3 separately because it's optional.
+    let rex_a = snap_a.read_state("rex3", sv_a).ok();
+    let rex_b = snap_b.read_state("rex3", sv_b).ok();
+    let rex3_changed = match (rex_a, rex_b) {
+        (Some(va), Some(vb)) => Some(va != vb),
+        (None, None)         => None,
+        _                    => Some(true),
+    };
+
+    // RAM bank deltas via chunks.bin (v3+ only).
+    let mut bank_changed_chunks = [0u32; 4];
+    let mut bank_total_chunks   = [0u32; 4];
+    let mut framebuffer_changed_chunks: Option<(u32, u32)> = None;
+    if sv_a >= 3 && sv_b >= 3 {
+        if let (Ok(ma), Ok(mb)) = (snap_a.read_chunks_manifest(), snap_b.read_chunks_manifest()) {
+            for i in 0..4 {
+                let ah = &ma.bank_chunks[i];
+                let bh = &mb.bank_chunks[i];
+                let n = ah.len().max(bh.len());
+                bank_total_chunks[i] = n as u32;
+                let mut changed = 0u32;
+                for k in 0..n {
+                    let av = ah.get(k);
+                    let bv = bh.get(k);
+                    if av != bv { changed += 1; }
+                }
+                bank_changed_chunks[i] = changed;
+            }
+            if let (Some((rgb_a, aux_a)), Some((rgb_b, aux_b))) =
+                (&ma.framebuffer_chunks, &mb.framebuffer_chunks)
+            {
+                let n = rgb_a.len().max(rgb_b.len()) + aux_a.len().max(aux_b.len());
+                let mut changed = 0u32;
+                for k in 0..rgb_a.len().max(rgb_b.len()) {
+                    if rgb_a.get(k) != rgb_b.get(k) { changed += 1; }
+                }
+                for k in 0..aux_a.len().max(aux_b.len()) {
+                    if aux_a.get(k) != aux_b.get(k) { changed += 1; }
+                }
+                framebuffer_changed_chunks = Some((changed, n as u32));
+            }
+        }
+    }
+
+    // COW overlay sector deltas from cow.toml.
+    let cow_a = snap_a.read_toml("cow.toml").ok();
+    let cow_b = snap_b.read_toml("cow.toml").ok();
+    let mut cow_diff_per_id: Vec<(usize, u64, u64, u64)> = Vec::new(); // (id, only_a, only_b, both)
+    if let (Some(ca), Some(cb)) = (cow_a, cow_b) {
+        let mut ids: std::collections::BTreeSet<usize> = Default::default();
+        if let Some(t) = ca.as_table() {
+            for k in t.keys() {
+                if let Some(s) = k.strip_prefix("scsi") {
+                    if let Ok(n) = s.parse::<usize>() { ids.insert(n); }
+                }
+            }
+        }
+        if let Some(t) = cb.as_table() {
+            for k in t.keys() {
+                if let Some(s) = k.strip_prefix("scsi") {
+                    if let Ok(n) = s.parse::<usize>() { ids.insert(n); }
+                }
+            }
+        }
+        for id in ids {
+            let key = format!("scsi{}", id);
+            let set_a: std::collections::HashSet<u64> = ca.get(&key)
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|x| x.as_integer().map(|i| i as u64)).collect())
+                .unwrap_or_default();
+            let set_b: std::collections::HashSet<u64> = cb.get(&key)
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|x| x.as_integer().map(|i| i as u64)).collect())
+                .unwrap_or_default();
+            let only_a = set_a.difference(&set_b).count() as u64;
+            let only_b = set_b.difference(&set_a).count() as u64;
+            let both = set_a.intersection(&set_b).count() as u64;
+            cow_diff_per_id.push((id, only_a, only_b, both));
+        }
+    }
+
+    Response::data(serde_json::json!({
+        "a": a,
+        "b": b,
+        "schema_a": sv_a,
+        "schema_b": sv_b,
+        "devices_changed": devices_changed,
+        "devices_unchanged": devices_unchanged,
+        "rex3_changed": rex3_changed,
+        "bank_changed_chunks": bank_changed_chunks,
+        "bank_total_chunks":   bank_total_chunks,
+        "framebuffer_changed_chunks": framebuffer_changed_chunks,
+        "cow_diff": cow_diff_per_id.into_iter().map(|(id, only_a, only_b, both)| {
+            serde_json::json!({"scsi_id": id, "only_a": only_a, "only_b": only_b, "both": both})
+        }).collect::<Vec<_>>(),
+    }))
+}
+
+/// Walk every snapshot under `saves/`, build a parent → children map, render
+/// indented tree text. Snapshots without a parent (or with a parent that
+/// doesn't exist locally) hang off a synthetic `(none)` root.
+fn cmd_tree() -> Response {
+    use std::collections::BTreeMap;
+    let root = std::path::Path::new("saves");
+    if !root.is_dir() {
+        return Response::data(serde_json::json!({"tree": "(no saves directory)"}));
+    }
+
+    // (name, parent) for each snapshot.
+    let mut entries: Vec<(String, Option<String>)> = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(it) = std::fs::read_dir(&dir) else { continue };
+        let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
+        let mut found_manifest = false;
+        let mut found_legacy_cpu = false;
+        for e in it.flatten() {
+            let p = e.path();
+            if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
+                if n == ".cas" { continue; }
+            }
+            if p.is_dir() {
+                subdirs.push(p);
+            } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if name == "snapshot.toml" { found_manifest = true; }
+                if name == "cpu.toml" { found_legacy_cpu = true; }
+            }
+        }
+        if found_manifest || found_legacy_cpu {
+            if let Ok(rel) = dir.strip_prefix(root) {
+                let display_name = rel.to_string_lossy().replace('\\', "/");
+                if !display_name.is_empty() {
+                    let snap = crate::snapshot::Snapshot::new(&dir);
+                    let parent = snap.read_manifest().ok().flatten().and_then(|m| m.parent);
+                    entries.push((display_name, parent));
+                }
+            }
+        }
+        for s in subdirs { stack.push(s); }
+    }
+
+    // Build parent → children map (None parent → top-level).
+    let mut by_parent: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
+    let names: std::collections::HashSet<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+    for (name, parent) in &entries {
+        let key = match parent {
+            Some(p) if names.contains(p) => Some(p.clone()),
+            _ => None,
+        };
+        by_parent.entry(key).or_default().push(name.clone());
+    }
+    for v in by_parent.values_mut() { v.sort(); }
+
+    fn render(out: &mut String, by_parent: &BTreeMap<Option<String>, Vec<String>>, parent: Option<&str>, depth: usize) {
+        let key = parent.map(String::from);
+        if let Some(children) = by_parent.get(&key) {
+            for child in children {
+                for _ in 0..depth { out.push_str("  "); }
+                out.push_str("- ");
+                out.push_str(child);
+                out.push('\n');
+                render(out, by_parent, Some(child), depth + 1);
+            }
+        }
+    }
+    let mut text = String::new();
+    render(&mut text, &by_parent, None, 0);
+    if text.is_empty() { text.push_str("(no snapshots)\n"); }
+
+    Response::data(serde_json::json!({
+        "snapshots": entries.iter().map(|(n, p)| {
+            serde_json::json!({"name": n, "parent": p})
+        }).collect::<Vec<_>>(),
+        "tree": text.trim_end_matches('\n').to_string(),
+    }))
+}
+
+// ----------------------------------------------------------------------------
+// HTTP snapshot registry (Phase 3.4)
+// ----------------------------------------------------------------------------
+
+fn cmd_pull(args: &Value) -> Response {
+    let url = match args.get("url").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return Response::err("pull: missing 'url' arg"),
+    };
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return Response::err("pull: missing 'name' arg"),
+    };
+    let saves = std::path::PathBuf::from("saves");
+    if !saves.is_dir() {
+        if let Err(e) = std::fs::create_dir_all(&saves) {
+            return Response::err(format!("pull: create saves/: {}", e));
+        }
+    }
+    match crate::registry::pull(&url, &name, &saves) {
+        Ok(report) => Response::data(serde_json::json!({
+            "name": name,
+            "url": url,
+            "chunks_fetched": report.chunks_fetched,
+            "chunks_skipped": report.chunks_skipped,
+            "files_transferred": report.files_transferred,
+            "bytes_transferred": report.bytes_transferred,
+        })),
+        Err(e) => Response::err(format!("pull: {}", e)),
+    }
+}
+
+fn cmd_push(args: &Value) -> Response {
+    let url = match args.get("url").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return Response::err("push: missing 'url' arg"),
+    };
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return Response::err("push: missing 'name' arg"),
+    };
+    match crate::registry::push(&url, &name, std::path::Path::new("saves")) {
+        Ok(report) => Response::data(serde_json::json!({
+            "name": name,
+            "url": url,
+            "chunks_uploaded": report.chunks_fetched,
+            "chunks_skipped": report.chunks_skipped,
+            "files_transferred": report.files_transferred,
+            "bytes_transferred": report.bytes_transferred,
+        })),
+        Err(e) => Response::err(format!("push: {}", e)),
     }
 }

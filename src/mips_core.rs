@@ -546,11 +546,22 @@ impl MipsCore {
                 // Formula: count_step = delta * dt_ns / (dc * 1_000_000)
                 //   delta = count units to next compare (what the kernel programmed)
                 //   dc    = instructions executed in last interval
-                //   dt_ns = wall-clock ns elapsed in last interval
-                // = (count units per instruction) * (wall-clock stretch factor)
+                //   dt_ns = ns elapsed in last interval
+                // = (count units per instruction) * (rate-stretch factor)
                 // Only calibrate for ~1ms timer intervals (IRIX 1000 Hz scheduler);
                 // leave count_step unchanged for other timer uses (one-shot, low-freq).
-                let now = std::time::Instant::now();
+                //
+                // dt_ns is SYNTHETIC: derived from dc * NS_PER_GUEST_CYCLE rather than
+                // host Instant::now(), so two runs from the same starting state always
+                // see the same dt_ns and recalibrate to the same count_step. NS=10
+                // targets 100 MIPS (one R4400 nominal cycle = 10 ns). This decouples
+                // guest-perceived time from host scheduling jitter; the Phase 3.3
+                // determinism validator now passes at any N because count_step is
+                // a deterministic function of the kernel's programmed compare deltas
+                // alone. Tradeoff: guest wall-clock no longer tracks host wall-clock
+                // (a CI run that takes 5 host minutes might present as 30 guest minutes
+                // depending on host MIPS), which is exactly what reproducible CI wants.
+                const NS_PER_GUEST_CYCLE: u64 = 10;
                 let cycles_now = self.local_cycles;
                 // Compute new_delta before the calibration block so we can guard on it.
                 // Top bit set means cp0_count > cp0_compare — counter hasn't wrapped correctly
@@ -558,10 +569,10 @@ impl MipsCore {
                 let new_delta = self.cp0_compare.wrapping_sub(self.cp0_count);
                 if new_delta >> 63 != 0 {
                     self.compare_last_cycles = cycles_now;
-                    self.compare_last_instant = now;
+                    // compare_last_instant is left as-is; no longer feeds calibration.
                 } else if self.compare_last_cycles != 0 {
                     let dc = cycles_now.wrapping_sub(self.compare_last_cycles);
-                    let dt_ns = now.duration_since(self.compare_last_instant).as_nanos() as u64;
+                    let dt_ns = dc.saturating_mul(NS_PER_GUEST_CYCLE);
                     // new_delta: what the *next* interval will fire at, stored as 32.32 fp.
                     #[cfg(feature = "developer_ip7")]
                     {
@@ -602,7 +613,8 @@ impl MipsCore {
                 }
                 // First write: keep default count_step (1<<15), just record state.
                 self.compare_last_cycles = cycles_now;
-                self.compare_last_instant = now;
+                // compare_last_instant intentionally not updated — calibration no
+                // longer reads it. Field retained for save_state schema stability.
             }
             12 => {
                 let old = self.cp0_status;

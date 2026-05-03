@@ -31,7 +31,8 @@ use crate::hpc3::Hpc3;
 use crate::ioc::Ioc;
 use crate::monitor::Monitor;
 use crate::rex3::Rex3;
-use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION};
+use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest};
+use crate::chunk_store::{ChunkStore, get_chunks_as_words, put_words_as_chunks};
 use crate::hptimer::TimerManager;
 
 pub fn emulator_name() -> &'static str {
@@ -824,15 +825,41 @@ impl Machine {
         snap.write_state("seeq",   &self.hpc3.seeq().save_state(),                 sv).map_err(|e| e.to_string())?;
         snap.write_state("hpc3",   &self.hpc3.save_state(),                        sv).map_err(|e| e.to_string())?;
 
-        // REX3 (optional — absent in headless config)
+        // REX3 (optional — absent in headless config). Framebuffers are
+        // included in the chunks manifest below for v3+; v2 wrote them as
+        // standalone .bin files.
         if let Some(rex3) = &self._phys.rex3 {
             snap.write_state("rex3", &rex3.save_state(), sv).map_err(|e| e.to_string())?;
-            rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+            if sv < 3 {
+                rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+            }
         }
 
-        // Bulk memory (raw binary, big-endian word layout) — 4 × 128MB banks
-        for i in 0..4 {
-            self._phys.save_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
+        // Bulk memory: v3+ goes to the content-addressable chunk store
+        // shared across all snapshots in `saves/.cas/`. v2 (legacy) writes
+        // raw bank{N}.bin files. Chunk hashes go in chunks.bin so load can
+        // walk the right chunks back out.
+        if sv >= 3 {
+            let store = ChunkStore::new("saves");
+            let mut chunks = ChunksManifest::default();
+            for i in 0..4 {
+                let words = self._phys.snapshot_bank_inmem(i);
+                chunks.bank_chunks[i] = put_words_as_chunks(&store, &words)
+                    .map_err(|e| format!("CAS bank{} put: {}", i, e))?;
+            }
+            if let Some(rex3) = &self._phys.rex3 {
+                let (rgb, aux) = rex3.snapshot_framebuffers_inmem();
+                let rgb_chunks = put_words_as_chunks(&store, &rgb)
+                    .map_err(|e| format!("CAS rex3 rgb put: {}", e))?;
+                let aux_chunks = put_words_as_chunks(&store, &aux)
+                    .map_err(|e| format!("CAS rex3 aux put: {}", e))?;
+                chunks.framebuffer_chunks = Some((rgb_chunks, aux_chunks));
+            }
+            snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
+        } else {
+            for i in 0..4 {
+                self._phys.save_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
+            }
         }
 
         // COW overlays per SCSI device, plus a `cow.toml` with the dirty
@@ -975,12 +1002,35 @@ impl Machine {
         if let Some(rex3) = &self._phys.rex3 {
             let rex3_v = snap.read_state("rex3", schema_version).map_err(|e| e.to_string())?;
             rex3.load_state(&rex3_v)?;
-            rex3.load_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+            // v3+ stores framebuffers in the chunk store; v2 used .bin files.
+            if schema_version < 3 {
+                rex3.load_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+            }
         }
 
-        // Bulk memory — 4 × 128MB banks
-        for i in 0..4 {
-            self._phys.load_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
+        // Bulk memory: v3+ comes from the content-addressable chunk store
+        // shared across snapshots; v2 reads raw bank{N}.bin files.
+        if schema_version >= 3 {
+            let store = ChunkStore::new("saves");
+            let chunks = snap.read_chunks_manifest()
+                .map_err(|e| format!("read chunks.bin: {}", e))?;
+            for (i, hashes) in chunks.bank_chunks.iter().enumerate() {
+                if hashes.is_empty() { continue; }
+                let words = get_chunks_as_words(&store, hashes)
+                    .map_err(|e| format!("CAS bank{} get: {}", i, e))?;
+                self._phys.restore_bank_inmem(i, &words);
+            }
+            if let (Some(rex3), Some((rgb_h, aux_h))) = (&self._phys.rex3, &chunks.framebuffer_chunks) {
+                let rgb = get_chunks_as_words(&store, rgb_h)
+                    .map_err(|e| format!("CAS rex3 rgb get: {}", e))?;
+                let aux = get_chunks_as_words(&store, aux_h)
+                    .map_err(|e| format!("CAS rex3 aux get: {}", e))?;
+                rex3.restore_framebuffers_inmem(&rgb, &aux);
+            }
+        } else {
+            for i in 0..4 {
+                self._phys.load_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
+            }
         }
 
         // COW overlays — best-effort for backward compatibility with

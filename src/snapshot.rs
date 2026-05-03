@@ -30,7 +30,13 @@ use toml::Value;
 /// v1 → v2: device state moved from *.toml (hex strings, ~80 ms cpu.toml
 /// parse) to *.bin (postcard-encoded BinValue tree, sub-millisecond). Manifest
 /// and cow.toml stay TOML.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// v2 → v3: RAM banks and framebuffers moved from raw `bank{N}.bin`/`rex3_*.bin`
+/// files to a content-addressable chunk store at `saves/.cas/`. Each snapshot
+/// writes a tiny `chunks.bin` manifest of per-bank/per-framebuffer chunk
+/// hashes. Two snapshots from the same parent share 95–99% of chunks, so a
+/// fresh save-after-bundle-install costs only the bytes that changed.
+pub const SCHEMA_VERSION: u32 = 3;
 
 const MANIFEST_FILE: &str = "snapshot.toml";
 
@@ -177,6 +183,19 @@ impl Snapshot {
         Ok(bv.into_toml())
     }
 
+    /// Postcard-encode a `ChunksManifest` (v3+ snapshots).
+    pub fn write_chunks_manifest(&self, m: &ChunksManifest) -> std::io::Result<()> {
+        let bytes = postcard::to_allocvec(m)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        self.write_bin("chunks.bin", &bytes)
+    }
+
+    pub fn read_chunks_manifest(&self) -> std::io::Result<ChunksManifest> {
+        let bytes = self.read_bin("chunks.bin")?;
+        postcard::from_bytes(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    }
+
     /// Write a device save_state value, picking `<base>.bin` for v2+ and
     /// `<base>.toml` for legacy schemas. Centralizes the per-call branching
     /// in machine.rs.
@@ -220,6 +239,38 @@ impl Snapshot {
         }
         let v = self.read_toml(MANIFEST_FILE).map_err(|e| e.to_string())?;
         Manifest::from_toml(&v).map(Some)
+    }
+}
+
+// ---- ChunksManifest: per-bank / per-framebuffer chunk hash lists (v3+) ----
+
+use crate::chunk_store::ChunkHash;
+
+/// Per-snapshot pointer into the content-addressable chunk store. Every bank
+/// and (optionally) each framebuffer is split into 64 KB chunks; this
+/// manifest records the BLAKE3 hash of each chunk in order. Loading a
+/// snapshot fetches the chunks and concatenates them back into the bank's
+/// big-endian byte stream.
+///
+/// Stored as `chunks.bin` in the snapshot dir, postcard-encoded.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChunksManifest {
+    /// One entry per RAM bank (0..3). Empty inner Vec means the bank wasn't
+    /// captured (e.g. zero-sized in this configuration).
+    pub bank_chunks: [Vec<ChunkHash>; 4],
+    /// REX3 framebuffer chunks: (rgb, aux). `None` when running headless.
+    pub framebuffer_chunks: Option<(Vec<ChunkHash>, Vec<ChunkHash>)>,
+}
+
+impl ChunksManifest {
+    /// Iterate every chunk hash referenced by this manifest. Used by `gc`
+    /// to build the live set across all kept snapshots.
+    pub fn referenced_hashes(&self) -> impl Iterator<Item = &ChunkHash> {
+        self.bank_chunks.iter().flatten().chain(
+            self.framebuffer_chunks
+                .iter()
+                .flat_map(|(rgb, aux)| rgb.iter().chain(aux.iter())),
+        )
     }
 }
 
