@@ -131,6 +131,107 @@ Writes go to `scsi1.raw.overlay`. Monitor commands:
 - `cow reset` - discard all overlay writes
 
 
+## Snapshots and rollback
+
+Capture the full machine state — RAM, every device, plus the COW overlay — into
+`saves/<name>/`, and restore it later. CPU, MC, IOC, HPC3, REX3, RTC, EEPROM,
+SCSI controller, and the Seeq Ethernet chip all round-trip. Snapshot format is
+postcard-encoded binary (`schema_version = 2`) — a 3.6 MB device-state file
+parses in ~6 ms instead of ~20 ms for the older TOML layout.
+
+From the interactive monitor (`telnet 127.0.0.1 8888`):
+```
+save base/desktop          # writes saves/base/desktop/
+load base/desktop          # restore everything (RAM, devices, disk overlay)
+```
+
+Two restore tiers from the CI socket — see below for the full protocol:
+- **`restore <name>`** — full disk-backed reload. ~150 ms. Use after a hard
+  reset or to switch to a different snapshot.
+- **`rollback`** — in-memory rewind to the last `restore` checkpoint. ~40–60 ms,
+  no disk I/O. Use this in tight inner test loops where you keep returning to
+  the same starting state.
+
+Reflinks are used on APFS / btrfs / xfs so capturing a snapshot of a 4 GB disk
+image takes <10 ms and uses ~18 MB of actual disk.
+
+
+## CI control socket
+
+`--ci` enables a Unix-socket control plane for headless automation, plus a
+small in-process serial backend so the harness can drive the IRIX console
+directly. The default socket path is `/tmp/iris.sock`.
+
+```
+cargo run --release --features lightning -- --ci --headless
+```
+
+The protocol is newline-delimited JSON, single-client. Quick reference:
+
+| Command | Args | Effect |
+|--------|------|--------|
+| `start` | — | Start the CPU thread |
+| `quit` | — | Clean shutdown |
+| `save` | `{name}` | Write `saves/<name>/` |
+| `restore` | `{name}` | Disk-backed full reload |
+| `rollback` | — | In-memory rewind to the last `restore` |
+| `list` / `info` / `delete` | `{name}` | Browse saves/ |
+| `serial-send` | `{data}` | Type into the IRIX console |
+| `serial-read` | — | Drain console output |
+| `wait-serial` | `{pattern, timeout_ms}` | Block until pattern is seen |
+| `screenshot` | `{path}` | PNG of the REX3 framebuffer |
+| `scratch-write` / `scratch-read` / `scratch-clear` / `scratch-info` | see below | Scratch volume I/O |
+
+Example:
+```
+echo '{"cmd":"start"}'                                | nc -U /tmp/iris.sock
+echo '{"cmd":"wait-serial","args":{"pattern":"login:","timeout_ms":120000}}' | nc -U /tmp/iris.sock
+echo '{"cmd":"serial-send","args":{"data":"root\r"}}' | nc -U /tmp/iris.sock
+echo '{"cmd":"save","args":{"name":"base/multiuser"}}' | nc -U /tmp/iris.sock
+```
+
+
+## Scratch volume — file injection without networking
+
+A SCSI device with `scratch = true` is a host-controlled raw block device
+intended for pushing files into the guest (and pulling artifacts back out)
+without bringing up NFS or anything else. iris pre-formats the underlying file
+with a minimal SGI Volume Header on first run.
+
+Enable in `iris.toml`:
+```toml
+[scsi.2]
+path    = "scratch.raw"
+cdrom   = false
+overlay = false
+scratch = true
+size_mb = 64
+```
+
+iris creates `scratch.raw` (64 MB, with a valid VH) on first boot and exposes
+it inside IRIX as `/dev/rdsk/dks0d2s0` (payload area, sectors 8..end). Host
+ops via the CI socket:
+
+```
+# Push a tarball into the guest
+echo '{"cmd":"scratch-write","args":{"host_path":"bundle.tar"}}' | nc -U /tmp/iris.sock
+
+# Inside IRIX:
+dd if=/dev/rdsk/dks0d2s0 bs=512 | tar xf -
+
+# Pull a log file back out (guest writes, host reads):
+# (inside IRIX) tar cf - /var/log/foo | dd of=/dev/rdsk/dks0d2s0 bs=512 conv=sync,notrunc
+echo '{"cmd":"scratch-read","args":{"to_path":"foo.tar"}}' | nc -U /tmp/iris.sock
+```
+
+`scratch-write`/`-read` offsets are relative to the payload area — the VH at
+the start of the disk is never touched by these commands.
+
+**IRIX gotcha:** raw block-device reads must be sector-aligned (`bs=512` works,
+`bs=64` returns "Read error: I/O error"). Writes must be padded to `bs`; for
+short inputs add `conv=sync` so dd zero-pads.
+
+
 ## Input
 
 Click the window to grab mouse and keyboard. Right Ctrl releases the grab.
@@ -150,6 +251,7 @@ on the codebase.
 - `rules/jit/` - dispatch architecture, store compilation, sync, verify mode, probe tuning
 - `rules/irix/` - networking config, keyboard quirks
 - `rules/testing/` - disk image handling, avoiding filesystem corruption
+- `rules/snapshot/` - snapshot v2 binary format, scratch-volume conventions, round-trip test convention, CI mode overlay paths
 
 If you're about to touch the JIT dispatch loop, read `rules/jit/dispatch-architecture.md`
 first. It'll save you a few days.

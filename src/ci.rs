@@ -191,6 +191,10 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "serial-read" => cmd_serial_read(server),
         "wait-serial" => cmd_wait_serial(server, &req.args),
         "screenshot" => cmd_screenshot(server, &req.args),
+        "scratch-write" => cmd_scratch_write(server, &req.args),
+        "scratch-read"  => cmd_scratch_read(server, &req.args),
+        "scratch-clear" => cmd_scratch_clear(server),
+        "scratch-info"  => cmd_scratch_info(server),
         other => Response::err(format!("unknown command: {}", other)),
     }
 }
@@ -434,4 +438,185 @@ fn cmd_wait_serial(server: &CiServer, args: &Value) -> Response {
         }
         None => Response::err(format!("wait-serial: timeout after {}ms waiting for {:?}", timeout_ms, pattern)),
     }
+}
+
+// ----------------------------------------------------------------------------
+// Scratch volume (Phase 2.4): file injection / extraction without networking.
+//
+// The scratch device is a raw SCSI LUN (`scratch = true` in iris.toml).
+// iris pre-formats the underlying file with a minimal SGI Volume Header at
+// sector 0 so IRIX recognises it (without the VH, /dev/rdsk/dks0dNvol
+// returns I/O error on every read). The VH defines partition slot 7
+// ("vol") spanning sectors 8..end and slot 8 ("vh") spanning sectors 0..7.
+//
+// Wire convention:
+//   - `scratch-write` and `scratch-read` operate on the *payload* area —
+//     `offset = 0` means the first byte after the VH (raw byte 4096 in the
+//     underlying file). The VH is never touched by these commands.
+//   - The guest reads the same payload at offset 0 of /dev/rdsk/dks0dNvol
+//     because partition 7's first_block = 8.
+//   - Typical guest read: `dd if=/dev/rdsk/dks0d2vol bs=64k | tar xf -`.
+//
+// Each scratch op briefly stops the machine to quiesce in-flight SCSI I/O
+// (Machine::with_paused). The CPU is restarted only if it was running before
+// — a scratch-write issued before the harness `start`s the CPU does not
+// auto-start it.
+// ----------------------------------------------------------------------------
+
+use crate::sgi_vh::SCRATCH_PAYLOAD_OFFSET;
+
+/// Reject names that would escape the host or smuggle in shell metachars. The
+/// host-side path is read by serde_json so quoting is already handled, but a
+/// caller-supplied "../" can still escape an intended sandbox.
+fn validate_host_path(p: &str) -> Result<std::path::PathBuf, String> {
+    if p.is_empty() {
+        return Err("path: empty".into());
+    }
+    let pb = std::path::PathBuf::from(p);
+    if pb.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(format!("path: '..' components not allowed in {:?}", p));
+    }
+    Ok(pb)
+}
+
+fn cmd_scratch_write(server: &CiServer, args: &Value) -> Response {
+    let host_path = match args.get("host_path").and_then(|v| v.as_str()) {
+        Some(p) => match validate_host_path(p) {
+            Ok(pb) => pb,
+            Err(e) => return Response::err(format!("scratch-write: {}", e)),
+        },
+        None => return Response::err("scratch-write: missing 'host_path' arg"),
+    };
+    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let bytes = match std::fs::read(&host_path) {
+        Ok(b) => b,
+        Err(e) => return Response::err(format!("scratch-write: read {}: {}", host_path.display(), e)),
+    };
+
+    let result = server.with_machine(|m| {
+        let scratch = match m.scratch_path() {
+            Some(p) => p.to_path_buf(),
+            None => return Err("scratch volume not configured (set `scratch = true` on a SCSI device in iris.toml)".to_string()),
+        };
+        m.with_paused(|| -> Result<u64, String> {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&scratch)
+                .map_err(|e| format!("open {}: {}", scratch.display(), e))?;
+            // Skip the VH partition; offset is relative to the payload area.
+            let raw_offset = SCRATCH_PAYLOAD_OFFSET.checked_add(offset)
+                .ok_or_else(|| "offset overflow".to_string())?;
+            f.seek(SeekFrom::Start(raw_offset)).map_err(|e| format!("seek: {}", e))?;
+            f.write_all(&bytes).map_err(|e| format!("write: {}", e))?;
+            f.sync_all().map_err(|e| format!("fsync: {}", e))?;
+            Ok(bytes.len() as u64)
+        })
+    });
+
+    match result {
+        Ok(n) => Response::data(serde_json::json!({
+            "bytes_written": n,
+            "offset": offset,
+            "host_path": host_path.display().to_string(),
+        })),
+        Err(e) => Response::err(format!("scratch-write: {}", e)),
+    }
+}
+
+fn cmd_scratch_read(server: &CiServer, args: &Value) -> Response {
+    let to_path = match args.get("to_path").and_then(|v| v.as_str()) {
+        Some(p) => match validate_host_path(p) {
+            Ok(pb) => pb,
+            Err(e) => return Response::err(format!("scratch-read: {}", e)),
+        },
+        None => return Response::err("scratch-read: missing 'to_path' arg"),
+    };
+    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+    let length = args.get("length").and_then(|v| v.as_u64());
+
+    let result = server.with_machine(|m| {
+        let scratch = match m.scratch_path() {
+            Some(p) => p.to_path_buf(),
+            None => return Err("scratch volume not configured (set `scratch = true` on a SCSI device in iris.toml)".to_string()),
+        };
+        m.with_paused(|| -> Result<u64, String> {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = std::fs::File::open(&scratch)
+                .map_err(|e| format!("open {}: {}", scratch.display(), e))?;
+            let total = f.metadata().map(|m| m.len()).unwrap_or(0);
+            let payload_total = total.saturating_sub(SCRATCH_PAYLOAD_OFFSET);
+            let raw_offset = SCRATCH_PAYLOAD_OFFSET.checked_add(offset)
+                .ok_or_else(|| "offset overflow".to_string())?;
+            let len = match length {
+                Some(n) => n.min(payload_total.saturating_sub(offset)),
+                None => payload_total.saturating_sub(offset),
+            };
+            f.seek(SeekFrom::Start(raw_offset)).map_err(|e| format!("seek: {}", e))?;
+            let mut buf = vec![0u8; len as usize];
+            f.read_exact(&mut buf).map_err(|e| format!("read: {}", e))?;
+            std::fs::write(&to_path, &buf)
+                .map_err(|e| format!("write {}: {}", to_path.display(), e))?;
+            Ok(buf.len() as u64)
+        })
+    });
+
+    match result {
+        Ok(n) => Response::data(serde_json::json!({
+            "bytes_read": n,
+            "offset": offset,
+            "to_path": to_path.display().to_string(),
+        })),
+        Err(e) => Response::err(format!("scratch-read: {}", e)),
+    }
+}
+
+fn cmd_scratch_clear(server: &CiServer) -> Response {
+    let result = server.with_machine(|m| {
+        let scratch = match m.scratch_path() {
+            Some(p) => p.to_path_buf(),
+            None => return Err("scratch volume not configured".to_string()),
+        };
+        m.with_paused(|| -> Result<u64, String> {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&scratch)
+                .map_err(|e| format!("open {}: {}", scratch.display(), e))?;
+            let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+            // Zero only the payload area (after the VH). Zero in 1 MiB chunks
+            // rather than allocating a buffer the full size of the volume.
+            let chunk = vec![0u8; 1024 * 1024];
+            f.seek(SeekFrom::Start(SCRATCH_PAYLOAD_OFFSET))
+                .map_err(|e| format!("seek: {}", e))?;
+            let mut remaining = size.saturating_sub(SCRATCH_PAYLOAD_OFFSET);
+            while remaining > 0 {
+                let n = remaining.min(chunk.len() as u64) as usize;
+                f.write_all(&chunk[..n]).map_err(|e| format!("write: {}", e))?;
+                remaining -= n as u64;
+            }
+            f.sync_all().map_err(|e| format!("fsync: {}", e))?;
+            Ok(size.saturating_sub(SCRATCH_PAYLOAD_OFFSET))
+        })
+    });
+
+    match result {
+        Ok(n) => Response::data(serde_json::json!({ "bytes_cleared": n })),
+        Err(e) => Response::err(format!("scratch-clear: {}", e)),
+    }
+}
+
+fn cmd_scratch_info(server: &CiServer) -> Response {
+    let path = server.with_machine(|m| m.scratch_path().map(|p| p.to_path_buf()));
+    let Some(path) = path else {
+        return Response::err("scratch-info: scratch volume not configured");
+    };
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    Response::data(serde_json::json!({
+        "path": path.display().to_string(),
+        "size_bytes": size,
+        "payload_offset": SCRATCH_PAYLOAD_OFFSET,
+        "payload_size_bytes": size.saturating_sub(SCRATCH_PAYLOAD_OFFSET),
+    }))
 }

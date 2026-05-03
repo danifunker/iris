@@ -43,6 +43,7 @@ pub mod disp;
 pub mod exp;
 pub mod gdb_stub;
 pub mod snapshot;
+pub mod sgi_vh;
 pub mod ci;
 pub mod hptimer;
 pub mod hptimer_tests;

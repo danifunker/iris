@@ -81,6 +81,11 @@ pub struct Machine {
     /// bank/framebuffer buffers. Cleared on any explicit `load_snapshot`
     /// outside the CI path.
     last_restore_checkpoint: Option<RollbackCheckpoint>,
+    /// Path of the configured scratch SCSI volume, if any. The CI socket reads
+    /// and writes this file directly (with the machine briefly stopped) to
+    /// inject/exfiltrate files without going through the network. None when no
+    /// SCSI device has `scratch = true` set in the config.
+    scratch_path: Option<std::path::PathBuf>,
 }
 
 /// In-memory snapshot of the just-restored guest state. Populated at the end
@@ -181,8 +186,45 @@ impl Machine {
         // processes. Files are kept for post-mortem inspection; cleanup
         // happens on machine drop below.
         let ci_pid = std::process::id();
+        // Track the on-disk path of any scratch device so the CI socket can
+        // read/write its bytes directly (Phase 2.4).
+        let mut scratch_path: Option<std::path::PathBuf> = None;
         for id in scsi_ids {
             let dev = &cfg.scsi[&id];
+            // Scratch volume: pre-create a raw file with a minimal SGI Volume
+            // Header if it doesn't exist. Refuse cdrom/overlay combinations —
+            // scratch must be a host-writable raw file. Default size 64 MB.
+            //
+            // The VH lays out partition 7 ("vol") spanning sectors 8..end and
+            // partition 8 ("vh") spanning sectors 0..7 (the VH itself).
+            // Without a VH, IRIX recognises the device but returns I/O error
+            // on every read because /dev/rdsk/dks0dNvh and /dev/rdsk/dks0dNvol
+            // both consult the partition table at sector 0.
+            //
+            // Convention: host writes payload via scratch-write at offset >=
+            // SCRATCH_PAYLOAD_OFFSET (4096). Guest reads from offset 0 of
+            // /dev/rdsk/dks0dNvol (which maps to sector 8 of the disk by
+            // partition 7's first_block=8).
+            if dev.scratch {
+                if dev.cdrom || dev.overlay {
+                    println!("Note: SCSI ID {}: scratch=true is incompatible with cdrom/overlay; ignoring scratch flag", id);
+                } else {
+                    let path = std::path::Path::new(&dev.path);
+                    if !path.exists() {
+                        let size_mb = dev.size_mb.unwrap_or(64) as u64;
+                        let bytes = size_mb * 1024 * 1024;
+                        match crate::sgi_vh::create_scratch_image(path, bytes) {
+                            Ok(()) => println!("iris: created scratch volume {} ({} MB, with SGI VH)", dev.path, size_mb),
+                            Err(e) => println!("Note: could not create scratch volume {}: {}", dev.path, e),
+                        }
+                    }
+                    if scratch_path.is_some() {
+                        println!("Note: multiple scratch SCSI devices configured; CI socket will use the lowest-id one");
+                    } else {
+                        scratch_path = Some(path.to_path_buf());
+                    }
+                }
+            }
             let (path, discs) = if dev.cdrom {
                 let mut list = dev.discs.clone();
                 if list.is_empty() {
@@ -366,7 +408,32 @@ impl Machine {
             ci_serial,
             last_restore: None,
             last_restore_checkpoint: None,
+            scratch_path,
         }
+    }
+
+    /// Path of the configured scratch SCSI volume, if any. Used by the CI
+    /// socket scratch-{write,read,clear,info} commands to act on the file
+    /// directly while the machine is briefly stopped.
+    pub fn scratch_path(&self) -> Option<&std::path::Path> {
+        self.scratch_path.as_deref()
+    }
+
+    /// Briefly stop the machine, run `work`, then restart peripherals and the
+    /// CPU only if it was running before. Used by the scratch-write/read/clear
+    /// CI commands to mutate the scratch file without racing the SCSI device's
+    /// in-flight reads. CPU stays stopped if the harness hasn't called `start`
+    /// yet — a file injected before boot stays injected, the CPU doesn't get
+    /// auto-started.
+    pub fn with_paused<R>(&mut self, work: impl FnOnce() -> R) -> R {
+        let was_running = self.cpu.is_running();
+        self.stop();
+        let r = work();
+        self.restart_peripherals();
+        if was_running {
+            self.cpu.start();
+        }
+        r
     }
 
     pub fn start(&mut self) {

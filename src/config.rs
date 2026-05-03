@@ -18,6 +18,19 @@ pub struct ScsiDeviceConfig {
     /// `{path}.overlay`. Delete the overlay file to reset to clean state.
     #[serde(default)]
     pub overlay: bool,
+    /// Scratch volume: a host-controlled raw block device used for file
+    /// injection/extraction without networking. iris auto-creates a zero-filled
+    /// file at `path` if it doesn't exist (size = `size_mb`, default 64). The
+    /// CI socket exposes scratch-write/read/clear/info to mutate it from the
+    /// host side. No filesystem is imposed: callers can write a tar stream and
+    /// the guest reads it with `dd if=/dev/rdsk/dks0dNvh | tar xf -`.
+    /// Implies !cdrom && !overlay (the volume must be host-writable directly).
+    #[serde(default)]
+    pub scratch: bool,
+    /// Size in MB for an auto-created scratch volume. Ignored when the file
+    /// already exists or `scratch=false`.
+    #[serde(default)]
+    pub size_mb: Option<u32>,
 }
 
 /// Protocol for port forwarding.
@@ -150,12 +163,16 @@ fn default_scsi() -> std::collections::HashMap<u8, ScsiDeviceConfig> {
         discs: vec![],
         cdrom: false,
         overlay: false,
+        scratch: false,
+        size_mb: None,
     });
     map.insert(4, ScsiDeviceConfig {
         path: "cdrom4.iso".to_string(),
         discs: vec![],
         cdrom: true,
         overlay: false,
+        scratch: false,
+        size_mb: None,
     });
     map
 }
@@ -362,6 +379,8 @@ impl Cli {
                 discs: vec![],
                 cdrom,
                 overlay: false,
+                scratch: false,
+                size_mb: None,
             });
             entry.path = path;
             entry.cdrom = cdrom;
