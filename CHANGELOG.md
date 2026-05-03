@@ -127,20 +127,19 @@ compute the live chunk set.
 
 ### Fixed
 
-- **`cp0_compare` write recalibration is now deterministic.** The
-  previous implementation in `src/mips_core.rs` measured
-  `Instant::now()` between successive Compare writes to compute a
-  wallclock-stretched `count_step`. Two passes from the same starting
-  state would see different host scheduling → different `dt_ns` →
-  different `count_step` → different timer-interrupt timing → divergent
-  guest execution. Replaced `dt_ns = wallclock` with synthetic `dt_ns =
-  (cycles since last Compare write) * NS_PER_GUEST_CYCLE` (where
-  `NS_PER_GUEST_CYCLE = 10`, targeting 100 MIPS guest-time). The Phase
-  3.3 validator now reports `deterministic: true` at any N. Tradeoff:
-  guest wall-clock no longer tracks host wall-clock — for CI/test
-  workflows this is exactly what reproducibility wants; for any guest
-  workload that depends on real wall-clock alignment the constant in
-  `mips_core.rs` is the one knob to revisit.
+- **`cp0_compare` write recalibration: synthetic clock available behind
+  `--features ci_clock`.** The previous implementation in
+  `src/mips_core.rs` measured `Instant::now()` between successive
+  Compare writes to compute a wallclock-stretched `count_step`. Two
+  passes from the same starting state would see different host
+  scheduling → different `dt_ns` → different `count_step` → different
+  timer-interrupt timing → divergent guest execution. With
+  `--features ci_clock` we swap in `dt_ns = (cycles since last Compare
+  write) * 10ns` (R4400 ~100 MIPS), giving the Phase 3.3 validator
+  `deterministic: true` at any N. Default builds keep the wallclock
+  path so interactive desktop sessions retain real-time IRIX timing.
+  Tradeoff under `ci_clock`: guest wall-clock no longer tracks host
+  wall-clock — exactly what reproducible CI wants.
 - **CiSerialBackend chunked-input loss** (Phase 3.5). The SCC channel-A
   RX worker silently dropped bytes when its 8-byte `rx_queue` was full,
   producing the symptom `dd if=/dev/rdsk/dks0d2s0 bs=512` arriving at

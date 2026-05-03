@@ -71,6 +71,7 @@ cargo run --release --features lightning             # disable emulator breakpoi
 cargo run --release --features jit                   # enable Cranelift MIPS JIT compiler
 cargo run --release --features rex-jit               # enable REX3 graphics JIT compiler
 cargo run --release --features tlbvmap               # enable 8k slot to tlb entry map (increases cache use but may help depending on host cpu arch)
+cargo run --release --features ci_clock              # synthetic deterministic CP0 Compare clock (CI/snapshot validator only; loses realtime desktop timing)
 cargo run --release --features lightning,rex-jit,tlbvmap     # recommended for best speed right now
 ```
 
@@ -153,7 +154,7 @@ iris-ci save base/desktop
 iris-ci restore base/desktop          # full disk-backed reload (~150 ms cold)
 iris-ci rollback                      # in-memory rewind to last restore (~40 ms)
 iris-ci diff base/desktop tests/grep  # what changed: devices, RAM chunks, COW sectors
-iris-ci validate base/desktop -n 1000000  # bit-deterministic re-execution check
+iris-ci validate base/desktop -n 1000000  # bit-deterministic re-execution check (build with --features ci_clock)
 iris-ci tree                          # snapshot parent-chain hierarchy
 iris-ci gc                            # sweep CAS chunks no kept snapshot references
 iris-ci pull http://reg/snapshots/base   # fetch a snapshot from another machine
