@@ -67,6 +67,12 @@ pub enum DiskBackend {
     Direct(File),
     /// Copy-on-write: base image is read-only, writes go to overlay file.
     Cow(CowDisk),
+    /// Hard-disk CHD. Writable; compressed parents get an uncompressed
+    /// `.diff.chd` sidecar (MAME-style), so the parent stays untouched.
+    ChdHd(crate::chd_disk::ChdHd),
+    /// CD CHD (single-track MODE1) exposed as a 2048-byte/sector read-only
+    /// stream. Writes return an error.
+    ChdCd(crate::chd_disk::ChdCd),
 }
 
 impl DiskBackend {
@@ -86,6 +92,8 @@ impl DiskBackend {
             DiskBackend::Cow(cow) => {
                 cow.read_sectors(lba, count)
             }
+            DiskBackend::ChdHd(hd) => hd.read_blocks(lba, count, block_size),
+            DiskBackend::ChdCd(cd) => cd.read_blocks(lba, count, block_size),
         }
     }
 
@@ -98,6 +106,11 @@ impl DiskBackend {
                 Ok(())
             }
             DiskBackend::Cow(cow) => cow.write_sectors(lba, data),
+            DiskBackend::ChdHd(hd) => hd.write_sectors(lba, data),
+            DiskBackend::ChdCd(_) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "CD CHD is read-only",
+            )),
         }
     }
 
@@ -105,6 +118,8 @@ impl DiskBackend {
         match self {
             DiskBackend::Direct(file) => file.metadata().map(|m| m.len()).unwrap_or(0),
             DiskBackend::Cow(cow) => cow.size(),
+            DiskBackend::ChdHd(hd) => hd.size(),
+            DiskBackend::ChdCd(cd) => cd.size(),
         }
     }
 }
@@ -155,7 +170,7 @@ impl ScsiDevice {
     pub fn cow_commit(&mut self) -> io::Result<usize> {
         match &mut self.backend {
             DiskBackend::Cow(cow) => cow.commit(),
-            DiskBackend::Direct(_) => Ok(0),
+            DiskBackend::Direct(_) | DiskBackend::ChdHd(_) | DiskBackend::ChdCd(_) => Ok(0),
         }
     }
 
@@ -163,7 +178,7 @@ impl ScsiDevice {
     pub fn cow_reset(&mut self) -> io::Result<()> {
         match &mut self.backend {
             DiskBackend::Cow(cow) => cow.reset_overlay(),
-            DiskBackend::Direct(_) => Ok(()),
+            DiskBackend::Direct(_) | DiskBackend::ChdHd(_) | DiskBackend::ChdCd(_) => Ok(()),
         }
     }
 
@@ -172,7 +187,7 @@ impl ScsiDevice {
     pub fn cow_export(&mut self, dest: &std::path::Path) -> io::Result<Vec<u64>> {
         match &mut self.backend {
             DiskBackend::Cow(cow) => cow.export_overlay(dest),
-            DiskBackend::Direct(_) => Ok(Vec::new()),
+            DiskBackend::Direct(_) | DiskBackend::ChdHd(_) | DiskBackend::ChdCd(_) => Ok(Vec::new()),
         }
     }
 
@@ -181,7 +196,7 @@ impl ScsiDevice {
     pub fn cow_import(&mut self, source: &std::path::Path, dirty: Vec<u64>) -> io::Result<()> {
         match &mut self.backend {
             DiskBackend::Cow(cow) => cow.import_overlay(source, dirty),
-            DiskBackend::Direct(_) => Ok(()),
+            DiskBackend::Direct(_) | DiskBackend::ChdHd(_) | DiskBackend::ChdCd(_) => Ok(()),
         }
     }
 
@@ -189,7 +204,7 @@ impl ScsiDevice {
     pub fn cow_dirty_count(&self) -> usize {
         match &self.backend {
             DiskBackend::Cow(cow) => cow.dirty_count(),
-            DiskBackend::Direct(_) => 0,
+            DiskBackend::Direct(_) | DiskBackend::ChdHd(_) | DiskBackend::ChdCd(_) => 0,
         }
     }
 

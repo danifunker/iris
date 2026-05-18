@@ -58,6 +58,7 @@ cranelift-jit        = { version = "0.116", optional = true }
 cranelift-module     = { version = "0.116", optional = true }
 cranelift-native     = { version = "0.116", optional = true }
 target-lexicon       = { version = "0.13",  optional = true }
+libchdman-rs = { git = "https://github.com/danifunker/libchdman-rs" }
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"

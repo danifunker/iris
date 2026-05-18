@@ -248,10 +248,24 @@ impl Wd33c93a {
         overlay: bool,
         overlay_path_override: Option<&str>,
     ) -> std::io::Result<()> {
+        use crate::chd_disk::{is_chd, ChdCd, ChdHd};
         use crate::cow_disk::CowDisk;
         use crate::scsi::DiskBackend;
 
-        let (backend, size) = if overlay && !is_cdrom {
+        let (backend, size) = if is_chd(path) {
+            if is_cdrom {
+                let cd = ChdCd::open(path)?;
+                let sz = cd.size();
+                (DiskBackend::ChdCd(cd), sz)
+            } else {
+                // HD CHDs are inherently writable via the libchdman-rs HdImage
+                // surface (in-place for uncompressed, diff sidecar for
+                // compressed), so the `overlay` flag is not applicable here.
+                let hd = ChdHd::open(path)?;
+                let sz = hd.size();
+                (DiskBackend::ChdHd(hd), sz)
+            }
+        } else if overlay && !is_cdrom {
             let overlay_path = overlay_path_override
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("{}.overlay", path));
