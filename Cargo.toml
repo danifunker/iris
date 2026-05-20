@@ -27,6 +27,9 @@ rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelif
 # Use WindowEvent::CursorMoved for mouse motion instead of DeviceEvent::MouseMotion.
 # Useful for testing absolute cursor position tracking. May cause doubled moves on some platforms.
 mouseabs = []
+# CHD disk image support (SCSI HDDs and CD-ROMs) via libchdman-rs.
+# Off by default — enable with `cargo build --features chd`.
+chd = ["dep:libchdman-rs"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -58,7 +61,7 @@ cranelift-jit        = { version = "0.116", optional = true }
 cranelift-module     = { version = "0.116", optional = true }
 cranelift-native     = { version = "0.116", optional = true }
 target-lexicon       = { version = "0.13",  optional = true }
-libchdman-rs = { version = "0.287.0-l7", features = ["prebuilt"] }
+libchdman-rs = { version = "0.287.0-l7", features = ["prebuilt"], optional = true }
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"

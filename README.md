@@ -72,8 +72,23 @@ cargo run --release --features jit                   # enable Cranelift MIPS JIT
 cargo run --release --features rex-jit               # enable REX3 graphics JIT compiler
 cargo run --release --features tlbvmap               # enable 8k slot to tlb entry map (increases cache use but may help depending on host cpu arch)
 cargo run --release --features ci_clock              # synthetic deterministic CP0 Compare clock (CI/snapshot validator only; loses realtime desktop timing)
+cargo run --release --features chd                   # mount .chd disk/CD-ROM images directly (via libchdman-rs); off by default to keep builds light
 cargo run --release --features lightning,rex-jit,tlbvmap     # recommended for best speed right now
 ```
+
+### CHD image support (`--features chd`)
+
+Off by default. When enabled, IRIS can mount `.chd` hard-disk and CD-ROM
+images directly without first extracting to raw. Compressed parent CHDs
+stay untouched — writes go to a MAME-style `.diff.chd` sidecar.
+
+```
+cargo build --release --features chd
+```
+
+Without this feature, attempting to mount a `.chd` path returns an
+`Unsupported` error; raw images and COW overlays continue to work as
+before.
 
 See [HELP.md](HELP.md) for the full rundown: serial ports, monitor console,
 NVRAM/MAC address setup, disk image prep, and more.

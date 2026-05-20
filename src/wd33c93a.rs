@@ -248,22 +248,40 @@ impl Wd33c93a {
         overlay: bool,
         overlay_path_override: Option<&str>,
     ) -> std::io::Result<()> {
-        use crate::chd_disk::{is_chd, ChdCd, ChdHd};
         use crate::cow_disk::CowDisk;
         use crate::scsi::DiskBackend;
 
-        let (backend, size) = if is_chd(path) {
-            if is_cdrom {
-                let cd = ChdCd::open(path)?;
-                let sz = cd.size();
-                (DiskBackend::ChdCd(cd), sz)
-            } else {
-                // HD CHDs are inherently writable via the libchdman-rs HdImage
-                // surface (in-place for uncompressed, diff sidecar for
-                // compressed), so the `overlay` flag is not applicable here.
-                let hd = ChdHd::open(path)?;
-                let sz = hd.size();
-                (DiskBackend::ChdHd(hd), sz)
+        #[cfg(feature = "chd")]
+        let is_chd_path = crate::chd_disk::is_chd(path);
+        #[cfg(not(feature = "chd"))]
+        let is_chd_path = {
+            let p = path.to_ascii_lowercase();
+            p.ends_with(".chd")
+        };
+
+        let (backend, size) = if is_chd_path {
+            #[cfg(feature = "chd")]
+            {
+                use crate::chd_disk::{ChdCd, ChdHd};
+                if is_cdrom {
+                    let cd = ChdCd::open(path)?;
+                    let sz = cd.size();
+                    (DiskBackend::ChdCd(cd), sz)
+                } else {
+                    // HD CHDs are inherently writable via the libchdman-rs HdImage
+                    // surface (in-place for uncompressed, diff sidecar for
+                    // compressed), so the `overlay` flag is not applicable here.
+                    let hd = ChdHd::open(path)?;
+                    let sz = hd.size();
+                    (DiskBackend::ChdHd(hd), sz)
+                }
+            }
+            #[cfg(not(feature = "chd"))]
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "CHD image support not compiled in (rebuild with --features chd)",
+                ));
             }
         } else if overlay && !is_cdrom {
             let overlay_path = overlay_path_override
