@@ -6,7 +6,7 @@ use std::net::TcpStream;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::config::MachineConfig;
+use crate::config::{MachineConfig, NetworkConfig};
 use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEvent};
 use crate::locks::LockMonitor;
 use crate::eeprom_93c56::Eeprom93c56;
@@ -176,7 +176,7 @@ impl Machine {
         let timer_manager = Arc::new(TimerManager::new());
         ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());
-        let hpc3 = Hpc3::with_nfs(eeprom.clone(), ioc.clone(), true, heartbeat.clone(), cfg.nfs.clone(), cfg.port_forward.clone(), cfg.no_audio);
+        let hpc3 = Hpc3::with_net(eeprom.clone(), ioc.clone(), true, heartbeat.clone(), cfg.network(), cfg.no_audio);
         hpc3.set_timer_manager(timer_manager.clone());
 
         // Attach SCSI devices from config (IDs 1–7).

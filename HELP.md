@@ -67,6 +67,8 @@ Right control releases mouse grab.
 
 ### Addresses
 
+Default addresses (see [Changing the subnet](#changing-the-subnet) if `192.168.0.x` conflicts with your LAN):
+
 | Host | IP | Notes |
 |------|----|-------|
 | Gateway (emulated) | `192.168.0.1` | Responds to ARP and ICMP ping |
@@ -77,14 +79,14 @@ Right control releases mouse grab.
 
 IRIX can obtain its IP address automatically.  The built-in gateway responds
 to both BOOTP (plain) and DHCP (Discover/Request) on UDP port 67, and always
-assigns `192.168.0.2`.
+assigns host `.2` of the configured subnet (default `192.168.0.2`).
 
 DHCP reply options provided:
 
 | Option | Value |
 |--------|-------|
-| Subnet mask | `255.255.255.0` |
-| Router | `192.168.0.1` |
+| Subnet mask | `255.255.255.0` (or configured prefix) |
+| Router | Gateway IP (default `192.168.0.1`) |
 | DNS server | Host's upstream resolver (`8.8.8.8` by default) |
 | Lease time | 86400 s (24 h) |
 
@@ -93,9 +95,28 @@ DHCP reply options provided:
 All outbound TCP, UDP, and ICMP traffic from the guest is NATed through the
 host's network.
 
-ICMP ping to `192.168.0.1` is answered locally by the emulator (no host
+ICMP ping to the gateway IP is answered locally by the emulator (no host
 network needed), so it always works.  DNS queries are forwarded to the host's
 upstream resolver.
+
+### Changing the subnet
+
+If `192.168.0.x` conflicts with your local network, set `nat_subnet` in
+`iris.toml` to any `/24` (or larger) network:
+
+```toml
+nat_subnet = "192.168.5.0/24"
+```
+
+The gateway always gets host `.1` and IRIX gets host `.2` within the chosen
+subnet.  The change is purely internal — no host interface is created.  Prefixes
+from `/8` to `/30` are accepted; `/24` is the typical choice.
+
+You can also pass it on the command line:
+
+```bash
+iris --nat-subnet 192.168.5.0/24
+```
 
 ### Port forwarding
 

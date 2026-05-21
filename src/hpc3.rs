@@ -6,7 +6,7 @@ use std::io::Write as IoWrite;
 use crate::devlog::{LogModule, devlog_mask};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, DmaClient, DmaStatus, Resettable, Saveable};
 use crate::snapshot::{get_field, u32_slice_to_toml, load_u32_slice, toml_u32, toml_bool, hex_u32};
-use crate::config::NfsConfig;
+use crate::config::NetworkConfig;
 use crate::eeprom_93c56::Eeprom93c56;
 use crate::ioc::Ioc;
 use crate::ds1x86::Ds1x86;
@@ -966,10 +966,13 @@ pub struct Hpc3 {
 
 impl Hpc3 {
     pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>) -> Self {
-        Self::with_nfs(eeprom, ioc, guinness, heartbeat, None, vec![], false)
+        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false)
     }
 
-    pub fn with_nfs(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, nfs: Option<NfsConfig>, port_forwards: Vec<crate::config::PortForwardConfig>, headless: bool) -> Self {
+    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, headless: bool) -> Self {
+        let nfs = net.nfs;
+        let port_forwards = net.port_forward;
+        let subnet = net.nat_subnet.unwrap_or_default();
         let rtc = Arc::new(Ds1x86::new(8192));
         let pdma_dump = Arc::new(AtomicU32::new(0));
         
@@ -1026,7 +1029,14 @@ impl Hpc3 {
             hpc3_state: state.clone(),
             ioc:        ioc.clone(),
         });
-        let gateway_cfg = GatewayConfig { nfs, port_forwards, ..GatewayConfig::default() };
+        let gateway_cfg = GatewayConfig {
+            nfs,
+            port_forwards,
+            gateway_ip: subnet.gateway_ip,
+            client_ip:  subnet.client_ip,
+            netmask:    subnet.netmask,
+            ..GatewayConfig::default()
+        };
         let seeq = Arc::new(Seeq8003::with_config(Some(seeq_irq), Some(enet_rx_dma), Some(enet_tx_dma), gateway_cfg, heartbeat.clone()));
         // Publish seeq to both the DMA ops (CTRL reads) and the irq (status checks in set_interrupt)
         let _ = enet_seeq_lock.set(seeq.clone());

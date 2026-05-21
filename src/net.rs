@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use crate::config::{ForwardBind, ForwardProto, NfsConfig, PortForwardConfig};
+use crate::config::{ForwardBind, ForwardProto, NatSubnet, NfsConfig, PortForwardConfig};
 use crate::devlog::LogModule;
 use parking_lot::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -58,13 +58,14 @@ pub struct GatewayConfig {
 
 impl Default for GatewayConfig {
     fn default() -> Self {
+        let subnet = NatSubnet::default();
         Self {
-            gateway_mac: [0x02, 0x00, 0xDE, 0xAD, 0xBE, 0xEF],
-            gateway_ip:  Ipv4Addr::new(192, 168, 0, 1),
-            client_ip:   Ipv4Addr::new(192, 168, 0, 2),
-            netmask:     Ipv4Addr::new(255, 255, 255, 0),
+            gateway_mac:  [0x02, 0x00, 0xDE, 0xAD, 0xBE, 0xEF],
+            gateway_ip:   subnet.gateway_ip,
+            client_ip:    subnet.client_ip,
+            netmask:      subnet.netmask,
             dns_upstream: "8.8.8.8:53".parse().unwrap(),
-            nfs: None,
+            nfs:          None,
             port_forwards: vec![],
         }
     }

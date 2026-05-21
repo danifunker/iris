@@ -1,5 +1,6 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 
 /// Valid memory bank sizes in MB.
 pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128];
@@ -89,6 +90,33 @@ fn default_unfsd()          -> String { "unfsd".to_string() }
 fn default_nfs_host_port()  -> u16    { 12049 }
 fn default_mountd_host_port() -> u16  { 11234 }
 
+/// Pre-parsed NAT subnet derived from a CIDR string.
+#[derive(Debug, Clone, Copy)]
+pub struct NatSubnet {
+    pub gateway_ip: Ipv4Addr,
+    pub client_ip:  Ipv4Addr,
+    pub netmask:    Ipv4Addr,
+}
+
+impl Default for NatSubnet {
+    fn default() -> Self {
+        Self {
+            gateway_ip: Ipv4Addr::new(192, 168, 0, 1),
+            client_ip:  Ipv4Addr::new(192, 168, 0, 2),
+            netmask:    Ipv4Addr::new(255, 255, 255, 0),
+        }
+    }
+}
+
+/// Networking parameters extracted from `MachineConfig` for the NAT engine and HPC3.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkConfig {
+    pub nfs:          Option<NfsConfig>,
+    pub port_forward: Vec<PortForwardConfig>,
+    /// Parsed subnet; None means use the built-in default (192.168.0.0/24).
+    pub nat_subnet:   Option<NatSubnet>,
+}
+
 /// Top-level machine configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineConfig {
@@ -128,6 +156,12 @@ pub struct MachineConfig {
     /// If Some(port), start the GDB RSP stub on that TCP port.
     #[serde(default)]
     pub gdb_port: Option<u16>,
+
+    /// NAT subnet in CIDR notation (e.g. "192.168.5.0/24").
+    /// The gateway gets host .1 and the guest (IRIX) gets host .2.
+    /// Defaults to "192.168.0.0/24" if not set.
+    #[serde(default)]
+    pub nat_subnet: Option<String>,
 
     /// CI mode: opens a control socket for automation, applies speed-favoring
     /// fidelity shortcuts. Implies headless unless ci_display is also set.
@@ -189,6 +223,7 @@ impl Default for MachineConfig {
             headless: false,
             no_audio: false,
             gdb_port: None,
+            nat_subnet: None,
             ci: false,
             ci_socket: default_ci_socket(),
             ci_display: false,
@@ -225,6 +260,11 @@ impl MachineConfig {
                 ));
             }
         }
+        if let Some(ref s) = self.nat_subnet {
+            if let Err(e) = parse_nat_subnet(s) {
+                return Err(format!("nat_subnet \"{}\": {}", s, e));
+            }
+        }
         for (id, dev) in &self.scsi {
             if *id == 0 || *id > 7 {
                 return Err(format!("SCSI ID {} is out of range (1–7)", id));
@@ -234,6 +274,21 @@ impl MachineConfig {
             }
         }
         Ok(())
+    }
+
+    /// Extract network-related settings into a `NetworkConfig`.
+    /// Parses `nat_subnet` from CIDR — safe to unwrap because `validate()` already accepted it.
+    pub fn network(&self) -> NetworkConfig {
+        let nat_subnet = self.nat_subnet.as_deref().map(|cidr| {
+            let (gateway_ip, client_ip, netmask) = parse_nat_subnet(cidr)
+                .expect("nat_subnet: validate() should have caught this");
+            NatSubnet { gateway_ip, client_ip, netmask }
+        });
+        NetworkConfig {
+            nfs:          self.nfs.clone(),
+            port_forward: self.port_forward.clone(),
+            nat_subnet,
+        }
     }
 
     /// Return the active disc path for a CD-ROM device (first of `discs` list,
@@ -342,6 +397,11 @@ pub struct Cli {
     #[arg(long = "mountd-port", value_name = "PORT")]
     pub mountd_host_port: Option<u16>,
 
+    /// NAT subnet in CIDR notation (e.g. 192.168.5.0/24).
+    /// Gateway gets .1, guest (IRIX) gets .2. Default: 192.168.0.0/24.
+    #[arg(long = "nat-subnet", value_name = "CIDR")]
+    pub nat_subnet: Option<String>,
+
     /// Enable GDB stub on the given TCP port (e.g. --gdb-port 1234).
     /// Connect with: target remote localhost:<port>
     #[arg(long = "gdb-port", value_name = "PORT")]
@@ -424,6 +484,7 @@ impl Cli {
         }
 
         if let Some(p) = self.gdb_port { cfg.gdb_port = Some(p); }
+        if let Some(ref s) = self.nat_subnet { cfg.nat_subnet = Some(s.clone()); }
 
         cfg
     }
@@ -441,4 +502,29 @@ pub fn load_config() -> (MachineConfig, u32) {
         std::process::exit(1);
     }
     (cfg, scale)
+}
+
+/// Parse a CIDR string like "192.168.5.0/24" and return
+/// `(gateway_ip, client_ip, netmask)` where gateway=host .1, client=host .2.
+///
+/// Returns an error string on invalid input.
+pub fn parse_nat_subnet(cidr: &str) -> Result<(std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr), String> {
+    let (addr_str, prefix_str) = cidr.split_once('/').ok_or("expected format IP/PREFIX (e.g. 192.168.5.0/24)")?;
+    let base: std::net::Ipv4Addr = addr_str.parse().map_err(|_| format!("invalid IPv4 address \"{}\"", addr_str))?;
+    let prefix: u8 = prefix_str.parse().map_err(|_| format!("invalid prefix length \"{}\"", prefix_str))?;
+    if prefix > 30 {
+        return Err(format!("prefix /{} is too small (minimum /30)", prefix));
+    }
+    let mask = if prefix == 0 { 0u32 } else { !0u32 << (32 - prefix) };
+    let network = u32::from(base) & mask;
+    if u32::from(base) != network {
+        return Err(format!("address {} is not the network address for /{} (did you mean {}.0/{}?)",
+            base, prefix,
+            std::net::Ipv4Addr::from(network & 0xFFFFFF00),
+            prefix));
+    }
+    let netmask = std::net::Ipv4Addr::from(mask);
+    let gateway_ip = std::net::Ipv4Addr::from(network + 1);
+    let client_ip  = std::net::Ipv4Addr::from(network + 2);
+    Ok((gateway_ip, client_ip, netmask))
 }
