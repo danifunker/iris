@@ -467,6 +467,7 @@ fn emit_calculate_fb_address(
 /// after `calculate_fb_address` succeeds.
 /// `src_color`: already-resolved source (colorback substitution applied by caller).
 /// `x_bayer`/`y_bayer`: window-relative coords for dither index.
+/// `is_hostw`: when true, src_color is already from host — colorhost beats fastclear
 /// Emits the fb read → fastclear/blend/logicop result → wrmask → store.
 fn emit_pixel_write(
     b:           &mut FunctionBuilder,
@@ -478,6 +479,7 @@ fn emit_pixel_write(
     mem:         &MemFlags,
     memv:        &MemFlags,
     dm1:         &Dm1,
+    is_hostw:    bool,
 ) {
     let use_aux     = matches!(dm1.planes(),
         p if p == DRAWMODE1_PLANES_OLAY || p == DRAWMODE1_PLANES_PUP || p == DRAWMODE1_PLANES_CID);
@@ -512,8 +514,9 @@ fn emit_pixel_write(
         b.ins().iconst(types::I32, 0)
     };
 
-    // Mirrors fastclear_color / blend / logic_op paths in process_pixel_draw
-    let result_val: Value = if dm1.fastclear() {
+    // Mirrors fastclear_color / blend / logic_op paths in process_pixel_draw.
+    // colorhost beats fastclear
+    let result_val: Value = if dm1.fastclear() && !is_hostw {
         // fastclear_color: replicate colorvram nibble/byte/etc into all plane slots
         match dm1.drawdepth() {
             0 => {
@@ -561,20 +564,20 @@ fn emit_pixel_write(
         };
         let blend_dst = if dm1.backblend() { pctx.colorback_v } else { dst_24 };
         let blended   = emit_blend_ir(b, src_color, blend_dst, dm1.sfactor(), dm1.dfactor());
-        let packed    = bayer_pack_ir(b, blended, x_bayer, y_bayer);
         let compressed = if dm1.rgbmode() && dm1.drawdepth() != 3 {
+            let packed = bayer_pack_ir(b, blended, x_bayer, y_bayer);
             emit_compress_ir(b, packed, dm1.drawdepth(), dm1.dither())
-        } else { packed };
+        } else { blended };
         if dblsrc_shift > 0 {
             let shifted = b.ins().ishl_imm(compressed, dblsrc_shift);
             b.ins().bor(compressed, shifted)
         } else { compressed }
     } else {
         // logic op path: compress → amplify src, amplify dst, logic op
-        let packed     = bayer_pack_ir(b, src_color, x_bayer, y_bayer);
         let compressed = if dm1.rgbmode() && dm1.drawdepth() != 3 {
+            let packed = bayer_pack_ir(b, src_color, x_bayer, y_bayer);
             emit_compress_ir(b, packed, dm1.drawdepth(), dm1.dither())
-        } else { packed };
+        } else { src_color };
         let amp_src = if use_aux {
             amplify_aux_ir(b, compressed, dm1.planes())
         } else if dblsrc_shift > 0 {
@@ -952,13 +955,9 @@ fn emit_shader(
         fb_rgb, fb_aux,
     };
 
-    // For HOSTW: fetch the host pixel BEFORE calculate_fb_address (mirrors interpreter:
-    // fetch_host_pixel is called at the top of process_pixel_draw, before the address calc).
-    // Clipped pixels still advance the host shifter.
-    // For HOSTR: similarly, store_host_pixel is called after address calc — but hostcnt
-    // is checked first. We pre-advance for HOSTR too so the count stays in sync.
-    // Actually for HOSTR: the pixel is read from fb then packed — we need the address first.
-    // We handle HOSTW fetch before address, HOSTR pack after address.
+    // Host pixel is fetched only when the pattern passes and we're drawing from host (not colorback).
+    // We pre-compute the fetched shifter here so it's available after pattern checks, but
+    // clip-skips and pattern-skips pass host_shifter_v (un-fetched) to skip_block.
     let (host_pixel_v, host_shifter_after_fetch) = if is_hostw {
         emit_fetch_host_pixel_ir(&mut b, host_shifter_v, dm1)
     } else {
@@ -966,13 +965,13 @@ fn emit_shader(
         (z, host_shifter_v)
     };
 
-    // skip_args for clipped pixels: pass the (possibly already advanced by fetch) shifter.
-    // For HOSTR: clip doesn't advance the shifter (store_host_pixel not called on clip).
-    // For HOSTW: clip DOES advance (fetch happens before address calc in interpreter).
-    let clip_skip_args_buf: [Value; 1] = [host_shifter_after_fetch];
+    // Clip/pattern-skip: host pixel NOT consumed (pass un-fetched shifter).
+    let no_fetch_skip_args_buf: [Value; 1] = [host_shifter_v];
     let clip_skip_args: &[Value] = if is_hostw || is_hostr {
-        &clip_skip_args_buf[..]
+        &no_fetch_skip_args_buf[..]
     } else { &[] };
+    // After a successful draw from host: pass the fetched (advanced) shifter.
+    let clip_skip_args_buf: [Value; 1] = [host_shifter_after_fetch];
 
     let (px_ptr, x_bayer, y_bayer) = emit_calculate_fb_address(
         &mut b, x_v, y_v, &pctx, skip_block, clip_skip_args, dm0, dm1, is_scr2scr,
@@ -997,6 +996,9 @@ fn emit_shader(
         new_s // unreachable but satisfies type checker
     } else {
         // ── Source color ──────────────────────────────────────────────────────
+        // draw_use_bg_bool: set in the DRAW (non-scr2scr) path, used after src_color is resolved
+        // to decide whether we consumed a host pixel (false) or drew colorback (true).
+        let mut draw_use_bg_bool: Value = b.ins().iconst(types::I8, 0); // default: drew from host/DDA
         let src_color = if is_scr2scr {
             let use_aux = matches!(dm1.planes(),
                 p if p == DRAWMODE1_PLANES_OLAY || p == DRAWMODE1_PLANES_PUP || p == DRAWMODE1_PLANES_CID);
@@ -1086,8 +1088,8 @@ fn emit_shader(
                     let bg1 = b.ins().iconst(types::I8, 1);
                     b.ins().jump(zp_pass, &[bg1]);
                 } else {
-                    // Pattern miss and not opaque: skip write but shifter was already advanced
-                    let skip_args_here: &[Value] = if is_hostw { &clip_skip_args_buf[..] } else { &[] };
+                    // Pattern miss, not opaque: skip without consuming host pixel.
+                    let skip_args_here: &[Value] = if is_hostw { &no_fetch_skip_args_buf[..] } else { &[] };
                     b.ins().jump(skip_block, skip_args_here);
                 }
                 b.switch_to_block(zp_pass); b.seal_block(zp_pass);
@@ -1109,7 +1111,8 @@ fn emit_shader(
                     let bg1 = b.ins().iconst(types::I8, 1);
                     b.ins().jump(ls_pass, &[bg1]);
                 } else {
-                    let skip_args_here: &[Value] = if is_hostw { &clip_skip_args_buf[..] } else { &[] };
+                    // Pattern miss, not opaque: skip without consuming host pixel.
+                    let skip_args_here: &[Value] = if is_hostw { &no_fetch_skip_args_buf[..] } else { &[] };
                     b.ins().jump(skip_block, skip_args_here);
                 }
                 b.switch_to_block(ls_pass); b.seal_block(ls_pass);
@@ -1120,11 +1123,19 @@ fn emit_shader(
             b.switch_to_block(draw_block); b.seal_block(draw_block);
             let use_bg_flag = b.block_params(draw_block).to_vec()[0];
             let use_bg_bool = b.ins().icmp_imm(IntCC::NotEqual, use_bg_flag, 0);
+            draw_use_bg_bool = use_bg_bool;
             b.ins().select(use_bg_bool, colorback_v, raw_src)
         };
 
-        emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1);
-        let skip_args_after_write: &[Value] = if is_hostw { &clip_skip_args_buf[..] } else { &[] };
+        emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1, is_hostw);
+        // Advance the host shifter only when we drew from host, not from colorback.
+        let final_shifter: Value = if is_hostw && (dm0.colorhost() || dm0.alphahost()) {
+            b.ins().select(draw_use_bg_bool, no_fetch_skip_args_buf[0], host_shifter_after_fetch)
+        } else {
+            host_shifter_v
+        };
+        let final_shifter_buf: [Value; 1] = [final_shifter];
+        let skip_args_after_write: &[Value] = if is_hostw { &final_shifter_buf[..] } else { &[] };
         b.ins().jump(skip_block, skip_args_after_write);
         host_shifter_after_fetch
     };
@@ -1716,7 +1727,7 @@ fn emit_draw_iline(
         b.ins().select(use_bg_bool, colorback_v, raw_src)
     };
 
-    emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1);
+    emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1, false);
     b.ins().jump(skip_block, &[]);
 
     // ── skip_block: shade + pattern advance ──────────────────────────────────
@@ -2497,14 +2508,41 @@ fn emit_fetch_host_pixel_ir(
     let hostdepth  = dm1.hostdepth();
 
     // Extract pixel from MSB of shifter based on hostdepth.
-    // Non-packed (host_shift=0): the entire 32-bit value is in bits[63:32].
+    // Both packed and non-packed use the same top-of-shifter extraction — the difference is
+    // only how many pixels fit per word and whether the shifter advances.
+    // Non-packed: one pixel per GO, shifter loaded fresh each time.
+    //   where m_host_shift = 64 - s_host_shifts[hostdepth]:
+    //     4bpp  → shift=56, mask=0xF
+    //     8bpp  → shift=56, mask=0xFF
+    //     12bpp → shift=48, mask=0xFFF
+    //     32bpp → shift=32, mask=0xFFFFFFFF
     let (pixel_raw, new_shifter) = if !dm1.rwpacked() {
-        // Non-packed: one pixel per word, occupies high 32 bits.
-        let hi32  = b.ins().ushr_imm(shifter, 32);
-        let pixel = b.ins().ireduce(types::I32, hi32);
-        // Shift doesn't matter for non-packed (only one pixel), but advance anyway.
+        // Non-packed: extract pixel from the top of the shifter using same logic as packed.
+        let pixel_raw: Value = match hostdepth {
+            0 => {
+                let hi = b.ins().ushr_imm(shifter, 56);
+                let r  = b.ins().ireduce(types::I32, hi);
+                b.ins().band_imm(r, 0xF)
+            }
+            1 => {
+                let hi = b.ins().ushr_imm(shifter, 56);
+                let r  = b.ins().ireduce(types::I32, hi);
+                b.ins().band_imm(r, 0xFF)
+            }
+            2 => {
+                let hi = b.ins().ushr_imm(shifter, 48);
+                let r  = b.ins().ireduce(types::I32, hi);
+                b.ins().band_imm(r, 0xFFF)
+            }
+            _ => {
+                // 32bpp: full top 32 bits
+                let hi = b.ins().ushr_imm(shifter, 32);
+                b.ins().ireduce(types::I32, hi)
+            }
+        };
+        // Shifter is reloaded each GO in non-packed mode; advance is a no-op placeholder.
         let shifted = b.ins().ishl_imm(shifter, 32);
-        (pixel, shifted)
+        (pixel_raw, shifted)
     } else {
         let pixel_raw: Value = match hostdepth {
             0 => {

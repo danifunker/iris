@@ -554,17 +554,20 @@ fn to12_4_7(val: i32) -> u32 {
     (val as u32).rexget(9, 7)
 }
 
-// COLORRED: o12.11 for CI mode, o8.15 for RGB mode
-// Write format: o12.11 (9 top bits overflow, 12 integer, 11 fractional)
-// Read format: o12.11 (same masking)
-// COLORRED: o12.11 format in both CI and RGB modes.
-// Wire format: bits[23:0] = o1 + 12 integer bits + 11 fractional bits.
-// Color registers: plain u32.
-// COLORRED:         o12.11 — bits[23:0] stored raw (24 bits). bit31 = overflow/neg after DDA.
-// COLORALPHA/GRN/BLUE: o8.11 — bits[19:0] stored raw (20 bits).
+// COLORRED internal format: o12.11 (sign bit + 12 integer bits + 11 fractional bits = 24 bits).
+// Write wire format depends on mode:
+//   - 12-bit CI mode (rgbmode=0, drawdepth=2): o12.9 on the bus → shift left 2 into o12.11.
+//   - All other modes: o12.11 on the bus → store raw low 24 bits.
+// Read wire format: always o12.11, low 24 bits.
+// get_colori() in CI mode: integer part = bits[22:11], i.e. (colorred >> 11) & 0xFFF.
 
-fn from_color_red(val: u32, _drawmode1: DrawMode1) -> u32 {
-    val & 0xFFFFFF
+fn from_color_red(val: u32, drawmode1: DrawMode1) -> u32 {
+    if !drawmode1.rgbmode() && drawmode1.drawdepth() == 2 {
+        // 12-bit CI mode: bus value is o12.9, shift left 2 to store as o12.11.
+        (val << 2) & 0xFFFFFF
+    } else {
+        val & 0xFFFFFF
+    }
 }
 fn to_color_red(val: u32, _drawmode1: DrawMode1) -> u32 {
     val & 0xFFFFFF
@@ -1007,6 +1010,9 @@ pub struct Rex3 {
     pub px_wr: UnsafeCell<fn(&Rex3, u32, u32)>,
     pub px_amp: UnsafeCell<fn(u32) -> u32>,
     pub px_logic: UnsafeCell<fn(u32, u32) -> u32>,
+    /// Pack bayer index into bits [27:24] for dither compress functions (rgbmode=1 only).
+    /// In CI mode this is a no-op (returns color unchanged) — CI values need no dithering.
+    pub px_bayer: UnsafeCell<fn(u32, i32, i32) -> u32>,
     /// Compress 24-bit BGR → plane-depth pixel (rgbmode=1 only; identity otherwise).
     pub px_compress: UnsafeCell<fn(u32) -> u32>,
     /// Expand plane-depth pixel → 24-bit BGR (for blend dst; identity for CI/24bpp).
@@ -1165,6 +1171,7 @@ impl Rex3 {
             px_wr: UnsafeCell::new(Self::default_px_wr),
             px_amp: UnsafeCell::new(Self::amplify_nop),
             px_logic: UnsafeCell::new(Self::logic_op_src),
+            px_bayer: UnsafeCell::new(Self::bayer_pack),
             px_compress: UnsafeCell::new(Self::identity),
             px_expand: UnsafeCell::new(Self::identity),
             px_proc: UnsafeCell::new(Self::process_pixel_noop),
@@ -1918,6 +1925,7 @@ impl Rex3 {
     fn bayer_pack(color: u32, x: i32, y: i32) -> u32 {
         (color & 0x00FFFFFF) | (((y as u32 & 3) << 2 | (x as u32 & 3)) << 24)
     }
+    fn bayer_nop(color: u32, _x: i32, _y: i32) -> u32 { color }
 
     #[inline(always)]
     fn bayer_threshold(idx: u32) -> u32 {
@@ -2374,17 +2382,12 @@ impl Rex3 {
     fn process_pixel_draw(&self, ctx: &mut Rex3Context, x: i32, y: i32) {
         let colorhost = ctx.drawmode0.colorhost();
         let alphahost = ctx.drawmode0.alphahost();
-        
-        let host_pixel = if alphahost || colorhost {
-            self.fetch_host_pixel(ctx)
-        } else {
-            0
-        };
 
         let mut use_bg = false;
         let mut check_ls = true;
 
-        // Pattern checks use independent bit indices; advance is done by px_pattern after the pixel.
+        // Pattern checks first — host pixel only consumed when the pixel is actually drawn.
+        // MAME: get_host_color() called only inside if(BIT(pattern, bit)), never on skip/opaque paths.
         if ctx.drawmode0.enzpattern() {
             let bit = (ctx.zpattern >> ctx.zpat_bit) & 1 != 0;
             if !bit {
@@ -2407,6 +2410,13 @@ impl Rex3 {
                 }
             }
         }
+
+        // Fetch host pixel only when the pattern passes and we're drawing from host (not colorback).
+        let host_pixel = if !use_bg && (alphahost || colorhost) {
+            self.fetch_host_pixel(ctx)
+        } else {
+            0
+        };
 
         if let Some(addr) = self.calculate_fb_address(x, y, ctx, true) {
             // CID Masking
@@ -2441,14 +2451,16 @@ impl Rex3 {
                 };
                 let blended = self.blend(ctx, raw_src, dst_raw);
                 // Compress blended 24-bit result back to plane-depth before write.
-                compress_fn(Self::bayer_pack(blended, x, y))
+                let bayer_fn = unsafe { *self.px_bayer.get() };
+                compress_fn(bayer_fn(blended, x, y))
             } else {
                 // Logic op path: compress src to plane-depth, amplify for dblsrc, then logic op.
                 // dst also needs amplify: rd_fn shifts the value down (e.g. bits 15:8 → 7:0 for
                 // dblsrc slot 1), so we must shift it back up to match the write mask position.
+                let bayer_fn = unsafe { *self.px_bayer.get() };
                 let amp_fn = unsafe { *self.px_amp.get() };
                 let logic_fn = unsafe { *self.px_logic.get() };
-                let src = amp_fn(compress_fn(Self::bayer_pack(raw_src, x, y)));
+                let src = amp_fn(compress_fn(bayer_fn(raw_src, x, y)));
                 let dst = amp_fn(rd_fn(self, addr));
                 logic_fn(src, dst)
             };
@@ -2467,9 +2479,10 @@ impl Rex3 {
         if let Some(addr) = self.calculate_fb_address(x, y, ctx, true) {
             let wr_fn       = unsafe { *self.px_wr.get() };
             let amp_fn      = unsafe { *self.px_amp.get() };
+            let bayer_fn    = unsafe { *self.px_bayer.get() };
             let compress_fn = unsafe { *self.px_compress.get() };
             // SRC logicop: result = src, no dst read needed.
-            wr_fn(self, addr, amp_fn(compress_fn(Self::bayer_pack(ctx.get_colori(), x, y))));
+            wr_fn(self, addr, amp_fn(compress_fn(bayer_fn(ctx.get_colori(), x, y))));
         }
     }
 
@@ -2498,9 +2511,10 @@ impl Rex3 {
             let rd_fn       = unsafe { *self.px_rd.get() };
             let wr_fn       = unsafe { *self.px_wr.get() };
             let amp_fn      = unsafe { *self.px_amp.get() };
+            let bayer_fn    = unsafe { *self.px_bayer.get() };
             let compress_fn = unsafe { *self.px_compress.get() };
             let logic_fn    = unsafe { *self.px_logic.get() };
-            let src = amp_fn(compress_fn(Self::bayer_pack(raw_src, x, y)));
+            let src = amp_fn(compress_fn(bayer_fn(raw_src, x, y)));
             let dst = amp_fn(rd_fn(self, addr));
             wr_fn(self, addr, logic_fn(src, dst));
         }
@@ -3169,7 +3183,7 @@ impl Rex3 {
                     let no_zpopaque = !ctx.drawmode0.zpopaque();
                     let is_src_op   = ctx.drawmode1.logicop() == DRAWMODE1_LOGICOP_SRC >> 28;
 
-                    if ctx.drawmode1.fastclear() && no_cid {
+                    if ctx.drawmode1.fastclear() && no_cid && no_host {
                         Self::process_pixel_fastclear
                     } else if no_cid && no_host && no_blend && en_z && !en_ls && no_zpopaque && is_src_op {
                         // Character/glyph: zpattern kill only, SRC logicop — no dst read needed.
@@ -3335,11 +3349,14 @@ impl Rex3 {
             Self::identity
         };
 
+        let bayer_fn: fn(u32, i32, i32) -> u32 = if rgbmode { Self::bayer_pack } else { Self::bayer_nop };
+
         unsafe {
             *self.px_rd.get() = rd;
             *self.px_wr.get() = wr;
             *self.px_amp.get() = amp;
             *self.px_logic.get() = logic_fn;
+            *self.px_bayer.get() = bayer_fn;
             *self.px_compress.get() = compress;
             *self.px_expand.get() = expand;
             self.host_setup(drawmode1);
