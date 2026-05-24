@@ -25,6 +25,11 @@ scale = 1
 # typically absent.  Total RAM = sum of non-zero banks.
 banks = [128, 128, 0, 0]
 
+# NAT subnet for the internal network (CIDR notation).
+# The gateway gets host .1 and IRIX gets host .2.
+# Change this if 192.168.0.x conflicts with your local network.
+#nat_subnet = "192.168.5.0/24"
+
 # SCSI devices.
 # Valid IDs: 1–7.  The SCSI controller itself occupies ID 0.
 # Typical Indy layout:
