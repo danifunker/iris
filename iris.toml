@@ -110,7 +110,7 @@ bind       = "localhost"
 # For a single disc, set path only.
 # For a changer (cycled with "scsi eject 4" in the monitor), list all
 # ISO images in `discs`; the first entry is mounted at startup.
-#[scsi.4]
-#path   = "cdrom4.iso"
-#cdrom  = true
-##discs = ["second.iso", "cdrom4.iso", "patches.iso"]
+[scsi.4]
+path   = "cdrom4.iso"
+cdrom  = true
+discs = ["second.iso", "cdrom4.iso", "patches.iso"]
