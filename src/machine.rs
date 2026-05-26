@@ -450,12 +450,10 @@ impl Machine {
         self.hpc3.start();
         if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
 
-        // Monitor server on localhost:8888. Skipped in CI mode — the control
-        // socket replaces it, and binding a fixed port would prevent parallel
-        // `--ci` instances.
-        if self.ci_serial.is_none() {
-            self.monitor.clone().start_server("127.0.0.1:8888".to_string());
-        }
+        // Monitor server on localhost:8888 — always start, even in CI mode,
+        // so debug helpers (status/regs/bt/dis) stay reachable while iris-ci
+        // drives the serial console.
+        self.monitor.clone().start_server("127.0.0.1:8888".to_string());
 
         // CI mode: the harness drives startup via `restore` / `start`. Don't
         // autostart the CPU so the first command finds a quiet machine.
