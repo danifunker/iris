@@ -567,6 +567,12 @@ impl Machine {
         self.hpc3.ioc().ps2()
     }
 
+    /// Borrow the HPC3 controller — used by CI socket commands that touch
+    /// RTC/SCSI directly (`rtc-save`, `cdrom-eject`).
+    pub fn hpc3(&self) -> &Hpc3 {
+        &self.hpc3
+    }
+
     pub fn get_rex3(&self) -> Option<Arc<crate::rex3::Rex3>> {
         self._phys.rex3.clone()
     }

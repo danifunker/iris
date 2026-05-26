@@ -201,7 +201,34 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "tree"          => cmd_tree(),
         "pull"          => cmd_pull(&req.args),
         "push"          => cmd_push(&req.args),
+        "rtc-save"      => cmd_rtc_save(server, &req.args),
+        "cdrom-eject"   => cmd_cdrom_eject(server, &req.args),
         other => Response::err(format!("unknown command: {}", other)),
+    }
+}
+
+fn cmd_rtc_save(server: &CiServer, args: &Value) -> Response {
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("nvram.bin").to_string();
+    let result = server.with_machine(|m| {
+        m.hpc3().rtc().save_nvram(&path)
+    });
+    match result {
+        Ok(()) => Response::data(serde_json::json!({ "path": path })),
+        Err(e) => Response::err(format!("rtc-save: {}", e)),
+    }
+}
+
+fn cmd_cdrom_eject(server: &CiServer, args: &Value) -> Response {
+    let id = match args.get("id").and_then(|v| v.as_u64()) {
+        Some(n) => n as usize,
+        None => return Response::err("cdrom-eject: missing 'id' arg"),
+    };
+    let result = server.with_machine(|m| {
+        m.hpc3().scsi().eject_disc(id)
+    });
+    match result {
+        Ok(path) => Response::data(serde_json::json!({ "id": id, "new_disc": path })),
+        Err(e) => Response::err(format!("cdrom-eject: {}", e)),
     }
 }
 

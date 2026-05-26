@@ -168,6 +168,15 @@ enum Cmd {
 
     /// Run a sequence of iris-ci commands from a file (one per line, # comments).
     Script { path: PathBuf },
+
+    /// Persist the emulated DS1386 NVRAM/RTC state to a file (default nvram.bin).
+    RtcSave {
+        #[arg(long)]
+        path: Option<String>,
+    },
+
+    /// Cycle the CD changer on a SCSI ID to the next disc.
+    CdromEject { id: u64 },
 }
 
 #[derive(Subcommand, Debug)]
@@ -267,6 +276,15 @@ fn dispatch(opts: &Opts, cmd: Cmd) -> Result<()> {
         Cmd::Push { url, name } => cmd_push(opts, &url, &name),
 
         Cmd::Script { path } => cmd_script(opts, &path),
+
+        Cmd::RtcSave { path } => {
+            let args = match path {
+                Some(p) => json!({"path": p}),
+                None => json!({}),
+            };
+            simple(opts, "rtc-save", args, "nvram saved")
+        }
+        Cmd::CdromEject { id } => simple(opts, "cdrom-eject", json!({"id": id}), "ejected"),
     }
 }
 
