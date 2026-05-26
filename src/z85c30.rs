@@ -928,6 +928,11 @@ pub struct CiSerialBackend {
     host_to_guest: Mutex<VecDeque<u8>>,
     guest_to_host: Mutex<Vec<u8>>,
     cv: Condvar,
+    /// Optional file mirror: every byte that flows through ttyd1 in either
+    /// direction is appended here. Host-injected bytes are echoed by IRIX
+    /// anyway, so writing only guest output already captures the full
+    /// transcript without duplication.
+    log: Mutex<Option<std::fs::File>>,
 }
 
 impl CiSerialBackend {
@@ -936,7 +941,19 @@ impl CiSerialBackend {
             host_to_guest: Mutex::new(VecDeque::new()),
             guest_to_host: Mutex::new(Vec::new()),
             cv: Condvar::new(),
+            log: Mutex::new(None),
         }
+    }
+
+    /// Open a log file that will receive every guest output byte. Append-only;
+    /// existing contents are preserved. Errors are returned to the caller.
+    pub fn set_log_file(&self, path: &str) -> io::Result<()> {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        *self.log.lock() = Some(f);
+        Ok(())
     }
 
     /// Inject bytes from host to guest (the harness typing on the console).
@@ -1003,6 +1020,10 @@ fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 impl SerialBackend for CiSerialBackend {
     fn send_byte(&self, byte: u8) {
         self.guest_to_host.lock().push(byte);
+        if let Some(f) = self.log.lock().as_mut() {
+            let _ = f.write_all(&[byte]);
+            let _ = f.flush();
+        }
         self.cv.notify_all();
     }
 

@@ -176,6 +176,12 @@ pub struct MachineConfig {
     /// interactive test development.
     #[serde(default)]
     pub ci_display: bool,
+
+    /// Optional file path that will receive every byte emitted on ttyd1
+    /// (the IRIX serial console) in `--ci` mode. Append-only. Useful for
+    /// keeping a continuously-updated transcript of the install or test run.
+    #[serde(default)]
+    pub serial_log: Option<String>,
 }
 
 fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
@@ -227,6 +233,7 @@ impl Default for MachineConfig {
             ci: false,
             ci_socket: default_ci_socket(),
             ci_display: false,
+            serial_log: None,
         }
     }
 }
@@ -420,6 +427,11 @@ pub struct Cli {
     /// development (deferred rendering at 10–15 fps).
     #[arg(long = "ci-display", default_value_t = false)]
     pub ci_display: bool,
+
+    /// With --ci, append every byte the guest emits on ttyd1 (IRIX serial
+    /// console) to this file. Useful for live tailing during an install.
+    #[arg(long = "serial-log", value_name = "FILE")]
+    pub serial_log: Option<String>,
 }
 
 impl Cli {
@@ -464,6 +476,7 @@ impl Cli {
         if self.ci         { cfg.ci         = true; }
         if let Some(p) = &self.ci_socket { cfg.ci_socket = p.clone(); }
         if self.ci_display { cfg.ci_display = true; }
+        if let Some(p) = &self.serial_log { cfg.serial_log = Some(p.clone()); }
         // NB: --ci does NOT imply --headless. REX3 stays alive so screenshots
         // work; main.rs simply skips the host window when ci && !ci_display.
 

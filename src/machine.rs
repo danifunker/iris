@@ -168,6 +168,13 @@ impl Machine {
         // current backend Arc into the RX/TX threads).
         let ci_serial = if ci_enabled {
             let b = Arc::new(crate::z85c30::CiSerialBackend::new());
+            if let Some(path) = cfg.serial_log.as_deref() {
+                if let Err(e) = b.set_log_file(path) {
+                    eprintln!("iris: serial_log: failed to open {}: {}", path, e);
+                } else {
+                    eprintln!("iris: serial console mirroring to {}", path);
+                }
+            }
             ioc.scc().set_backend_b(b.clone());
             Some(b)
         } else {
