@@ -136,6 +136,12 @@ impl Saa7191 {
         *self.state.lock() = Saa7191State::default();
     }
 
+    /// True when the device has accepted an address byte and is mid-transfer.
+    /// VINO uses this to route subsequent bytes to the correct I2C target.
+    pub fn is_active(&self) -> bool {
+        self.state.lock().i2c_state != I2cState::Idle
+    }
+
     /// Set the IICSA pin state (false=LOW → addr 0x8A, true=HIGH → addr 0x8E).
     pub fn set_iicsa(&self, high: bool) {
         let mut st = self.state.lock();
@@ -155,10 +161,9 @@ impl Saa7191 {
                     st.i2c_state = I2cState::SubaddrWrite;
                 } else if data == st.i2c_read_addr {
                     st.i2c_state = I2cState::SubaddrRead;
-                } else {
-                    eprintln!("SAA7191: I2C idle, address {:#04x} ignored (mine: W={:#04x} R={:#04x})",
-                        data, st.i2c_write_addr, st.i2c_read_addr);
                 }
+                // Address didn't match — silently stay idle.  Another device
+                // on the shared bus may pick it up.
             }
             I2cState::SubaddrWrite => {
                 st.i2c_subaddr = data;

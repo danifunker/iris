@@ -117,6 +117,53 @@ pub struct NetworkConfig {
     pub nat_subnet:   Option<NatSubnet>,
 }
 
+/// Where VINO's video-in capture should come from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum VinoSource {
+    /// Live host camera capture (requires building with `--features camera`).
+    /// First run on macOS triggers the camera permission dialog.
+    Camera,
+    /// SMPTE-style colour bars + animated luma ramp.  No host capture needed.
+    TestPattern,
+    /// Solid black field.  Useful when you want IRIX video drivers to attach
+    /// but don't want any host camera permission prompt or test pattern.
+    Black,
+}
+
+impl Default for VinoSource {
+    fn default() -> Self { VinoSource::TestPattern }
+}
+
+/// Broadcast video standard the source emits.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum VinoStandard {
+    /// 525-line / 60-field interlaced (NTSC, 640×486 frame).
+    Ntsc,
+    /// 625-line / 50-field interlaced (PAL, 768×576 frame).
+    Pal,
+}
+
+impl Default for VinoStandard {
+    fn default() -> Self { VinoStandard::Ntsc }
+}
+
+/// VINO video-in configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VinoConfig {
+    /// Where the IndyCam feed comes from.
+    #[serde(default)]
+    pub source: VinoSource,
+    /// Broadcast standard.  Affects field rate (60 vs 50 Hz) and field size.
+    #[serde(default)]
+    pub standard: VinoStandard,
+    /// Index of the host camera to open (0 = default).  Only meaningful when
+    /// `source = "camera"`.
+    #[serde(default)]
+    pub camera_index: u32,
+}
+
 /// Top-level machine configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineConfig {
@@ -182,6 +229,10 @@ pub struct MachineConfig {
     /// keeping a continuously-updated transcript of the install or test run.
     #[serde(default)]
     pub serial_log: Option<String>,
+
+    /// VINO video-in configuration (IndyCam emulation source).
+    #[serde(default)]
+    pub vino: VinoConfig,
 }
 
 fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
@@ -234,6 +285,7 @@ impl Default for MachineConfig {
             ci_socket: default_ci_socket(),
             ci_display: false,
             serial_log: None,
+            vino: VinoConfig::default(),
         }
     }
 }

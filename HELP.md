@@ -323,6 +323,20 @@ cdrom = true
 # path  = "irix65.iso"
 # cdrom = true
 # discs = ["irix65.iso", "extras.iso", "patches.iso"]
+
+# VINO video-in (IndyCam emulation).
+# source:   "test_pattern" | "camera" | "black"
+# standard: "ntsc" | "pal"
+# camera_index: which host camera (0 = default; only used when source="camera")
+#
+# source = "camera" requires building with `cargo build --features camera`.
+# On macOS the first capture attempt triggers the system permission dialog;
+# if you deny it (or no camera is attached) iris falls back to a black field
+# so IRIX video drivers still attach cleanly.
+[vino]
+source       = "test_pattern"
+standard     = "ntsc"
+camera_index = 0
 ```
 
 Looks like we have some problems automounting hybrid ISO9660 CDs like Hot Mix 19 while efs formatted ones and pure iso9660 seem to work fine.
@@ -556,6 +570,8 @@ Changed") on the next `TEST UNIT READY` poll — no restart required.
 | `pit debug <on\|off>` | PIT trace **[DEV]** |
 | `hal2 status` | HAL2 audio controller state |
 | `ps2 debug <on\|off>` | PS/2 keyboard/mouse trace **[DEV]** |
+| `vino status` | VINO video-in registers, channel state, descriptor cache |
+| `vino debug <on\|off>` | VINO register/I2C trace **[DEV]** |
 
 ### Networking
 

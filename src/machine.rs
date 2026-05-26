@@ -325,8 +325,38 @@ impl Machine {
         // Connect HPC3 to System Memory (via Physical)
         hpc3.set_phys(phys.clone());
 
-        // Connect VINO to System Memory and start its DMA thread
+        // Connect VINO to System Memory, install a video source, start DMA.
+        // Source kind + broadcast standard come from `[vino]` in iris.toml.
         phys.vino.set_phys(phys.clone());
+        let standard = match cfg.vino.standard {
+            crate::config::VinoStandard::Ntsc => crate::video_source::VideoStandard::Ntsc,
+            crate::config::VinoStandard::Pal  => crate::video_source::VideoStandard::Pal,
+        };
+        let source: Arc<dyn crate::video_source::VideoSource> = match cfg.vino.source {
+            crate::config::VinoSource::Camera => {
+                #[cfg(feature = "camera")]
+                {
+                    let idx = cfg.vino.camera_index;
+                    match crate::camera::CameraSource::new_with_index(standard, idx) {
+                        Ok(c)  => Arc::new(c),
+                        Err(e) => {
+                            eprintln!("VINO: camera {} unavailable ({}); using black source", idx, e);
+                            Arc::new(crate::video_source::BlackSource::new(standard))
+                        }
+                    }
+                }
+                #[cfg(not(feature = "camera"))]
+                {
+                    eprintln!("VINO: source=\"camera\" set but iris was built without --features camera; using test pattern");
+                    Arc::new(crate::video_source::TestPatternSource::new(standard))
+                }
+            }
+            crate::config::VinoSource::TestPattern =>
+                Arc::new(crate::video_source::TestPatternSource::new(standard)),
+            crate::config::VinoSource::Black =>
+                Arc::new(crate::video_source::BlackSource::new(standard)),
+        };
+        phys.vino.set_source(source);
         phys.vino.start();
 
         // 5. CPU config + TLB + Executor

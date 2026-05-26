@@ -37,7 +37,15 @@ look at ide fpu test, convert to user space test, compile and run on irix, fix f
 watchhi/watchlo register support for debugging, translate variants that fire exception when hit
 
 
-HALF BAKED vino - all, hook up uvc camera
+vino — basic pixel pipeline, CDMC stub, and macOS UVC camera capture are
+       in (see [vino] in iris.toml).  Remaining work:
+       - per-port routing via SELECT_D1: today both VINO channels see the
+         same source; the real chip selects between SAA7191 composite (D0)
+         and CDMC IndyCam (D1) per channel
+       - I2C repeated-start so IRIX drivers that skip the subaddr resend
+         for reads (the standard protocol) work without a workaround
+       - end-to-end visual verification under IRIX (needs vl_eoe /
+         vino_eoe / indycam_eoe installed — not on the MAME CHD by default)
 
 DONE scsi - eject, load cd
 

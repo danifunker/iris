@@ -73,6 +73,7 @@ cargo run --release --features rex-jit               # enable REX3 graphics JIT 
 cargo run --release --features tlbvmap               # enable 8k slot to tlb entry map (increases cache use but may help depending on host cpu arch)
 cargo run --release --features ci_clock              # synthetic deterministic CP0 Compare clock (CI/snapshot validator only; loses realtime desktop timing)
 cargo run --release --features chd                   # mount .chd disk/CD-ROM images directly (via libchdman-rs); off by default to keep builds light
+cargo run --release --features camera                # use host camera as the IndyCam video source (macOS AVFoundation via nokhwa). See [vino] in iris.toml.
 cargo run --release --features lightning,rex-jit,tlbvmap     # recommended for best speed right now
 ```
 

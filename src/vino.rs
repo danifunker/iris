@@ -14,12 +14,15 @@
 ///   irix/stand/arcs/ide/IP22/video/VINO/vinohw.h — IRIX diagnostic headers
 
 use std::sync::Arc;
+use std::time::Duration;
 use parking_lot::{Mutex, Condvar};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device};
 use crate::saa7191::Saa7191;
+use crate::cdmc::Cdmc;
 use crate::devlog::{LogModule, devlog_is_active};
+use crate::video_source::{VideoSource, Field, FieldParity};
 
 /// Interrupt callback — implemented by the machine glue to assert/deassert
 /// the VINO interrupt line on the IOC.  Keeps vino.rs free of IOC details.
@@ -308,7 +311,8 @@ struct VinoState {
     i2c_ctrl:   u32,
     i2c_data:   u32,
     channels:   [ChannelState; 2],
-    dmsd:       Saa7191,  // Philips SAA7191B on the VINO I2C bus
+    dmsd:       Saa7191,  // Philips SAA7191B on the VINO I2C bus (addr 0x8A/0x8B)
+    cdmc:       Cdmc,     // SGI IndyCam controller on the same bus (addr 0xAE/0xAF)
 }
 
 impl Default for VinoState {
@@ -321,6 +325,7 @@ impl Default for VinoState {
             i2c_data:   0,
             channels:   [ChannelState::default(), ChannelState::default()],
             dmsd:       Saa7191::new(),
+            cdmc:       Cdmc::new(),
         }
     }
 }
@@ -347,6 +352,7 @@ pub struct Vino {
     state:   Arc<Mutex<VinoState>>,
     irq:     Arc<Mutex<Option<Arc<dyn VinoIrq>>>>,
     sys_mem: Arc<Mutex<Option<Arc<dyn BusDevice>>>>,
+    source:  Arc<Mutex<Option<Arc<dyn VideoSource>>>>,
     wake:    Arc<DmaWake>,
     running: Arc<AtomicBool>,
     thread:  Arc<Mutex<Option<thread::JoinHandle<()>>>>,
@@ -358,6 +364,7 @@ impl Vino {
             state:   Arc::new(Mutex::new(VinoState::default())),
             irq:     Arc::new(Mutex::new(None)),
             sys_mem: Arc::new(Mutex::new(None)),
+            source:  Arc::new(Mutex::new(None)),
             wake:    DmaWake::new(),
             running: Arc::new(AtomicBool::new(false)),
             thread:  Arc::new(Mutex::new(None)),
@@ -374,11 +381,19 @@ impl Vino {
         *self.sys_mem.lock() = Some(mem);
     }
 
+    /// Install the video input source.  Shared by both channels (per-port
+    /// routing via the SELECT_D1 control bit is a later-phase concern).
+    pub fn set_source(&self, src: Arc<dyn VideoSource>) {
+        *self.source.lock() = Some(src);
+        self.wake.notify();
+    }
+
     // ── Power-on reset ────────────────────────────────────────────────────
 
     pub fn power_on(&self) {
         let mut st = self.state.lock();
         st.dmsd.power_on(); // reset before overwriting the field
+        st.cdmc.power_on();
         *st = VinoState::default();
     }
 
@@ -546,50 +561,41 @@ impl Vino {
         }
     }
 
-    // ── DMA thread ────────────────────────────────────────────────────────
+    // ── DMA: emit one dword to memory at the current descriptor offset ────
 
-    /// Process one 64-bit dword of DMA output for channel `ch`.
-    /// Called with the state lock dropped; re-acquires and releases per call.
-    /// Returns false when DMA for this channel is complete or stopped.
-    fn process_channel_dword(&self, ch: usize, mem: &Arc<dyn BusDevice>) -> bool {
+    /// Write one assembled dword to system memory at the current channel's
+    /// DMA position, then advance `page_index` (handling 4 K rollover and
+    /// interleave-mode line skips).  Returns false if DMA stopped — either
+    /// the channel was disabled mid-flight, or the head descriptor had the
+    /// STOP bit set (in which case the DESC interrupt is raised here).
+    fn dma_emit_dword(&self, ch: usize, dword: u64, mem: &Arc<dyn BusDevice>) -> bool {
         let mut st = self.state.lock();
 
         let dma_en = [ctrl::CHA_DMA_EN, ctrl::CHB_DMA_EN][ch];
         if st.control & dma_en == 0 {
-            return false; // channel disabled
+            return false;
         }
 
         let chan = &mut st.channels[ch];
 
-        // Check for STOP bit on the head descriptor.
         if chan.descriptors[0] & desc::VALID_BIT != 0
-            && chan.descriptors[0] & desc::STOP_BIT != 0
+            && chan.descriptors[0] & desc::STOP_BIT  != 0
         {
-            // Raise DESC interrupt, disable DMA for this channel.
             let isr_desc = [isr::CHA_DESC, isr::CHB_DESC][ch];
             let new_status = st.int_status | isr_desc;
             let irq = self.irq.lock().clone();
             Self::raise_interrupt(&mut st, &irq, new_status);
-            let dma_bit = [ctrl::CHA_DMA_EN, ctrl::CHB_DMA_EN][ch];
-            st.control &= !dma_bit;
+            st.control &= !dma_en;
             return false;
         }
 
-        // Compute physical write address: descriptor base | page_index offset.
-        let desc_base = (chan.descriptors[0] as u32) & desc::PTR_MASK as u32;
+        let desc_base  = (chan.descriptors[0] as u32) & desc::PTR_MASK as u32;
         let write_addr = desc_base | (chan.page_index & 0x0FF8);
-
-        // In a real capture we'd assemble pixel data; for now write zero
-        // (the pixel pipeline is a separate future stub).
-        let dword: u64 = chan.next_dword;
-        drop(st); // release lock before memory write
+        drop(st);
 
         mem.write64(write_addr, dword);
 
-        // Re-acquire to advance page_index (and line_counter in interleaved mode).
         let mut st = self.state.lock();
-        let mem = mem.clone();
-
         let interleave = st.control & [ctrl::CHA_INTERLEAVE_EN, ctrl::CHB_INTERLEAVE_EN][ch] != 0;
         let chan = &mut st.channels[ch];
 
@@ -597,64 +603,210 @@ impl Vino {
         chan.page_index = (chan.page_index + 8) & 0x0FFF;
 
         if interleave {
-            // In interleaved mode the field is split into two interlaced lines
-            // within the same 4K page.  line_counter tracks our offset within
-            // the current scan-line; when it reaches line_size we have finished
-            // one line and must skip to the next (which starts line_size+8 bytes
-            // into the page, leaving room for the other field's line).
-            // MAME line_count_w: if line_counter == line_size → reset to 0,
-            // advance page_index by line_size+8 (jumping over the interleaved
-            // partner line), then let the normal 4K roll-over handle desc shift.
             chan.line_counter += 8;
             if chan.line_counter >= chan.line_size {
                 chan.line_counter = 0;
-                // Jump page_index forward past the partner scan-line.
                 let skip = chan.line_size.wrapping_add(8);
                 let new_page = chan.page_index.wrapping_add(skip);
                 chan.page_index = new_page & 0x0FFF;
-                // If either the +8 step or the line skip crossed 4K, shift descs.
                 if chan.page_index < old_page || new_page >= 0x1000 {
-                    Self::shift_descriptors(chan, &mem);
+                    Self::shift_descriptors(chan, mem);
                 }
                 return true;
             }
         }
 
         if chan.page_index < old_page {
-            // Rolled over 4K boundary — shift descriptor cache.
-            Self::shift_descriptors(chan, &mem);
+            Self::shift_descriptors(chan, mem);
         }
 
         true
     }
 
+    // ── Field pump: pull a field, clip/decimate/convert, DMA to memory ────
+
+    /// Decode the packed pixel format from CONTROL bits for channel `ch`.
+    fn channel_format(control: u32, ch: usize) -> PixelFormat {
+        let (luma_only, color_rgb, dither) = if ch == 0 {
+            (ctrl::CHA_LUMA_ONLY, ctrl::CHA_COLOR_SPACE_RGB, ctrl::CHA_DITHER_EN)
+        } else {
+            (ctrl::CHB_LUMA_ONLY, ctrl::CHB_COLOR_SPACE_RGB, ctrl::CHB_DITHER_EN)
+        };
+        if control & luma_only != 0 {
+            PixelFormat::Y8
+        } else if control & color_rgb != 0 {
+            if control & dither != 0 { PixelFormat::Rgba8 } else { PixelFormat::Rgba32 }
+        } else {
+            PixelFormat::Yuv422
+        }
+    }
+
+    /// Process one captured field for channel `ch`.  Applies the frame-rate
+    /// mask (dropping unselected fields), then clips/decimates and converts
+    /// to the channel's output format before pushing dwords through DMA.
+    /// Raises the channel's end-of-field interrupt regardless of drop state.
+    fn pump_field(&self, ch: usize, field: &Field, mem: &Arc<dyn BusDevice>) {
+        let (clip_start, clip_end, format, dec_h_only, decimation, frame_rate, field_counter)
+            = {
+            let st   = self.state.lock();
+            let chan = &st.channels[ch];
+            let dec_h_only_bit = if ch == 0 { ctrl::CHA_DECIMATE_HORIZ } else { ctrl::CHB_DECIMATE_HORIZ };
+            (chan.clip_start, chan.clip_end,
+             Self::channel_format(st.control, ch),
+             st.control & dec_h_only_bit != 0,
+             chan.decimation,
+             chan.frame_rate,
+             chan.field_counter)
+        };
+
+        let pal     = frame_rate & frame_rate::PAL != 0;
+        let modulus = if pal { 10 } else { 12 };
+        let mask    = (frame_rate >> frame_rate::MASK_SHIFT) & frame_rate::MASK_BITS;
+        let drop    = mask != 0 && (mask >> (field_counter % modulus)) & 1 == 0;
+
+        if !drop {
+            let x_start = (clip_start >> clip::X_SHIFT) & clip::X_MASK;
+            let x_end   = (clip_end   >> clip::X_SHIFT) & clip::X_MASK;
+            let (y_shift, y_mask) = match field.parity {
+                FieldParity::Even => (clip::YEVEN_SHIFT, clip::YEVEN_MASK),
+                FieldParity::Odd  => (clip::YODD_SHIFT,  clip::YODD_MASK),
+            };
+            let y_start = (clip_start >> y_shift) & y_mask;
+            let y_end   = (clip_end   >> y_shift) & y_mask;
+
+            if x_end > x_start && y_end > y_start {
+                let dec_x = decimation.max(1) as usize;
+                let dec_y = if dec_h_only { 1 } else { dec_x };
+                self.render_and_pump(ch, field, format,
+                    dec_x, dec_y,
+                    x_start, x_end, y_start, y_end, mem);
+            }
+        }
+
+        let mut st = self.state.lock();
+        st.channels[ch].field_counter = st.channels[ch].field_counter.wrapping_add(1);
+        let isr_eof    = if ch == 0 { isr::CHA_EOF } else { isr::CHB_EOF };
+        let new_status = st.int_status | isr_eof;
+        let irq        = self.irq.lock().clone();
+        Self::raise_interrupt(&mut st, &irq, new_status);
+    }
+
+    /// Walk the clipped rectangle in source coordinates with the configured
+    /// decimation, sample UYVY from the field, convert to `format`, pack
+    /// bytes MSB-first into 64-bit dwords, and stream them through DMA.
+    /// Each output line is zero-padded to a dword boundary so the channel's
+    /// interleave-mode line accounting stays in step with `line_size`.
+    fn render_and_pump(&self, ch: usize, field: &Field, format: PixelFormat,
+                       dec_x: usize, dec_y: usize,
+                       x_start: u32, x_end: u32, y_start: u32, y_end: u32,
+                       mem: &Arc<dyn BusDevice>) {
+        let src_w = field.width  as usize;
+        let src_h = field.height as usize;
+        let src   = &field.pixels;
+
+        let x0 = (x_start as usize).min(src_w);
+        let x1 = (x_end   as usize).min(src_w);
+        let y0 = (y_start as usize).min(src_h);
+        let y1 = (y_end   as usize).min(src_h);
+        if x1 <= x0 || y1 <= y0 { return; }
+
+        let mut accum: u64 = 0;
+        let mut bytes_in: u32 = 0;
+        let mut stopped = false;
+
+        let mut y = y0;
+        while y < y1 && !stopped {
+            let mut x = x0;
+            while x < x1 && !stopped {
+                let pair_x = x & !1;
+                let i      = (y * src_w + pair_x) * 2;
+                let u   = src[i    ];
+                let y0p = src[i + 1];
+                let v   = src[i + 2];
+                let y1p = src[i + 3];
+                let y_s = if x & 1 == 0 { y0p } else { y1p };
+
+                match format {
+                    PixelFormat::Y8 => {
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, y_s);
+                    }
+                    PixelFormat::Yuv422 => {
+                        // Emit a UYVY pair: U Y0 V Y1.  Pair with the next
+                        // decimated pixel for Y1, then advance x past it.
+                        let nx = x + dec_x;
+                        let y_n = if nx < x1 {
+                            let pair_nx = nx & !1;
+                            let ni      = (y * src_w + pair_nx) * 2;
+                            if nx & 1 == 0 { src[ni + 1] } else { src[ni + 3] }
+                        } else {
+                            y_s
+                        };
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, u);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, y_s);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, v);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, y_n);
+                        x += dec_x;
+                    }
+                    PixelFormat::Rgba32 => {
+                        let (r, g, b) = yuv_to_rgb(y_s, u, v);
+                        // SGI RGBA in memory: A R G B (alpha in the high byte).
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, 0xFF);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, r);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, g);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, b);
+                    }
+                    PixelFormat::Rgba8 => {
+                        let (r, g, b) = yuv_to_rgb(y_s, u, v);
+                        // BGR 2:3:3 packed into one byte: BB GGG RRR.
+                        let pix = ((b & 0xC0))            // B in bits [7:6]
+                                | ((g & 0xE0) >> 2)       // G in bits [5:3]
+                                | ((r & 0xE0) >> 5);      // R in bits [2:0]
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, pix);
+                    }
+                }
+
+                x += dec_x;
+            }
+            // Pad to dword boundary so interleave line accounting stays aligned.
+            while bytes_in != 0 && !stopped {
+                emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, 0);
+            }
+            y += dec_y;
+        }
+    }
+
     fn process_dma(&self) {
         loop {
-            // Sleep until a DMA enable bit is written.
-            self.wake.wait();
-            if !self.running.load(Ordering::Relaxed) { break; }
-
-            // Drain both channels one dword at a time, dropping and reacquiring
-            // the state lock on every iteration to allow CPU register updates.
-            loop {
-                if !self.running.load(Ordering::Relaxed) { return; }
-
-                let mem_opt = self.sys_mem.lock().clone();
-                let mem = match mem_opt {
-                    Some(m) => m,
-                    None => break,
-                };
-
+            let active = {
                 let st = self.state.lock();
-                let a_en = st.control & ctrl::CHA_DMA_EN != 0;
-                let b_en = st.control & ctrl::CHB_DMA_EN != 0;
-                drop(st);
-
-                if !a_en && !b_en { break; }
-
-                if a_en { self.process_channel_dword(0, &mem); }
-                if b_en { self.process_channel_dword(1, &mem); }
+                st.control & (ctrl::CHA_DMA_EN | ctrl::CHB_DMA_EN) != 0
+            };
+            if !active {
+                self.wake.wait();
+                if !self.running.load(Ordering::Relaxed) { return; }
+                continue;
             }
+            if !self.running.load(Ordering::Relaxed) { return; }
+
+            let mem = match self.sys_mem.lock().clone() {
+                Some(m) => m,
+                None    => { thread::sleep(Duration::from_millis(10)); continue; }
+            };
+            let src = match self.source.lock().clone() {
+                Some(s) => s,
+                None    => { thread::sleep(Duration::from_millis(10)); continue; }
+            };
+
+            // Blocks one field period; the source paces itself.
+            let field = src.next_field();
+
+            let (a_en, b_en) = {
+                let st = self.state.lock();
+                (st.control & ctrl::CHA_DMA_EN != 0,
+                 st.control & ctrl::CHB_DMA_EN != 0)
+            };
+            if a_en { self.pump_field(0, &field, &mem); }
+            if b_en { self.pump_field(1, &field, &mem); }
         }
     }
 
@@ -757,17 +909,34 @@ impl Vino {
                 st.i2c_ctrl = val & i2c_ctrl::MASK;
 
                 if prev & i2c_ctrl::NOT_IDLE != 0 && val & i2c_ctrl::NOT_IDLE == 0 {
-                    // NOT_IDLE cleared → STOP condition
+                    // NOT_IDLE cleared → STOP condition.  Reset both devices
+                    // since either (or neither) could have been the target.
                     st.dmsd.i2c_stop();
+                    st.cdmc.i2c_stop();
                 } else if val & i2c_ctrl::NOT_IDLE != 0 {
-                    // Transfer request: execute one byte
+                    // Transfer request: execute one byte.  Two devices share
+                    // the bus, so route by address: whichever is mid-transfer
+                    // gets subsequent bytes; the initial address byte is
+                    // broadcast so the matching device can claim it.
                     if val & i2c_ctrl::READ != 0 {
-                        // Read direction: fetch byte from SAA7191 → store in I2C_DATA
-                        let byte = st.dmsd.i2c_read();
+                        let byte = if st.dmsd.is_active() {
+                            st.dmsd.i2c_read()
+                        } else if st.cdmc.is_active() {
+                            st.cdmc.i2c_read()
+                        } else {
+                            0
+                        };
                         st.i2c_data = byte as u32;
                     } else {
-                        // Write direction: push I2C_DATA byte to SAA7191
-                        st.dmsd.i2c_write(st.i2c_data as u8);
+                        let data = st.i2c_data as u8;
+                        let saa_active  = st.dmsd.is_active();
+                        let cdmc_active = st.cdmc.is_active();
+                        if saa_active  { st.dmsd.i2c_write(data); }
+                        if cdmc_active { st.cdmc.i2c_write(data); }
+                        if !saa_active && !cdmc_active {
+                            st.dmsd.i2c_write(data);
+                            st.cdmc.i2c_write(data);
+                        }
                     }
                     // Transfer completes instantly (no real I2C bus timing)
                     st.i2c_ctrl &= !i2c_ctrl::XFER_BUSY;
@@ -880,6 +1049,35 @@ impl BusDevice for Vino {
         self.write32(addr + 4, val as u32);
         BUS_OK
     }
+}
+
+// ─── Pixel pipeline helpers (free functions to keep render_and_pump tidy) ────
+
+#[inline]
+fn emit_byte(vino: &Vino, ch: usize, mem: &Arc<dyn BusDevice>,
+             accum: &mut u64, bytes_in: &mut u32, stopped: &mut bool, b: u8) {
+    if *stopped { return; }
+    *accum = (*accum << 8) | (b as u64);
+    *bytes_in += 1;
+    if *bytes_in == 8 {
+        if !vino.dma_emit_dword(ch, *accum, mem) {
+            *stopped = true;
+        }
+        *accum = 0;
+        *bytes_in = 0;
+    }
+}
+
+/// BT.601 limited-range YCbCr → full-range RGB.  Fixed-point, no SIMD.
+#[inline]
+fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
+    let yf = y as i32 - 16;
+    let uf = u as i32 - 128;
+    let vf = v as i32 - 128;
+    let r = (298 * yf + 409 * vf + 128) >> 8;
+    let g = (298 * yf - 100 * uf - 208 * vf + 128) >> 8;
+    let b = (298 * yf + 516 * uf + 128) >> 8;
+    (r.clamp(0, 255) as u8, g.clamp(0, 255) as u8, b.clamp(0, 255) as u8)
 }
 
 // ─── Register name helper ─────────────────────────────────────────────────────
@@ -1026,5 +1224,275 @@ impl Device for Vino {
             _ => return Err("Usage: vino debug <on|off> | vino status".to_string()),
         }
         Ok(())
+    }
+}
+
+// ─── Pixel pipeline tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::{BusDevice, BUS_OK};
+    use crate::video_source::{Field, FieldParity};
+
+    /// Mock BusDevice that captures every write64 call.  We only care about
+    /// 64-bit writes — that's all `dma_emit_dword` issues.
+    struct MockMem { writes: Mutex<Vec<(u32, u64)>> }
+    impl MockMem {
+        fn new() -> Arc<Self> { Arc::new(Self { writes: Mutex::new(Vec::new()) }) }
+        /// Sequential byte image, sorted by address, big-endian per dword.
+        fn bytes(&self) -> Vec<u8> {
+            let mut w = self.writes.lock().clone();
+            w.sort_by_key(|(addr, _)| *addr);
+            let mut out = Vec::with_capacity(w.len() * 8);
+            for (_, val) in w { out.extend_from_slice(&val.to_be_bytes()); }
+            out
+        }
+        fn dword_count(&self) -> usize { self.writes.lock().len() }
+    }
+    impl BusDevice for MockMem {
+        fn write64(&self, addr: u32, val: u64) -> u32 {
+            self.writes.lock().push((addr, val));
+            BUS_OK
+        }
+    }
+
+    /// UYVY field where each pair stores a deterministic pattern:
+    ///   pix[i + 0] = 0x80 | pair_id   (U)
+    ///   pix[i + 1] = 0x10 | pair_id   (Y0 — even-x luma)
+    ///   pix[i + 2] = 0x40 | pair_id   (V)
+    ///   pix[i + 3] = 0x20 | pair_id   (Y1 — odd-x luma)
+    /// `pair_id` is just (line × pairs_per_line + pair) & 0x0F.
+    fn make_field(w: u32, h: u32) -> Field {
+        let mut pix = vec![0u8; (w * h * 2) as usize];
+        let ppl = w / 2;
+        for y in 0..h {
+            for pair in 0..ppl {
+                let pid = ((y * ppl + pair) & 0x0F) as u8;
+                let i   = ((y * w + pair * 2) * 2) as usize;
+                pix[i    ] = 0x80 | pid;
+                pix[i + 1] = 0x10 | pid;
+                pix[i + 2] = 0x40 | pid;
+                pix[i + 3] = 0x20 | pid;
+            }
+        }
+        Field { parity: FieldParity::Even, width: w, height: h, pixels: Arc::from(pix) }
+    }
+
+    /// Stand up a Vino with DMA enabled on channel A, a valid head descriptor,
+    /// clip covering the full input field (even parity), and the chosen format
+    /// + decimation set in CONTROL.  CHA_FIELD_INT_EN is set so EOF actually
+    /// surfaces in `int_status` instead of being masked off.
+    fn setup_vino(format: PixelFormat, dec: u32, dec_h_only: bool,
+                  w: u32, h: u32, desc_base: u32) -> (Vino, Arc<MockMem>) {
+        let vino = Vino::new();
+        let mem  = MockMem::new();
+        vino.set_phys(mem.clone());
+
+        let mut control = ctrl::CHA_DMA_EN | ctrl::CHA_FIELD_INT_EN;
+        match format {
+            PixelFormat::Yuv422 => {}
+            PixelFormat::Rgba32 => control |= ctrl::CHA_COLOR_SPACE_RGB,
+            PixelFormat::Rgba8  => control |= ctrl::CHA_COLOR_SPACE_RGB | ctrl::CHA_DITHER_EN,
+            PixelFormat::Y8     => control |= ctrl::CHA_LUMA_ONLY,
+        }
+        if dec > 1 {
+            control |= ctrl::CHA_DECIMATE_EN
+                     | ((dec - 1) << ctrl::CHA_DECIMATION_SHIFT);
+            if dec_h_only { control |= ctrl::CHA_DECIMATE_HORIZ; }
+        }
+
+        {
+            let mut st = vino.state.lock();
+            st.control = control;
+            let chan = &mut st.channels[0];
+            chan.decimation     = dec;
+            chan.descriptors[0] = (desc_base as u64 & desc::DATA_MASK) | desc::VALID_BIT;
+            chan.page_index     = 0;
+            chan.line_size      = 0;
+            chan.clip_start     = 0;
+            chan.clip_end       = (w & clip::X_MASK)
+                                | ((h & clip::YEVEN_MASK) << clip::YEVEN_SHIFT)
+                                | ((h & clip::YODD_MASK)  << clip::YODD_SHIFT);
+            chan.frame_rate     = 0;
+        }
+        (vino, mem)
+    }
+
+    #[test]
+    fn yuv422_full_field_is_byte_for_byte_passthrough() {
+        let (vino, mem) = setup_vino(PixelFormat::Yuv422, 1, false, 4, 2, 0x1000);
+        let field       = make_field(4, 2);
+        let mem_dyn: Arc<dyn BusDevice> = mem.clone();
+
+        vino.pump_field(0, &field, &mem_dyn);
+
+        let bytes = mem.bytes();
+        assert_eq!(bytes.len(), (field.width * field.height * 2) as usize);
+        assert_eq!(&bytes[..], &field.pixels[..],
+            "UYVY passthrough must copy input exactly");
+
+        let st = vino.state.lock();
+        assert_ne!(st.int_status & isr::CHA_EOF, 0, "CHA_EOF should fire");
+        assert_eq!(st.channels[0].field_counter, 1);
+    }
+
+    #[test]
+    fn y8_extracts_luma_byte_per_pixel() {
+        let (vino, mem) = setup_vino(PixelFormat::Y8, 1, false, 8, 1, 0x2000);
+        let field       = make_field(8, 1);
+        let mem_dyn: Arc<dyn BusDevice> = mem.clone();
+
+        vino.pump_field(0, &field, &mem_dyn);
+
+        let bytes = mem.bytes();
+        assert_eq!(bytes.len(), 8, "8 pixels → 1 dword → 8 bytes");
+        for x in 0..8u32 {
+            let pair_x = (x & !1) as usize;
+            let i      = pair_x * 2;
+            let expected = if x & 1 == 0 { field.pixels[i + 1] }
+                           else          { field.pixels[i + 3] };
+            assert_eq!(bytes[x as usize], expected,
+                "Y8 byte at x={} should be the per-pixel luma", x);
+        }
+    }
+
+    #[test]
+    fn rgba32_emits_argb_two_pixels_per_dword() {
+        let (vino, mem) = setup_vino(PixelFormat::Rgba32, 1, false, 2, 1, 0x3000);
+        let field       = make_field(2, 1);
+        let mem_dyn: Arc<dyn BusDevice> = mem.clone();
+
+        vino.pump_field(0, &field, &mem_dyn);
+
+        let bytes = mem.bytes();
+        assert_eq!(bytes.len(), 8, "2 pixels × 4 bytes each = one dword");
+        // Alpha is always 0xFF in slots [0] and [4].
+        assert_eq!(bytes[0], 0xFF);
+        assert_eq!(bytes[4], 0xFF);
+        // R/G/B for each pixel come from yuv_to_rgb of that pixel's (Y, U, V).
+        let (r0, g0, b0) = yuv_to_rgb(field.pixels[1], field.pixels[0], field.pixels[2]);
+        let (r1, g1, b1) = yuv_to_rgb(field.pixels[3], field.pixels[0], field.pixels[2]);
+        assert_eq!(&bytes[..],
+                   &[0xFF, r0, g0, b0, 0xFF, r1, g1, b1][..],
+                   "ARGB packing for the two pixels");
+    }
+
+    #[test]
+    fn frame_rate_mask_drops_field_but_still_raises_eof() {
+        let (vino, mem) = setup_vino(PixelFormat::Yuv422, 1, false, 4, 1, 0x4000);
+        // mask = 0x0FFE (bits 11..1 set, bit 0 clear) → drop field 0 (counter % 12 = 0)
+        {
+            let mut st = vino.state.lock();
+            st.channels[0].frame_rate    = 0x0FFE << frame_rate::MASK_SHIFT;
+            st.channels[0].field_counter = 0;
+        }
+        let field = make_field(4, 1);
+        let mem_dyn: Arc<dyn BusDevice> = mem.clone();
+
+        vino.pump_field(0, &field, &mem_dyn);
+
+        assert_eq!(mem.dword_count(), 0, "masked field should produce no DMA writes");
+        let st = vino.state.lock();
+        assert_ne!(st.int_status & isr::CHA_EOF, 0, "EOF must still fire on dropped fields");
+        assert_eq!(st.channels[0].field_counter, 1, "field_counter advances even when dropped");
+    }
+
+    // ─── I2C bus tests: SAA7191 + CDMC coexist on a shared bus ───────────
+
+    /// Push one byte through the VINO I2C bridge by way of the I2C_CONTROL /
+    /// I2C_DATA register pair, mirroring what an IRIX driver writes.
+    fn i2c_byte_write(vino: &Vino, byte: u8) {
+        vino.write_reg(reg::I2C_DATA, byte as u32);
+        vino.write_reg(reg::I2C_CONTROL, i2c_ctrl::NOT_IDLE);
+    }
+    fn i2c_byte_read(vino: &Vino) -> u8 {
+        vino.write_reg(reg::I2C_CONTROL, i2c_ctrl::NOT_IDLE | i2c_ctrl::READ);
+        let st = vino.state.lock();
+        st.i2c_data as u8
+    }
+    fn i2c_stop(vino: &Vino) {
+        vino.write_reg(reg::I2C_CONTROL, 0);
+    }
+
+    /// Helper: read one byte from a device register via I2C.
+    ///
+    /// Protocol: START → read-addr → subaddr → READ → STOP.  The current
+    /// saa7191/cdmc state machine routes the byte after a read-address as
+    /// the subaddress (it's a simplified model — real I2C uses a repeated
+    /// start instead, which is a future enhancement to support).
+    fn i2c_read_reg(vino: &Vino, read_addr: u8, subaddr: u8) -> u8 {
+        i2c_byte_write(vino, read_addr);
+        i2c_byte_write(vino, subaddr);
+        let v = i2c_byte_read(vino);
+        i2c_stop(vino);
+        v
+    }
+
+    /// Helper: write one byte to a device register via I2C.
+    /// Protocol: START → write-addr → subaddr → data → STOP.
+    fn i2c_write_reg(vino: &Vino, write_addr: u8, subaddr: u8, data: u8) {
+        i2c_byte_write(vino, write_addr);
+        i2c_byte_write(vino, subaddr);
+        i2c_byte_write(vino, data);
+        i2c_stop(vino);
+    }
+
+    #[test]
+    fn cdmc_version_register_reads_as_identification_value() {
+        let vino = Vino::new();
+        let v = i2c_read_reg(&vino, 0xAF, crate::cdmc::reg::VERSION);
+        assert_eq!(v, crate::cdmc::reg::VERSION_VAL,
+            "CDMC subaddress 0x00 should return the identification byte");
+    }
+
+    #[test]
+    fn cdmc_register_write_then_read_round_trips() {
+        let vino = Vino::new();
+        i2c_write_reg(&vino, 0xAE, crate::cdmc::reg::GAIN, 0x42);
+        let v = i2c_read_reg(&vino, 0xAF, crate::cdmc::reg::GAIN);
+        assert_eq!(v, 0x42, "CDMC GAIN register write should round-trip");
+    }
+
+    #[test]
+    fn saa7191_and_cdmc_dont_corrupt_each_other() {
+        let vino = Vino::new();
+
+        // Write CDMC GAIN = 0x77
+        i2c_write_reg(&vino, 0xAE, crate::cdmc::reg::GAIN, 0x77);
+        {
+            let st = vino.state.lock();
+            assert!(!st.dmsd.is_active() && !st.cdmc.is_active(),
+                "both devices back to idle after STOP");
+        }
+
+        // Address SAA7191 — must not touch CDMC state.
+        i2c_write_reg(&vino, 0x8A, crate::saa7191::reg::HUEC, 0x55);
+
+        // CDMC GAIN must still be 0x77.
+        let v = i2c_read_reg(&vino, 0xAF, crate::cdmc::reg::GAIN);
+        assert_eq!(v, 0x77, "CDMC state must survive SAA7191 traffic");
+    }
+
+    #[test]
+    fn horizontal_decimation_2x_halves_output_per_line() {
+        // 8-pixel-wide input, horizontal decimation 2× → 4 pixels per output line.
+        // YUV422 puts 4 pixels in one dword.  height = 1 → expect one dword total.
+        let (vino, mem) = setup_vino(PixelFormat::Yuv422, 2, true, 8, 1, 0x5000);
+        let field       = make_field(8, 1);
+        let mem_dyn: Arc<dyn BusDevice> = mem.clone();
+
+        vino.pump_field(0, &field, &mem_dyn);
+
+        let bytes = mem.bytes();
+        assert_eq!(bytes.len(), 8, "8 input pixels ÷ 2 = 4 output pixels = 1 dword");
+        // Sampled pixels in source are x = 0, 2, 4, 6 (step by dec_x=2).
+        // YUV422 emits U(x) Y(x) V(x) Y(x+2) for each iteration; iteration advances
+        // x by 2*dec_x = 4.  So iterations at x=0 and x=4:
+        //   it0: U=pix[0], Y=pix[1], V=pix[2], Y_next from x=2 → pair_x=2, i=4, even→pix[5]
+        //   it1: U=pix[8], Y=pix[9], V=pix[10], Y_next from x=6 → pair_x=6, i=12, even→pix[13]
+        let p = &field.pixels;
+        assert_eq!(&bytes[..],
+                   &[p[0], p[1], p[2], p[5], p[8], p[9], p[10], p[13]][..]);
     }
 }

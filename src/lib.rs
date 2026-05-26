@@ -53,7 +53,11 @@ pub mod ci;
 pub mod hptimer;
 pub mod hptimer_tests;
 pub mod vga_font;
+pub mod cdmc;
+#[cfg(feature = "camera")]
+pub mod camera;
 pub mod saa7191;
+pub mod video_source;
 pub mod vino;
 #[cfg(feature = "jit")]
 pub mod jit;
