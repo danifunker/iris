@@ -377,7 +377,68 @@ impl Device for Ioc {
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
         if cmd == "ioc" {
-            return Err("Usage: ioc status".to_string());
+            if args.first().copied() != Some("status") {
+                return Err("Usage: ioc status".to_string());
+            }
+            let s = self.state.lock();
+            fn bits8(v: u8, names: &[(u8, &str)]) -> String {
+                let mut out = Vec::new();
+                for (b, n) in names { if v & b != 0 { out.push(*n); } }
+                if out.is_empty() { "-".into() } else { out.join("|") }
+            }
+            let l0_names: &[(u8, &str)] = &[
+                (l0_regs::MAP_INT0, "MAP_INT0"), (l0_regs::GRAPHICS, "GRAPHICS"),
+                (l0_regs::PARALLEL, "PARALLEL"), (l0_regs::MC_DMA, "MC_DMA"),
+                (l0_regs::ETHERNET, "ETHERNET"), (l0_regs::SCSI1, "SCSI1"),
+                (l0_regs::SCSI0, "SCSI0"), (l0_regs::FIFO_FULL, "FIFO_FULL"),
+            ];
+            let l1_names: &[(u8, &str)] = &[
+                (l1_regs::VERTICAL_RETRACE, "VRETR"), (l1_regs::VIDEO_VSYNC, "VSYNC"),
+                (l1_regs::AC_FAIL, "ACFAIL"), (l1_regs::HPC_DMA, "HPC_DMA"),
+                (l1_regs::MAP_INT1, "MAP_INT1"), (l1_regs::GP2, "GP2"),
+                (l1_regs::PANEL, "PANEL"), (l1_regs::GP0, "GP0"),
+            ];
+            let map_names: &[(u8, &str)] = &[
+                (map_regs::SERIAL, "SERIAL"), (map_regs::KBD_MOUSE, "KBD_MOUSE"),
+                (1 << 1, "TIMER1"), (1 << 0, "TIMER0"),
+            ];
+            let l0_eff = s.l0_stat & s.l0_mask;
+            let l1_eff = s.l1_stat & s.l1_mask;
+            let map_eff0 = s.map_stat & s.map_mask0;
+            let map_eff1 = s.map_stat & s.map_mask1;
+            let ip2 = l0_eff != 0;
+            let ip3 = l1_eff != 0;
+            let ip4 = (s.map_stat & 0x01) != 0;
+            let ip5 = (s.map_stat & 0x02) != 0;
+            let ip6 = s.err_stat != 0;
+            let _ = writeln!(writer, "IOC INT3 state:");
+            let _ = writeln!(writer, "  L0  stat={:02x} [{}]  mask={:02x}  eff={:02x} [{}]",
+                s.l0_stat, bits8(s.l0_stat, l0_names), s.l0_mask, l0_eff, bits8(l0_eff, l0_names));
+            let _ = writeln!(writer, "  L1  stat={:02x} [{}]  mask={:02x}  eff={:02x} [{}]",
+                s.l1_stat, bits8(s.l1_stat, l1_names), s.l1_mask, l1_eff, bits8(l1_eff, l1_names));
+            let _ = writeln!(writer, "  MAP stat={:02x} [{}]  mask0={:02x}  eff0={:02x} [{}]  mask1={:02x}  eff1={:02x} [{}]",
+                s.map_stat, bits8(s.map_stat, map_names),
+                s.map_mask0, map_eff0, bits8(map_eff0, map_names),
+                s.map_mask1, map_eff1, bits8(map_eff1, map_names));
+            let _ = writeln!(writer, "  MAP_POL={:02x}  ERR_STAT={:02x}", s.map_pol, s.err_stat);
+            let _ = writeln!(writer, "  CPU IP lines: IP2={} IP3={} IP4=TMR0:{} IP5=TMR1:{} IP6=ERR:{}",
+                ip2, ip3, ip4, ip5, ip6);
+            let _ = writeln!(writer, "  Misc: sys_id={:02x} gc_select={:02x} gen_cntl={:02x} panel={:02x} read_reg={:02x} dma_sel={:02x} reset_reg={:02x} write_reg={:02x}",
+                s.sys_id, s.gc_select, s.gen_cntl, s.panel, s.read_reg, s.dma_sel, s.reset_reg, s.write_reg);
+            if let Some(ints) = &s.interrupts {
+                let raw = ints.load(Ordering::SeqCst);
+                let _ = writeln!(writer, "  Atomic interrupts word: {:016x}  (IP2={} IP3={} IP4={} IP5={} IP6={} IP7=TMR:{})",
+                    raw,
+                    (raw & CAUSE_IP2 as u64) != 0,
+                    (raw & CAUSE_IP3 as u64) != 0,
+                    (raw & CAUSE_IP4 as u64) != 0,
+                    (raw & CAUSE_IP5 as u64) != 0,
+                    (raw & CAUSE_IP6 as u64) != 0,
+                    (raw & (1u64 << 15)) != 0);
+            } else {
+                let _ = writeln!(writer, "  Atomic interrupts word: NOT WIRED (set_interrupts never called)");
+            }
+            return Ok(());
         }
         if cmd == "serial" {
             return self.scc.execute_command(cmd, args, writer);
