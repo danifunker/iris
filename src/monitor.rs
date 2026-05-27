@@ -41,13 +41,21 @@ impl Monitor {
 
 fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
     // Register this connection with DevLog so log output is broadcast here.
+    // Wrap in CrlfWriter so bare \n from log messages renders as CRLF on the
+    // telnet client side.
     if let Some(dl) = crate::devlog::DEVLOG.get() {
-        let w = Arc::new(Mutex::new(BufWriter::new(stream.try_clone().unwrap())));
-        dl.add_writer(w);
+        let w: crate::devlog::DevLogWriter = Arc::new(Mutex::new(
+            BufWriter::new(crate::telnet::CrlfWriter::new(stream.try_clone().unwrap()))
+        ));
+        dl.add_sink(w);
     }
 
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut writer = BufWriter::new(stream.try_clone().unwrap());
+    // Monitor is line-oriented: stay in NVT (passive telnet — strip inbound
+    // IAC, decline whatever the client offers, but don't initiate). The
+    // client keeps its local echo and line editor. Outbound goes through
+    // CrlfWriter so bare \n becomes CRLF on the wire as NVT requires.
+    let mut reader = BufReader::new(crate::telnet::TelnetReader::new_passive(stream.try_clone().unwrap()));
+    let mut writer = BufWriter::new(crate::telnet::CrlfWriter::new(stream.try_clone().unwrap()));
     let mut line = String::new();
     
     {
@@ -108,7 +116,7 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
         
         if !is_help {
             if let Some(dev) = target_device {
-                let cmd_writer = Box::new(BufWriter::new(stream.try_clone().unwrap()));
+                let cmd_writer = Box::new(BufWriter::new(crate::telnet::CrlfWriter::new(stream.try_clone().unwrap())));
                 match dev.execute_command(cmd, args, cmd_writer) {
                     Ok(_) => {
                     }

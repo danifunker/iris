@@ -429,9 +429,14 @@ impl SerialBackend for UnixSocketBackend {
     }
 }
 
+struct TcpConn {
+    stream: TcpStream,
+    telnet: crate::telnet::TelnetFilter,
+}
+
 struct TcpSocketBackend {
     listener: TcpListener,
-    stream: Mutex<Option<TcpStream>>,
+    conn: Mutex<Option<TcpConn>>,
 }
 
 impl TcpSocketBackend {
@@ -440,31 +445,43 @@ impl TcpSocketBackend {
         listener.set_nonblocking(true).expect("Failed to set nonblocking");
         Self {
             listener,
-            stream: Mutex::new(None),
+            conn: Mutex::new(None),
         }
     }
 }
 
 impl SerialBackend for TcpSocketBackend {
     fn send_byte(&self, byte: u8) {
-        let mut stream_guard = self.stream.lock();
-        if let Some(ref mut stream) = *stream_guard {
-            if let Err(e) = stream.write_all(&[byte]) {
+        let mut guard = self.conn.lock();
+        if let Some(ref mut c) = *guard {
+            let mut buf = Vec::with_capacity(2);
+            crate::telnet::escape_byte(byte, &mut buf);
+            if let Err(e) = c.stream.write_all(&buf) {
                 if e.kind() != io::ErrorKind::WouldBlock {
-                    *stream_guard = None;
+                    *guard = None;
                 }
             }
         }
     }
 
     fn recv_byte(&self) -> io::Result<u8> {
-        let mut guard = self.stream.lock();
-        
+        let mut guard = self.conn.lock();
+
         if guard.is_none() {
             match self.listener.accept() {
                 Ok((socket, _)) => {
                     socket.set_nonblocking(true)?;
-                    *guard = Some(socket);
+                    let mut c = TcpConn {
+                        stream: socket,
+                        telnet: crate::telnet::TelnetFilter::new(),
+                    };
+                    // Send the initial WILL/DO offers. If the write fails,
+                    // drop the connection — the client can reconnect.
+                    let hs = crate::telnet::TelnetFilter::initial_handshake();
+                    if c.stream.write_all(&hs).is_err() {
+                        return Err(io::Error::new(io::ErrorKind::WouldBlock, "handshake failed"));
+                    }
+                    *guard = Some(c);
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     return Err(io::Error::new(io::ErrorKind::WouldBlock, "No connection"));
@@ -473,22 +490,40 @@ impl SerialBackend for TcpSocketBackend {
             }
         }
 
-        if let Some(ref mut stream) = *guard {
+        // Pull bytes one at a time through the telnet filter until either a
+        // real data byte falls out or the socket has nothing more to give.
+        loop {
+            let c = guard.as_mut().unwrap();
             let mut buf = [0u8; 1];
-            match stream.read(&mut buf) {
-                Ok(1) => Ok(buf[0]),
-                Ok(_) => { // EOF
-                    *guard = None;
-                    Err(io::Error::new(io::ErrorKind::NotConnected, "EOF"))
+            match c.stream.read(&mut buf) {
+                Ok(1) => {
+                    let mut reply = Vec::new();
+                    let data = c.telnet.feed(buf[0], &mut reply);
+                    if !reply.is_empty() {
+                        if let Err(e) = c.stream.write_all(&reply) {
+                            if e.kind() != io::ErrorKind::WouldBlock {
+                                *guard = None;
+                                return Err(e);
+                            }
+                        }
+                    }
+                    if let Some(d) = data {
+                        return Ok(d);
+                    }
+                    // Telnet command consumed; keep reading.
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Err(io::Error::new(io::ErrorKind::WouldBlock, "WouldBlock")),
+                Ok(_) => {
+                    *guard = None;
+                    return Err(io::Error::new(io::ErrorKind::NotConnected, "EOF"));
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "WouldBlock"));
+                }
                 Err(e) => {
                     *guard = None;
-                    Err(e)
+                    return Err(e);
                 }
             }
-        } else {
-            Err(io::Error::new(io::ErrorKind::WouldBlock, "No connection"))
         }
     }
 }

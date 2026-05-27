@@ -23,6 +23,7 @@ pub mod ioc;
 pub mod physical;
 pub mod ds1x86;
 pub mod z85c30;
+pub mod telnet;
 pub mod monitor;
 pub mod locks;
 pub mod pit8254;
