@@ -33,7 +33,7 @@ use parking_lot::Mutex;
 // rest is image-control registers (brightness, hue, saturation, gamma, etc.).
 
 pub mod reg {
-    pub const VERSION:     u8 = 0x00; // r   Version / ID byte
+    pub const VERSION:     u8 = 0x00; // r   Version / ID byte (used by 6.5 inventory)
     pub const GAIN:        u8 = 0x01; // rw  Analog gain
     pub const BLUE_BAL:    u8 = 0x02; // rw  Blue balance
     pub const RED_BAL:     u8 = 0x03; // rw  Red balance
@@ -43,12 +43,36 @@ pub mod reg {
     pub const SHUTTER_LO:  u8 = 0x07; // rw  Shutter speed low byte
     pub const CONTROL:     u8 = 0x08; // rw  Control bits (AGC, AEC, AWB, etc.)
 
-    /// Number of writable register slots (0x00–0x08 inclusive = 9).
-    pub const COUNT: usize = 0x09;
+    // 0x09–0x0D unused (silently ignored)
+
+    pub const CAMERA_ID:   u8 = 0x0E; // r   Model/presence ID byte
+    //
+    // The IRIX 5.3 vino driver's `vinoCameraAttached()` reads this byte
+    // and considers the camera "present" iff the value is exactly 0x10.
+    // Disassembly of vinoCameraAttached in vino_main.o:
+    //   ...
+    //   addiu $a1, $zero, 0x56     ; CDMC I2C write addr
+    //   addiu $a2, $zero, 0x0e     ; subaddr
+    //   jal   vinoI2cReadReg
+    //   ...
+    //   addiu $at, $zero, 0x10
+    //   bnel  $v0, $at, not_attached
+    //
+    // Without this byte present at the expected value, the kernel prints
+    // "IndyCam not attached. [HELP=VINONOCAMERA_WARN]" and refuses to
+    // start frame capture even though videod / vlinfo have already
+    // enumerated the device.
+
+    // Total register slots — 0x00..=0x0E inclusive = 15.
+    pub const COUNT: usize = 0x0F;
 
     /// Identification value returned at subaddress 0x00.  Concrete IndyCam
     /// units returned 0x12; pick a value that lets driver probes succeed.
     pub const VERSION_VAL: u8 = 0x12;
+
+    /// Value returned at CAMERA_ID (0x0E). Must be exactly 0x10 for the
+    /// IRIX 5.3 vino driver's `vinoCameraAttached()` check to pass.
+    pub const CAMERA_ID_VAL: u8 = 0x10;
 }
 
 // ─── I2C state machine ────────────────────────────────────────────────────────
@@ -74,7 +98,8 @@ struct CdmcState {
 impl Default for CdmcState {
     fn default() -> Self {
         let mut regs = [0u8; reg::COUNT];
-        regs[reg::VERSION as usize] = reg::VERSION_VAL;
+        regs[reg::VERSION as usize]   = reg::VERSION_VAL;
+        regs[reg::CAMERA_ID as usize] = reg::CAMERA_ID_VAL;
         Self {
             regs,
             i2c_write_addr: 0x56,

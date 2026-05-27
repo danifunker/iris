@@ -354,6 +354,19 @@ impl Physical {
             self.device_map[i as usize] = black_hole_ptr;
         }
 
+        // HPC1 region (0x1FB00000–0x1FB80000) — older HPC chip iris doesn't
+        // emulate. IRIX still probes here during normal operation (visible as
+        // `MC: CPU Error at 1fb02000` etc. in stderr) and usually tolerates
+        // the bus error. Once vidtomem activates the vino capture pipeline,
+        // a kernel access here escalates to a hard panic
+        // ("PANIC: IRIX Killed due to Bus Error"). Mapping the region to the
+        // black hole (reads as zero, writes silently accepted) prevents the
+        // bus error from firing and avoids the panic — without implementing
+        // real HPC1 semantics, which would be a much larger emulation gap.
+        for i in (0x1FB00000u32 >> 16)..((HPC3_BASE - 1) >> 16) + 1 {
+            self.device_map[i as usize] = black_hole_ptr;
+        }
+
         // Map Newport/REX3 (4MB GIO slot at 0x1F000000) — only if graphics enabled
         if let Some(rex3_ptr) = rex3_ptr {
             for i in (NEWPORT_BASE >> 16)..((NEWPORT_END - 1) >> 16) + 1 {

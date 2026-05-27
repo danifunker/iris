@@ -1061,6 +1061,39 @@ impl Vino {
 // register (bit 2 is masked in read_reg/write_reg, matching mc.rs `& !4`).
 
 impl BusDevice for Vino {
+    // Byte/halfword accesses extract a sub-field of the underlying 32-bit
+    // register. The default trait impl returns BusRead8::err() / err which
+    // triggers a CPU bus error — and the IRIX vino driver does at least
+    // one 16-bit access (offset 0x16, half of INTR_STATUS) during the
+    // vidtomem path, escalating to a hard kernel panic
+    // (`PANIC: KERNEL FAULT … Bad addr: 0xa0080016`). Routing
+    // smaller-width accesses through read_reg keeps the bus quiet without
+    // imposing semantics the real chip doesn't have.
+    fn read8(&self, addr: u32) -> BusRead8 {
+        let aligned = addr & !3;
+        let shift = (3 - (addr & 3)) * 8;
+        let w = self.read_reg(aligned.wrapping_sub(VINO_BASE));
+        BusRead8::ok(((w >> shift) & 0xFF) as u8)
+    }
+
+    fn read16(&self, addr: u32) -> BusRead16 {
+        let aligned = addr & !3;
+        let shift = (2 - (addr & 2)) * 8;
+        let w = self.read_reg(aligned.wrapping_sub(VINO_BASE));
+        BusRead16::ok(((w >> shift) & 0xFFFF) as u16)
+    }
+
+    fn write8(&self, _addr: u32, _val: u8) -> u32 {
+        // Sub-word writes to MMIO registers are atypical; quietly accept
+        // them so the kernel doesn't panic. No partial-register update is
+        // performed — full-register semantics is what the driver expects.
+        BUS_OK
+    }
+
+    fn write16(&self, _addr: u32, _val: u16) -> u32 {
+        BUS_OK
+    }
+
     fn read32(&self, addr: u32) -> BusRead32 {
         let offset = addr.wrapping_sub(VINO_BASE);
         BusRead32::ok(self.read_reg(offset))
