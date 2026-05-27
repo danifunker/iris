@@ -478,17 +478,24 @@ fn cmd_wait_serial(server: &CiServer, args: &Value) -> Response {
 //
 // The scratch device is a raw SCSI LUN (`scratch = true` in iris.toml).
 // iris pre-formats the underlying file with a minimal SGI Volume Header at
-// sector 0 so IRIX recognises it (without the VH, /dev/rdsk/dks0dNvol
-// returns I/O error on every read). The VH defines partition slot 7
-// ("vol") spanning sectors 8..end and slot 8 ("vh") spanning sectors 0..7.
+// sector 0 so IRIX recognises it (without the VH, /dev/rdsk/dks0dN*
+// returns I/O error on every read). The VH defines three partitions
+// (see src/sgi_vh.rs):
+//   - slot  0 ("s0",  payload):     PT_RAW,    sectors 8..end
+//   - slot  8 ("vh",  volhdr):      PT_VOLHDR, sectors 0..7
+//   - slot 10 ("vol", whole-disk):  PT_VOLUME, sectors 0..end
 //
 // Wire convention:
 //   - `scratch-write` and `scratch-read` operate on the *payload* area —
 //     `offset = 0` means the first byte after the VH (raw byte 4096 in the
 //     underlying file). The VH is never touched by these commands.
-//   - The guest reads the same payload at offset 0 of /dev/rdsk/dks0dNvol
-//     because partition 7's first_block = 8.
-//   - Typical guest read: `dd if=/dev/rdsk/dks0d2vol bs=64k | tar xf -`.
+//   - The guest reads/writes the same payload at offset 0 of
+//     /dev/rdsk/dks0dNs0 (NOT /dev/rdsk/dks0dNvol — that one starts at
+//     sector 0 and so begins with the volume header itself; writing to it
+//     also clobbers the VH so future scratch ops misalign).
+//   - Typical guest read:  `dd if=/dev/rdsk/dks0d2s0 bs=64k | tar xf -`.
+//   - Typical guest write: `dd if=mydata of=/dev/rdsk/dks0d2s0 bs=512 conv=sync`
+//     (sector-aligned; conv=sync zero-pads the trailing partial sector).
 //
 // Each scratch op briefly stops the machine to quiesce in-flight SCSI I/O
 // (Machine::with_paused). The CPU is restarted only if it was running before
