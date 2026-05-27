@@ -57,8 +57,9 @@ boots to a usable system: shell, networking, X11, the works.
 ## Getting started
 
 You need:
-- `scsi1.raw` — raw hard disk image with IRIX 6.5.22 for Indy
-  (for a quick start get the MAME IRIX image from https://mirror.rqsall.com/sgi-mame/ and convert to raw using `chdman extractraw`)
+- A hard-disk image with IRIX 6.5.22 for Indy. To produce one, follow
+  `docs/irix-6.5.22-install.md` (install from the original 6.5.22 media
+  CDs into an empty CHD/raw disk).
 - `070-9101-011.bin` — Indy PROM image (optional; a default is embedded)
 
 ```

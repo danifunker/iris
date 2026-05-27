@@ -271,7 +271,14 @@ impl Physical {
         let unmapped_ram = UnmappedRam;
         let alias_bus = AliasBus::new(std::ptr::null::<ErrorBus>(), ALIAS_OFFSET);
         // VINO GIO alias: 0x1F08xxxx → 0x0008xxxx (subtract 0x1F000000 = add 0xFF000000)
-        let vino_gio_alias = AliasBus::new(std::ptr::null::<ErrorBus>(), 0xFF000000u32);
+        // GIO64 VINO aperture sits at 0x1F080000; the chip's primary registers
+        // live at physical 0x00080000 (VINO_BASE). To map 0x1F080000 → 0x00080000
+        // via wrapping_add we need offset = -(0x1F000000) = 0xE1000000.
+        // (Previously 0xFF000000 here, which is -(0x01000000), so vino probes
+        // through the GIO alias landed at 0x1E080000 — gio_err_ptr region —
+        // returning 0xFFFFFFFF. The IRIX vino driver's chip_id check then
+        // mismatches and no /hw/.../vino node is created.)
+        let vino_gio_alias = AliasBus::new(std::ptr::null::<ErrorBus>(), 0xE1000000u32);
         let black_hole = BlackHoleRegion::new();
 
         // Initialize lookup table with null - will be filled in init()

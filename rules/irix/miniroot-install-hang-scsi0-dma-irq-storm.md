@@ -40,8 +40,7 @@ kernel banner, prints
 then never produces another byte on ttyd1. CPU stays at ~7 MIPS in kernel
 text (`0x88008000–0x88012000`), no user-mode addresses, no faults. Same
 hang on both 6.5.18 (kernel `10151452`) and 6.5.22 (kernel `10070055`)
-miniroots. The same emulator boots the bundled MAME pre-installed CHD
-to login fine.
+miniroots.
 
 ## Reproducer
 
@@ -122,26 +121,24 @@ Possibilities, ranked by current evidence weight:
 - `src/wd33c93a.rs` — chip ASR/INT bit lifecycle; check whether DMA-end
   paths assert ASR.INT for the kernel to find
 
-## Compare against working pre-installed boot
+## Compare against working installed boot
 
-Extract `irix-6.5.22m-MAME.tar.xz` to a sibling dir, point `iris.toml`
-`[scsi.1]` at its `irix65.chd`, boot. At login:
+Once a fresh install completes (see `docs/irix-6.5.22-install.md`) and
+the installed disk boots multi-user, at login:
 
     IOC  L0  stat=00 [-]  mask=82
     HPC3 intstat = 00000000
     CPU  IP2=false
     Atomic interrupts word: 0x0000000000000000
 
-The same kernel runs to multi-user with zero residual `intstat`. Net
-delta = `intstat[SCSI0_DMA]` sticky vs. cleared. The bug is therefore
-specific to the IO pattern the miniroot (not the installed kernel)
-issues to SCSI0 on iris.
+The installed-system kernel runs to multi-user with zero residual
+`intstat`. Net delta = `intstat[SCSI0_DMA]` sticky vs. cleared. The bug
+is therefore specific to the IO pattern the miniroot (not the installed
+kernel) issues to SCSI0 on iris.
 
 ## Workarounds
 
-None known that don't risk regressing the working boot path. Using the
-bundled MAME CHD (`irix-6.5.22m-MAME.tar.xz`) bypasses the install
-entirely — but that's avoiding the bug, not fixing it.
+None known that don't risk regressing the working boot path.
 
 ## Fix attempts that did NOT work
 
@@ -158,7 +155,7 @@ working boot) or removed.
 
 2. **Drop IRQ raise inside SCSI_CTRL FLUSH branch**
    (`src/hpc3.rs:759-771` ScsiDmaOps::write, KEPT — verified not to
-   break MAME CHD boot). The FLUSH path used to call
+   break the installed-system boot path). The FLUSH path used to call
    `cb.set_dma_interrupt(true)` if `chan.xie`, on the theory that
    FLUSH should signal completion. Removed — IRIX miniroot acks the
    previous real IRQ and writes FLUSH as kernel-driven teardown; an

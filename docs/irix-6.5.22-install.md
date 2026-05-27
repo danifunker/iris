@@ -141,10 +141,12 @@ ic cdrom-eject 4
 ic serial-send "/CDROM/dist"
 ic serial-wait --timeout 180 "Install software from:"
 
-# Applications → /CDROM/dist (README pager pops; q to dismiss)
+# Applications → /CDROM/dist
+# (license-agreement pager auto-quits because step 4 set page_output off;
+#  do NOT send "q" — at the "Install software from:" prompt it means quit
+#  and pops you back to Inst> with only 4 CDs scanned)
 ic cdrom-eject 4
 ic serial-send "/CDROM/dist"
-ic serial-send "q"
 ic serial-wait --timeout 240 "Install software from:"
 
 # Foundation 1 → /CDROM/dist
@@ -208,6 +210,49 @@ Answer `y` to reboot into the freshly-installed system.
 PROM lands at the System Maintenance Menu; option `1` (Start System)
 boots from `dks0d1s0`. Watch the serial console for the IRIX login
 prompt.
+
+### 9. Remove the miniroot install stub from the volume header
+
+After the install completes, the SGI volume header on the boot disk
+still has an `ide` entry alongside `sash`:
+
+```
+IRIS # dvhtool -v list /dev/rdsk/dks0d1vh
+
+Current contents:
+        File name        Length     Block #
+        ide              343040           2
+        sash             343040         672
+```
+
+`ide` is the miniroot installer image. Sash checks for it on every boot
+and prints
+
+```
+It appears that a miniroot install failed.  Either the system is
+misconfigured or a previous installation failed.
+...
+Enter 'c' to continue with no state fixup.
+Enter 'f' to fix miniroot install state, and try again
+Enter 'a' to abort and return to menu.
+```
+
+even though the install actually succeeded — selecting `f` resets the
+in-progress flag but the next boot puts it back because the `ide` blob
+is still in the volume header. Remove it once and the prompt is gone
+for good:
+
+```
+IRIS # dvhtool -v delete ide /dev/rdsk/dks0d1vh
+IRIS # dvhtool -v list /dev/rdsk/dks0d1vh
+
+Current contents:
+        File name        Length     Block #
+        sash             343040         672
+```
+
+You don't lose anything you'll miss — to reinstall later you'd boot
+from a CD anyway, which writes a fresh `ide` for that session.
 
 ## Conflict resolution without `rulesoverride on`
 
@@ -281,14 +326,74 @@ loses these optionals:
 
 ## Iris-specific gotchas
 
-- **PROM `console=d`** — already the default; means PROM and IRIX
-  early boot output go to `/dev/ttyd1` → TCP 8881 → mirrored to
-  `irix-install-console.log` via the `serial_log` setting.
+- **PROM `console=d` is mandatory when `headless = true`.** With
+  `headless = true` in `iris.toml`, iris does not instantiate REX3, so
+  the Newport graphics slot at `0x1F000000-0x1F3FFFFF` is unmapped (see
+  `src/physical.rs` — REX3 is only mapped when `rex3_ptr.is_some()`).
+  The PROM's *Install System Software* option dereferences a graphics
+  console pointer on the install path; if nvram still has `console=g`
+  (typical leftover from a graphical 5.3 install), this panics
+  immediately after "Insert the installation CD-ROM, then press
+  <enter>:" with a UTLB miss at PC `0x97f9c39c`, bad address `0x1c`,
+  and the iris log floods with `MC: GIO Timeout at 1f0f1338`
+  (REX3_STATUS). The Maintenance Menu itself has a serial fallback
+  (you'll see `Cannot open video() for output` in the log) so the menu
+  is reachable, but option 2 isn't. **Before invoking option 2**, run
+  `setenv -f console d; rtc-save; exit` from the Command Monitor at
+  least once so the nvram persists `console=d`. Step 1 of this guide
+  already includes the `setenv` lines — add `setenv -f console d` to
+  that block if nvram was inherited from a 5.3 install.
 - **fx defaults** are correct on iris; `label/create/all` writes a
   standard SGI volume header with a root partition that mkfs will
   later format as XFS.
 - **`scsi eject 4`** vs `iris-ci cdrom-eject 4` are the same thing.
   Use the iris-ci form so it's scriptable.
-- The bundled MAME pre-installed CHD (`irix-6.5.22m-MAME.tar.xz`)
-  remains a backup — extract its `irix65.chd` over the empty one
-  if you'd rather skip the install entirely.
+
+## Driving the installer reliably
+
+The Inst program is interactive and emits prompts that don't always
+match `serial-wait` patterns cleanly. Two things bite hard:
+
+1. **Catalog rescans at the same path REPLACE, they don't accumulate**
+   — but only if you've already made selections. The "from" loop in
+   step 5 must scan all six CDs *before* any `install`/`keep` command
+   runs. Once a selection exists, re-entering the same path
+   (`/CDROM/dist`) inside `from` prompts:
+
+   ```
+   There are products marked for installation or removal.
+   Switching distributions will cause the selections to be lost.
+   Do you really want to switch distributions? (y/n)
+   ```
+
+   Answering `y` discards the prior catalog at that path. The doc's
+   `from`-loop is structured so all six CDs are scanned before any
+   selection — keep it that way. If you `done` out of the `from` loop
+   too early and then `from` again, you will hit this prompt for every
+   CD you swap in at `/CDROM/dist` and end up with only the last CD's
+   catalog. Symptom: `install eoe.sw.fonttools` returns "No matches"
+   for core eoe packages from Overlay 1.
+
+2. **`serial-wait` for `"Install software from:"` matches stale
+   buffer**, since that prompt persists across CD-load iterations. Wait
+   for `"100% Done\\."` (emitted exactly once per scan completion)
+   between CDs instead. And never drain the buffer with `serial-read`
+   while a `serial-wait` is in flight against the same socket — it
+   competes with the wait's stream and the wait will time out even
+   after the pattern has appeared.
+
+3. **Catch *all* prompt shapes proactively.** A narrow `tail -F | grep
+   -E "100% Done|Install software from:"` will miss `(y/n)`,
+   `Please enter a choice [1]:`, license-agreement `Press <Enter>`,
+   and `Inst>` returns. Use a wider filter that emits on any of:
+   `100% Done`, `Install software from:`, `Inst>` at EOL, `(y/n)`,
+   `Press` + `Enter`, `Please enter`, `[yes/no`, `Restart the system`,
+   `Insert.*press`, `ERROR:`, `Conflicts`, `PANIC|Exception`, lines
+   ending with `?`.
+
+4. **README/license pagers**. The Applications CD prints a multi-page
+   license agreement during scan. With `set page_output off` (step 4)
+   the pager is auto-quit and *no* `q` keystroke is needed — sending
+   `q` afterwards is interpreted as `quit` at the next prompt and pops
+   you back to `Inst>` prematurely. Earlier versions of this guide
+   recommended sending `q` after the Apps load; don't.

@@ -45,7 +45,7 @@ vino — basic pixel pipeline, CDMC stub, and macOS UVC camera capture are
        - I2C repeated-start so IRIX drivers that skip the subaddr resend
          for reads (the standard protocol) work without a workaround
        - end-to-end visual verification under IRIX (needs vl_eoe /
-         vino_eoe / indycam_eoe installed — not on the MAME CHD by default)
+         vino_eoe / indycam_eoe installed)
 
 DONE scsi - eject, load cd
 
