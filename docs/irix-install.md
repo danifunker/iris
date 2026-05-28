@@ -1,4 +1,7 @@
-# Installing IRIX 6.5.22 on iris (from scratch)
+# Installing IRIX on iris (from scratch)
+
+Covers **IRIX 5.3 for Indy** and **IRIX 6.5.22**. Where the two diverge
+the differences are called out inline as **5.3:** / **6.5.22:** notes.
 
 Adapted from <https://sgi.neocities.org/installguide> (which targets MAME)
 with the corrections and shortcuts we found running it through iris.
@@ -8,62 +11,79 @@ with the corrections and shortcuts we found running it through iris.
 - `iris` built with `--features chd,camera,lightning` (the WD33C93 +
   HPC3 fixes for the miniroot install path are part of mainline now;
   see `rules/irix/miniroot-install-hang-scsi0-dma-irq-storm.md`).
-- An **empty** `irix65.chd` (any size ≥ 4 GB) at SCSI ID 1. Create with
-  `chdman` (Homebrew: `brew install rom-tools`):
+- An **empty** boot disk at SCSI ID 1.
+  - **6.5.22:** uncompressed CHD ≥ 4 GB. Create with `chdman`
+    (Homebrew: `brew install rom-tools`):
 
-  ```bash
-  # 20 GB uncompressed CHD — sparse on disk (~20 MB used until written)
-  chdman createhd -o irix65.chd -s 21474836480 -ss 512 -c none
-  ```
+    ```bash
+    # 20 GB uncompressed CHD — sparse on disk (~20 MB used until written)
+    chdman createhd -o irix65.chd -s 21474836480 -ss 512 -c none
+    ```
 
-  iris auto-creates a `.diff.chd` sidecar next to compressed parents;
-  uncompressed CHDs are written in place, which is what you want for
-  a fresh install (no sidecar accumulation).
+    iris auto-creates a `.diff.chd` sidecar next to compressed parents;
+    uncompressed CHDs are written in place, which is what you want for
+    a fresh install (no sidecar accumulation).
+  - **5.3:** a raw sparse file is enough — 5.3 fits comfortably in
+    4 GB and the disk format `fx` writes is the same SGI VH iris's
+    raw-disk path understands. Create with:
+
+    ```bash
+    # 4 GB sparse raw — grows as inst writes
+    truncate -s 4G irix53.raw
+    ```
+
 - `prom.bin` is **not** required — iris falls back to an embedded PROM
   image when the file is missing. You'll see one line at startup:
   `Warning: Could not read PROM file 'prom.bin': ... — using embedded PROM`.
-- The six 6.5.22 ISOs (filenames vary by media kit — the names below
-  are the SGI 6.5.22 release-kit labels, which is what's typically on
-  disk under `irix/`):
-  - Installation Tools and Overlays (1 of 3) ← bootable (miniroot +
-    fx.ARCS + sashARCS) — the "Overlay 1" the recipe refers to
-  - Overlays (2 of 3)
-  - Overlays (3 of 3)
-  - IRIX 6.5 Applications November 2003
-  - IRIX 6.5 Foundation 1
-  - IRIX 6.5 Foundation 2
-  - IRIX Development Foundation 1.3 (optional — not in the recipe below)
+- Install ISOs:
+  - **6.5.22:** six (seven with Dev Foundation) ISOs. The names below
+    are the SGI 6.5.22 release-kit labels, typically on disk under
+    `irix/`:
+    - Installation Tools and Overlays (1 of 3) ← bootable (miniroot +
+      fx.ARCS + sashARCS) — the "Overlay 1" the recipe refers to
+    - Overlays (2 of 3)
+    - Overlays (3 of 3)
+    - IRIX 6.5 Applications November 2003
+    - IRIX 6.5 Foundation 1
+    - IRIX 6.5 Foundation 2
+    - IRIX Development Foundation 1.3 (optional — not in the recipe)
 
-  If your filenames differ from what's in the `iris.toml` snippet
-  below, edit the `discs = [...]` list to match the actual paths.
-  A clean template lives at `iris-irix65.toml` in this repo.
+    If your filenames differ, edit the `discs = [...]` list in the
+    toml to match. A clean template lives at `iris-irix65.toml`.
+  - **5.3:** a single CD covers everything 5.3 ever shipped on Indy:
+    `IRIX 5.3 for Indy.iso`. No CD swapping during install. Template
+    at `iris-irix53.toml`.
 
-## iris-irix65.toml
+## Install config
 
 Keep the install config separate from your day-to-day `iris.toml` —
-the install needs a different disk path, the full CD changer order,
-and the specific PROM env tweaks, and you don't want any of those
-bleeding into normal operation. A ready-to-edit template lives at
-the repo root as `iris-irix65.toml`; launch with `--config
-iris-irix65.toml --ci --ci-display`.
+the install needs a different disk path, the CD changer order, and
+specific PROM env tweaks, and you don't want any of those bleeding
+into normal operation. Two ready-to-edit templates live at the repo
+root: `iris-irix53.toml` for 5.3, `iris-irix65.toml` for 6.5.22.
+Launch with `--config <file> --ci --ci-display`.
 
-> ⚠️ **`headless = false` is mandatory for the install.** With
-> `headless = true`, iris doesn't map REX3 and miniroot's hinv
-> records `GFXBOARD=SERVER`. Inst then applies its
+> ⚠️ **`headless = false` is mandatory for the install — both
+> versions.** With `headless = true`, iris doesn't map REX3 and
+> miniroot's hinv records `GFXBOARD=SERVER`. Inst then applies its
 > `RGFXBOARD!=SERVER` tag filters and strips every Newport-specific
 > file — `Xsgi`, `gfxinit`, `/hw/gfx` autoconfig, board-specific
 > keymaps — while still marking subsystems like `x_eoe.sw.Server`
 > and `eoe.sw.gfx` as Installed. The system boots multi-user but
 > xdm has nothing to launch, and there is no in-place fix short of
-> redoing the install. See section 10 for the gory details. Pair
-> `headless = false` with `--ci --ci-display` so iris-ci stays
-> reachable while iris draws the Newport window miniroot needs to
-> see.
+> redoing the install. (5.3 was originally installed headless here
+> and exhibited exactly this — graphics packages present on the
+> ISO but never landed on disk.) See section 10 for the gory
+> details. Pair `headless = false` with `--ci --ci-display` so
+> iris-ci stays reachable while iris draws the Newport window
+> miniroot needs to see.
 
-The disk goes at SCSI 1, CD changer at SCSI 4 with Overlay 1 active
-and the rest in cycle order. Keep `[vino] source = "test_pattern"`
-for the install (avoid the 30 fps camera interrupt rate while
-booting); flip to `"camera"` after.
+The disk goes at SCSI 1, CD (or CD changer) at SCSI 4. Keep
+`[vino] source = "test_pattern"` for the install (avoid the 30 fps
+camera interrupt rate while booting); flip to `"camera"` after.
+
+**6.5.22:** CD changer on SCSI 4 with Overlay 1 active and the rest
+in cycle order:
 
 ```toml
 headless    = false
@@ -95,14 +115,50 @@ source = "test_pattern"
 proto = "tcp"; host_port = 2323; guest_port = 23; bind = "localhost"
 ```
 
+**5.3:** single CD, no `discs = [...]` list. The
+[scsi.2] scratch volume gives the host an out-of-band channel for
+copying files in/out without networking; useful both during and
+after install:
+
+```toml
+headless    = false
+no_audio    = false
+banks       = [128, 128, 0, 0]
+serial_log  = "irix-install-console.log"
+
+[scsi.1]
+path  = "irix53.raw"
+cdrom = false
+
+[scsi.2]
+path    = "scratch.raw"
+cdrom   = false
+overlay = false
+scratch = true
+size_mb = 16
+
+[scsi.4]
+path  = "irix65/IRIX 5.3 for Indy.iso"
+cdrom = true
+
+[vino]
+source = "test_pattern"
+
+[[port_forward]]
+proto = "tcp"; host_port = 2323; guest_port = 23; bind = "localhost"
+```
+
 ## Driving the install
 
 All commands go through `iris-ci`. Boot iris with `--ci --ci-display`
 (the `--ci-display` keeps the Newport window visible alongside the
-control socket, which is what allows miniroot to detect graphics):
+control socket, which is what allows miniroot to detect graphics).
+The commands below use `$CFG` so the same shell session works for
+either version:
 
 ```bash
-./target/release/iris --config iris-irix65.toml --ci --ci-display \
+export CFG=iris-irix53.toml   # or iris-irix65.toml
+./target/release/iris --config "$CFG" --ci --ci-display \
     > /tmp/iris.stdout.log 2>&1 &
 ```
 
@@ -170,8 +226,8 @@ So the bootstrap is a two-phase dance:
 # Phase A: seed nvram via a one-shot headless boot so the serial
 # console is the only console — sed the toml or use a separate
 # config; restore after.
-sed -i.bak 's/^headless    = false/headless    = true/' iris-irix65.toml
-./target/release/iris --config iris-irix65.toml --ci \
+sed -i.bak 's/^headless    = false/headless    = true/' "$CFG"
+./target/release/iris --config "$CFG" --ci \
     > /tmp/iris.stdout.log 2>&1 &
 ic ping; ic start
 
@@ -194,8 +250,8 @@ ic rtc-save                            # persist nvram.bin — REQUIRED
 ic quit
 
 # Phase B: real install, headless=false so REX3 is mapped.
-sed -i.bak 's/^headless    = true/headless    = false/' iris-irix65.toml
-./target/release/iris --config iris-irix65.toml --ci --ci-display \
+sed -i.bak 's/^headless    = true/headless    = false/' "$CFG"
+./target/release/iris --config "$CFG" --ci --ci-display \
     > /tmp/iris.stdout.log 2>&1 &
 ic ping; ic start
 
@@ -259,11 +315,24 @@ shot. Without them you'll spend an hour resolving 71 + 62 + ... cascading
 conflicts by hand — most of which are old-version-vs-new incompatibilities
 inst would happily skip if you let it.
 
-### 5. Load all six install distributions
+### 5. Load install distributions
 
-The order matters because each CD is mounted as `/CDROM/dist` (or
-`/CDROM/dist/unbundled` for Overlay 2's variant). Eject between each
-with `iris-ci cdrom-eject 4`.
+**5.3:** single CD, single `from` invocation:
+
+```bash
+ic serial-send "from"
+ic serial-send "1"                # /CDROM/dist
+ic serial-wait --timeout 90 "Inst>"
+```
+
+The 5.3 inst doesn't ask the feature/maintenance question, doesn't
+need any CD swapping, and finishes the catalog scan quickly. Skip to
+section 6 once you're back at `Inst>`.
+
+**6.5.22:** six CDs cycled through the changer. The order matters
+because each CD is mounted as `/CDROM/dist` (or `/CDROM/dist/unbundled`
+for Overlay 2's variant). Eject between each with `iris-ci
+cdrom-eject 4`.
 
 ```bash
 # Overlay 1 (already mounted) — Inst already pointed at /CDROM/dist
@@ -311,10 +380,26 @@ ic serial-wait --timeout 30 "Inst>"
 
 ### 6. The package-selection recipe
 
-This is the sgi.neocities recipe verbatim — `keep *` then carve out
-the standard set. With `rulesoverride on` from step 4, conflicting
-older versions get auto-deselected during `go` so you don't have to
-hand-resolve.
+**5.3:** the recipe is shorter (one CD, fewer subsystems). Pick the
+full desktop install — `install *` selects everything on the CD
+including the gfx_eoe / Newport graphics bits and the desktop stack
+(4Dwm, mwm, IndigoMagic toolchest). Then `go`:
+
+```bash
+ic serial-send "install *"
+ic serial-send "go"
+```
+
+If `go` reports conflicts (it shouldn't for a single-CD 5.3 install
+on an empty disk, but it can if you tried a partial install
+earlier), use the `Conflict resolution` appendix at the bottom of
+this doc. There is no `Foundations 1.1` cross-CD prereq problem on
+5.3 because everything is on one disc.
+
+**6.5.22:** the sgi.neocities recipe verbatim — `keep *` then carve
+out the standard set. With `rulesoverride on` from step 4,
+conflicting older versions get auto-deselected during `go` so you
+don't have to hand-resolve.
 
 ```bash
 ic serial-send "keep *"
@@ -513,13 +598,12 @@ ic quit
 ```
 
 Now use a non-headless config for the launch. Simplest: in
-`iris-irix65.toml`, remove `headless = true` (or set it `false`).
-The daily-use `iris.toml` is fine to keep for other disks. Flip
-vino back to `source = "camera"` here too if you want the IndyCam
-live.
+`$CFG`, remove `headless = true` (or set it `false`). The daily-use
+`iris.toml` is fine to keep for other disks. Flip vino back to
+`source = "camera"` here too if you want the IndyCam live.
 
 ```bash
-./target/release/iris --config iris-irix65.toml \
+./target/release/iris --config "$CFG" \
     > /tmp/iris.stdout.log 2>&1 &
 ```
 
