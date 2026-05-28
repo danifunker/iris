@@ -8,43 +8,84 @@ with the corrections and shortcuts we found running it through iris.
 - `iris` built with `--features chd,camera,lightning` (the WD33C93 +
   HPC3 fixes for the miniroot install path are part of mainline now;
   see `rules/irix/miniroot-install-hang-scsi0-dma-irq-storm.md`).
-- An **empty** `irix65.chd` (any size ≥ 4 GB) at SCSI ID 1.
-- The seven 6.5.22 ISOs in `irix/6.5.22/`:
-  - Overlay 1 of 3 ← bootable (miniroot + fx.ARCS + sashARCS)
-  - Overlay 2 of 3
-  - Overlay 3 of 3
-  - Applications November-2003
-  - Foundation 1
-  - Foundation 2
-  - Development Foundation 1.2 (optional — not in the recipe below)
+- An **empty** `irix65.chd` (any size ≥ 4 GB) at SCSI ID 1. Create with
+  `chdman` (Homebrew: `brew install rom-tools`):
 
-## iris.toml
+  ```bash
+  # 20 GB uncompressed CHD — sparse on disk (~20 MB used until written)
+  chdman createhd -o irix65.chd -s 21474836480 -ss 512 -c none
+  ```
 
-The disk at SCSI 1, CD changer at SCSI 4 with Overlay 1 active and the
-rest in the cycle order. Keep `[vino] source = "test_pattern"` for the
-install (avoid the 30 fps camera interrupt rate while booting); flip to
-`"camera"` after.
+  iris auto-creates a `.diff.chd` sidecar next to compressed parents;
+  uncompressed CHDs are written in place, which is what you want for
+  a fresh install (no sidecar accumulation).
+- `prom.bin` is **not** required — iris falls back to an embedded PROM
+  image when the file is missing. You'll see one line at startup:
+  `Warning: Could not read PROM file 'prom.bin': ... — using embedded PROM`.
+- The six 6.5.22 ISOs (filenames vary by media kit — the names below
+  are the SGI 6.5.22 release-kit labels, which is what's typically on
+  disk under `irix/`):
+  - Installation Tools and Overlays (1 of 3) ← bootable (miniroot +
+    fx.ARCS + sashARCS) — the "Overlay 1" the recipe refers to
+  - Overlays (2 of 3)
+  - Overlays (3 of 3)
+  - IRIX 6.5 Applications November 2003
+  - IRIX 6.5 Foundation 1
+  - IRIX 6.5 Foundation 2
+  - IRIX Development Foundation 1.3 (optional — not in the recipe below)
+
+  If your filenames differ from what's in the `iris.toml` snippet
+  below, edit the `discs = [...]` list to match the actual paths.
+  A clean template lives at `iris-irix65.toml` in this repo.
+
+## iris-irix65.toml
+
+Keep the install config separate from your day-to-day `iris.toml` —
+the install needs a different disk path, the full CD changer order,
+and the specific PROM env tweaks, and you don't want any of those
+bleeding into normal operation. A ready-to-edit template lives at
+the repo root as `iris-irix65.toml`; launch with `--config
+iris-irix65.toml --ci --ci-display`.
+
+> ⚠️ **`headless = false` is mandatory for the install.** With
+> `headless = true`, iris doesn't map REX3 and miniroot's hinv
+> records `GFXBOARD=SERVER`. Inst then applies its
+> `RGFXBOARD!=SERVER` tag filters and strips every Newport-specific
+> file — `Xsgi`, `gfxinit`, `/hw/gfx` autoconfig, board-specific
+> keymaps — while still marking subsystems like `x_eoe.sw.Server`
+> and `eoe.sw.gfx` as Installed. The system boots multi-user but
+> xdm has nothing to launch, and there is no in-place fix short of
+> redoing the install. See section 10 for the gory details. Pair
+> `headless = false` with `--ci --ci-display` so iris-ci stays
+> reachable while iris draws the Newport window miniroot needs to
+> see.
+
+The disk goes at SCSI 1, CD changer at SCSI 4 with Overlay 1 active
+and the rest in cycle order. Keep `[vino] source = "test_pattern"`
+for the install (avoid the 30 fps camera interrupt rate while
+booting); flip to `"camera"` after.
 
 ```toml
-headless = true
-no_audio = false
-banks = [128, 128, 0, 0]
-serial_log = "irix-install-console.log"
+headless    = false
+no_audio    = false
+banks       = [128, 128, 0, 0]
+serial_log  = "irix-install-console.log"
 
 [scsi.1]
 path  = "irix65.chd"
 cdrom = false
 
+# Adjust the paths below to match your actual ISO filenames.
 [scsi.4]
-path  = "irix/6.5.22/IRIX 6.5.22 Overlay 1 of 3.iso"
+path  = "irix/IRIX 6.5.22 Installation Tools and Overlays (1 of 3).iso"
 cdrom = true
 discs = [
-  "irix/6.5.22/IRIX 6.5.22 Overlay 1 of 3.iso",
-  "irix/6.5.22/IRIX 6.5.22 Overlay 2 of 3.iso",
-  "irix/6.5.22/IRIX 6.5.22 Overlay 3 of 3.iso",
-  "irix/6.5.22/IRIX 6.5.22 Applications November-2003.iso",
-  "irix/6.5.22/IRIX-6.5-Foundation1.iso",
-  "irix/6.5.22/IRIX-6.5-Foundation2.iso",
+  "irix/IRIX 6.5.22 Installation Tools and Overlays (1 of 3).iso",
+  "irix/IRIX 6.5.22 Overlays (2 of 3).iso",
+  "irix/IRIX 6.5.22 Overlays (3 of 3).iso",
+  "irix/IRIX 6.5 Applications November 2003.iso",
+  "irix/IRIX 6.5 Foundation 1.iso",
+  "irix/IRIX 6.5 Foundation 2.iso",
 ]
 
 [vino]
@@ -56,23 +97,127 @@ proto = "tcp"; host_port = 2323; guest_port = 23; bind = "localhost"
 
 ## Driving the install
 
-All commands go through `iris-ci`. Boot iris with `--ci`, then in another
-shell:
+All commands go through `iris-ci`. Boot iris with `--ci --ci-display`
+(the `--ci-display` keeps the Newport window visible alongside the
+control socket, which is what allows miniroot to detect graphics):
+
+```bash
+./target/release/iris --config iris-irix65.toml --ci --ci-display \
+    > /tmp/iris.stdout.log 2>&1 &
+```
+
+Then in another shell:
 
 ```bash
 alias ic=./target/release/iris-ci
+ic ping     # liveness check
+ic start    # CPU thread does not auto-start in --ci mode
 ```
 
-### 1. PROM env (one-time)
+### Watch prompts with `tools/inst-watch.py`
+
+The install asks 20+ interactive questions across a couple of hours.
+Driving it with chained `serial-wait` calls is fragile (stale buffer
+matches, prompt-shape variants, race against `serial-read`). Instead
+run `tools/inst-watch.py` as a persistent background watcher — it
+tails `irix-install-console.log` and emits one classified event per
+stall (`mkfs_confirm`, `numbered_choice`, `install_software_from`,
+`yn_confirm`, `inst_ready`, `cd_swap`, `restart_confirm`, etc.) with
+a hint for how to respond. From Claude Code:
+
+```
+Monitor: tools/inst-watch.py --log irix-install-console.log --quiet-secs 6 --json
+```
+
+From a shell, just run it in the foreground and react to each event
+line as it appears. The classifier is in the script's docstring;
+add new prompt shapes there if you find one it doesn't recognise.
+
+**Avoid `serial-read` while a `serial-wait` is in flight on the same
+socket** — they race and you'll see `connect /tmp/iris.sock: Resource
+temporarily unavailable (os error 35)`. Pick one: drive entirely
+through `inst-watch.py` events, or use only `serial-wait` between
+sends.
+
+**`tail -F … | grep` won't see prompts that have no trailing newline.**
+The `Restart? { (y)es, (n)o, (sh)ell, (h)elp }:` line and a few others
+are written without a `\n` because Inst is waiting for input on the
+same line. `grep --line-buffered` still buffers until end-of-line, so a
+`Monitor: tail -F | grep "Restart"` will silently miss the prompt and
+only fire after you've already responded (the keystroke produces the
+newline that flushes the line). Use `iris-ci serial-wait "Restart"`
+for prompts of this shape — it scans the byte stream, not lines.
+Prompts with this gotcha that have bitten this install: the `Restart?`
+prompt above, `Are you sure? [y/n] (n):`, `Block size of filesystem
+512 or 4096 bytes?`, `Install software from: [/CDROM/dist]`, fx's
+`fx> ` and `fx/label/create> ` prompts, and the PROM monitor `>> `.
+
+### 1. PROM env (one-time, with a small chicken-and-egg)
+
+A fresh iris launch reads `nvram.bin`. If the file is missing or its
+checksum is bad iris prints `NVRAM checksum is incorrect:
+reinitializing.` on the serial console and resets the PROM env to
+defaults — including `ConsoleIn=serial(0)`, but the PROM at that
+point hasn't latched onto serial yet and `console` is unset (effective
+`console=g`). With `headless = false` the graphics console takes
+priority and **the serial channel is dead-eared until you've
+explicitly set `console=d` in nvram and persisted it**. You can't do
+that from the serial console because the PROM isn't listening.
+
+So the bootstrap is a two-phase dance:
 
 ```bash
+# Phase A: seed nvram via a one-shot headless boot so the serial
+# console is the only console — sed the toml or use a separate
+# config; restore after.
+sed -i.bak 's/^headless    = false/headless    = true/' iris-irix65.toml
+./target/release/iris --config iris-irix65.toml --ci \
+    > /tmp/iris.stdout.log 2>&1 &
+ic ping; ic start
+
+# Wait for the System Maintenance Menu. The exact prompt is "Option?"
+# (NOT "Stop for Maintenance" — that string never appears in iris's
+# embedded-PROM serial output; the menu draws straight to "Option?").
+ic serial-wait --timeout 60 "Option?"
+
 ic serial-send "5"                # Command Monitor
+ic serial-wait --timeout 10 ">> " # PROM monitor prompt
 ic serial-send "setenv -f eaddr 08:00:69:de:ad:01"
+ic serial-wait --timeout 10 ">> "
 ic serial-send "setenv -f SystemPartition scsi(0)disk(1)rdisk(0)partition(8)"
+ic serial-wait --timeout 10 ">> "
 ic serial-send "setenv -f OSLoadPartition scsi(0)disk(1)rdisk(0)partition(0)"
-ic rtc-save                       # persist nvram.bin
-ic serial-send "exit"
+ic serial-wait --timeout 10 ">> "
+ic serial-send "setenv -f console d"   # routes output to serial
+ic serial-wait --timeout 10 ">> "
+ic rtc-save                            # persist nvram.bin — REQUIRED
+ic quit
+
+# Phase B: real install, headless=false so REX3 is mapped.
+sed -i.bak 's/^headless    = true/headless    = false/' iris-irix65.toml
+./target/release/iris --config iris-irix65.toml --ci --ci-display \
+    > /tmp/iris.stdout.log 2>&1 &
+ic ping; ic start
+
+# The default PROM env has AutoLoad=Yes, so the PROM tries to chain-load
+# sash from the (still unformatted) disk before falling through to the
+# Maintenance Menu. You'll see:
+#
+#   No volume header on device: scsi(0)disk(1)rdisk(0)partition(8)/sash.
+#   Unable to boot; press any key to continue:
+#
+# Send an empty line to advance past it, *then* wait for "Option?".
+ic serial-wait --timeout 60 "Unable to boot"
+ic serial-send ""
+ic serial-wait --timeout 30 "Option?"
 ```
+
+Once Phase A's `rtc-save` is in place, the Phase B PROM picks up
+`console=d` at init and routes serial properly. If you happen to
+have inherited an nvram.bin from an older `headless = true` run
+where the *previous* PROM init flooded `MC: GIO Timeout at
+1f0f1338`, those events stop accruing once the menu is up and don't
+recur this session.
 
 ### 2. Label the disk via fx (one-time per fresh disk)
 
@@ -124,10 +269,10 @@ with `iris-ci cdrom-eject 4`.
 # Overlay 1 (already mounted) — Inst already pointed at /CDROM/dist
 ic serial-send "from"
 ic serial-send "1"                # /CDROM/dist
-ic serial-send "q"                # skip README pager (now harmless)
-# wait for "Reading product descriptions ... Done."
-ic serial-wait --timeout 180 "Done\\."
-# stream choice — pick "feature" (2)
+# README pager is auto-quit by step 4's "set page_output off" —
+# do NOT send "q" (it would be interpreted as quit from the next prompt)
+# stream choice (maintenance vs feature) — pick "feature" (2)
+# inst-watch classifies this as numbered_choice
 ic serial-send "2"
 ic serial-wait --timeout 60 "Install software from:"
 
@@ -194,22 +339,81 @@ ic serial-send "go"
 
 `go` runs the actual install. Expect 1–2 hours of emulated CPU
 chewing through tar streams, writing to the XFS root. The installer
-will prompt to swap CDs ("Insert ..."); answer by ejecting via the
-iris monitor (`iris-ci cdrom-eject 4`) and then pressing Enter.
+will prompt to swap CDs ("Please insert the `<NAME>` CD."); answer
+by cycling the changer until the requested ISO is mounted, then
+press Enter:
 
-When it finishes:
+```bash
+# Cycle the SCSI 4 changer until the wanted disc is mounted.
+want='Foundation 1'    # match a substring of the requested CD's filename
+for i in 1 2 3 4 5 6; do
+  cur=$(ic cdrom-eject 4 | sed -E 's/.*new_disc":"([^"]+)".*/\1/')
+  echo "now mounted: $cur"
+  case "$cur" in *"$want"*) break ;; esac
+done
+ic serial-send ""
+```
+
+If you happen to advance past the requested disc, just keep going —
+the changer wraps around. A spurious "You've inserted the incorrect
+CD." print is normal while the changer is cycling under the
+installer's polling; once the right ISO is mounted the install
+resumes automatically.
+
+When `go` finishes you're dropped back at the Inst> prompt — not the
+Restart prompt. The success signal in the log is one line:
 
 ```
-Restart the system. (y/n)?
+Installations and removals were successful.
 ```
 
-Answer `y` to reboot into the freshly-installed system.
+From Inst>, send `quit`. This triggers:
+
+1. A non-fatal `ERROR: INCOMPATIBLE SUBSYSTEMS INSTALLED` print —
+   harmless because step 4 set `rulesoverride on` (the message even
+   says "Exit allowed because rulesoverride option is set").
+2. A several-minute `Requickstarting ELF files (rqsall(1))` pass that
+   walks the entire installed tree (CHD grows another ~50–100 MB).
+3. An autoconfig pass (`Automatically reconfiguring the operating
+   system.`).
+4. Finally, the actual restart prompt — and it's `Restart? { (y)`,
+   not the `Restart the system. (y/n)?` the SGI guide shows.
+
+```bash
+ic serial-send "quit"
+ic serial-wait --timeout 900 "Restart"
+ic serial-send "y"
+```
 
 ### 8. First multi-user boot
 
-PROM lands at the System Maintenance Menu; option `1` (Start System)
-boots from `dks0d1s0`. Watch the serial console for the IRIX login
-prompt.
+After the post-install restart, the PROM goes straight through
+`AutoLoad=Yes` and chains into the installed sash → /unix → init.
+You don't see the Maintenance Menu at all on this first boot; you'll
+see the standard sysadm shell up + a sequence of one-time warnings
+that aren't fatal:
+
+```
+network: WARNING: IRIS's Internet address is the default.
+Using standalone network mode.
+UX:mv: ERROR: /etc/resolv.conf - No such file or directory
+Warning:  Internet Gateway web server running as root.
+
+IRIS console login:
+```
+
+The `UX:mv: ERROR: /etc/resolv.conf` is the standalone-network
+bring-up trying to swap in a dhclient resolv.conf and finding none;
+it's cosmetic on a clean install. Configure networking later if you
+want to silence it.
+
+Log in as `root` (no password yet); `iris-ci login` handles the
+`TERM = (vt100)` dismissal automatically:
+
+```bash
+ic login
+ic run "uname -a; df -k / | tail -1"
+```
 
 ### 9. Remove the miniroot install stub from the volume header
 
@@ -253,6 +457,85 @@ Current contents:
 
 You don't lose anything you'll miss — to reinstall later you'd boot
 from a CD anyway, which writes a fresh `ide` for that session.
+
+### 10. Switching to the Indigo Magic Desktop
+
+> ⚠️ **If you ran the install with `headless = true` (per step 0 of
+> this guide), the desktop will NOT come up cleanly — you need to
+> re-run the install with graphics on.** Inst's tag filters
+> (`RGFXBOARD!=SERVER` on `x_eoe.sw.Server`, `x_eoe.sw.Xfonts`,
+> `eoe.sw.gfx` server bits, etc.) read the install-time hinv to
+> decide what to drop on disk. With `headless = true`, REX3 is
+> unmapped, miniroot's hinv records GFXBOARD=SERVER, and inst
+> silently strips:
+>
+> - `/usr/bin/X11/Xsgi` (the actual X server)
+> - `/usr/gfx/gfxinit` (graphics-board init)
+> - `/hw/gfx/*` autoconfig entries (so the kernel doesn't probe
+>   Newport)
+> - All board-specific X font and keymap pieces
+>
+> `versions` will *still* list `x_eoe.sw.Server` as installed
+> ("I") — the subsystem is there, but its hardware-tagged files
+> aren't. Symptom: xdm runs but no Xsgi is launched, `/var/X11/xdm/
+> Xservers` is empty, `hinv` doesn't show a graphics line, and
+> `/usr/bin/X11/X` prints `X: /usr/gfx/gfxinit not found`.
+>
+> **Fix**: rerun the install with `headless = false` (drop step 4's
+> `console=d` setenv, leave `console=g`), so miniroot probes graphics
+> and the SERVER filter doesn't trip. The rest of the recipe is
+> identical. There's no in-place fix from the booted system that's
+> simpler than reinstalling — the dropped files span multiple
+> subsystems and inst won't repaint them without the hinv override.
+
+The install brought in the desktop stack (`x_eoe`, `desktop_eoe`,
+4Dwm, the toolchest) and turned `desktop`/`visuallogin`/`xdm` on by
+default. Assuming you did *not* run the install headless, the
+remaining switchover steps are:
+
+```bash
+# 1) From the IRIX shell: enable the X server + tell the PROM to use
+#    graphics console.
+ic run "chkconfig windowsystem on"
+ic run "nvram console g"
+
+# 2) Persist the emulated NVRAM to nvram.bin on the host. Without this
+#    the console=g change lives only in iris's in-memory NVRAM and
+#    evaporates when iris exits — the next launch reads stale nvram.bin
+#    and you're back to console=d. This applies to any PROM env change
+#    made from inside IRIX (nvram(1)) or from the PROM monitor (setenv).
+ic rtc-save
+
+# 3) Cleanly halt so XFS journals are flushed, then quit iris.
+ic run "halt -y"
+ic serial-wait --timeout 60 "Maintenance Menu"
+ic quit
+```
+
+Now use a non-headless config for the launch. Simplest: in
+`iris-irix65.toml`, remove `headless = true` (or set it `false`).
+The daily-use `iris.toml` is fine to keep for other disks. Flip
+vino back to `source = "camera"` here too if you want the IndyCam
+live.
+
+```bash
+./target/release/iris --config iris-irix65.toml \
+    > /tmp/iris.stdout.log 2>&1 &
+```
+
+iris pops a Newport window; the PROM runs through AutoLoad and
+chains into the installed kernel; xdm draws the graphical login
+manager. (If you want the CI socket alongside the visible window,
+launch with `--ci --ci-display` instead — that keeps `iris-ci`
+usable at the cost of ~10–15 fps render rate.)
+
+To verify from the host without looking at the window:
+
+```bash
+ic login
+ic run "ps -ef | grep -E 'Xsgi|4Dwm|toolchest' | grep -v grep"
+ic screenshot /tmp/desktop.png   # only with --ci-display
+```
 
 ## Conflict resolution without `rulesoverride on`
 
@@ -326,23 +609,20 @@ loses these optionals:
 
 ## Iris-specific gotchas
 
-- **PROM `console=d` is mandatory when `headless = true`.** With
-  `headless = true` in `iris.toml`, iris does not instantiate REX3, so
-  the Newport graphics slot at `0x1F000000-0x1F3FFFFF` is unmapped (see
-  `src/physical.rs` — REX3 is only mapped when `rex3_ptr.is_some()`).
-  The PROM's *Install System Software* option dereferences a graphics
-  console pointer on the install path; if nvram still has `console=g`
-  (typical leftover from a graphical 5.3 install), this panics
-  immediately after "Insert the installation CD-ROM, then press
-  <enter>:" with a UTLB miss at PC `0x97f9c39c`, bad address `0x1c`,
-  and the iris log floods with `MC: GIO Timeout at 1f0f1338`
-  (REX3_STATUS). The Maintenance Menu itself has a serial fallback
-  (you'll see `Cannot open video() for output` in the log) so the menu
-  is reachable, but option 2 isn't. **Before invoking option 2**, run
-  `setenv -f console d; rtc-save; exit` from the Command Monitor at
-  least once so the nvram persists `console=d`. Step 1 of this guide
-  already includes the `setenv` lines — add `setenv -f console d` to
-  that block if nvram was inherited from a 5.3 install.
+- **`headless = false` + `console=d` is the correct install combo,
+  not `headless = true`.** Earlier versions of this guide ran the
+  install with `headless = true` to avoid needing a window — that
+  produces a degraded install (see the warning at the top of section
+  10). Use `headless = false` so REX3 is mapped (miniroot probes
+  Newport correctly and inst's `RGFXBOARD!=SERVER` filters don't
+  strip Xsgi etc.), and keep `console=d` so the inst dialog routes
+  to ttyd1 where `iris-ci` can drive it. With REX3 mapped, the old
+  failure mode here (`MC: GIO Timeout at 1f0f1338` flood, UTLB miss
+  at PC `0x97f9c39c`/`0x1c`) doesn't happen: the PROM finds a real
+  graphics device to back the `console=g`-era pointers even though
+  we're routing output to serial. Setting `console=d` mid-session
+  with `setenv -f` still requires an `rtc-save` (see the next bullet)
+  so the value survives an iris restart.
 - **fx defaults** are correct on iris; `label/create/all` writes a
   standard SGI volume header with a root partition that mkfs will
   later format as XFS.

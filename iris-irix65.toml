@@ -1,0 +1,38 @@
+# iris-irix65.toml — IRIX 6.5.22 install run
+# Follows docs/irix-6.5.22-install.md. Media in irix/ (filenames as on disk).
+# PROM is loaded from the embedded image (prom.bin not required).
+
+headless    = false
+no_audio    = false
+banks       = [128, 128, 0, 0]
+serial_log  = "irix-install-console.log"
+
+# Empty 20 GB CHD created with:
+#   chdman createhd -o irix65.chd -s 21474836480 -ss 512 -c none
+[scsi.1]
+path  = "irix65.chd"
+cdrom = false
+
+# CD changer at SCSI 4. Overlay 1 mounted first; the rest cycle in load order.
+# Filenames match what's actually in irix/ (the doc's irix/6.5.22/ layout
+# doesn't exist; these are the same ISOs under different release-kit names).
+[scsi.4]
+path  = "irix/IRIX 6.5.22 Installation Tools and Overlays (1 of 3).iso"
+cdrom = true
+discs = [
+  "irix/IRIX 6.5.22 Installation Tools and Overlays (1 of 3).iso",
+  "irix/IRIX 6.5.22 Overlays (2 of 3).iso",
+  "irix/IRIX 6.5.22 Overlays (3 of 3).iso",
+  "irix/IRIX 6.5 Applications November 2003.iso",
+  "irix/IRIX 6.5 Foundation 1.iso",
+  "irix/IRIX 6.5 Foundation 2.iso",
+]
+
+[vino]
+source = "test_pattern"
+
+[[port_forward]]
+proto      = "tcp"
+host_port  = 2323
+guest_port = 23
+bind       = "localhost"
