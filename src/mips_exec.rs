@@ -5113,6 +5113,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             ("u".to_string(), "Alias for undo [DEV]".to_string()),
             ("sym".to_string(), "Lookup symbol: sym <addr>".to_string()),
             ("loadsym".to_string(), "Load symbols from file: loadsym <file>".to_string()),
+            ("proc".to_string(), "IRIX kernel introspection: proc info  (requires `loadsym` first)".to_string()),
             ("l1i".to_string(), "L1 Instruction Cache commands: l1i <check|dump> <addr|index>".to_string()),
             ("l1d".to_string(), "L1 Data Cache commands: l1d <check|dump> <addr|index>".to_string()),
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
@@ -5279,6 +5280,75 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 writeln!(writer, "{:016x} = ???", addr).unwrap();
             }
             return Ok(());
+        }
+
+        if actual_cmd == "proc" {
+            let mut exec = self.try_lock_executor()?;
+            // Helper closures around debug_read so the body stays readable.
+            // All reads here are big-endian (IRIX kernel).
+            let read_u32 = |exec: &mut MipsExecutor<T, C>, vaddr: u64| -> Result<u32, String> {
+                exec.debug_read(vaddr, 4)
+                    .map(|v| v as u32)
+                    .map_err(|e| format!("debug_read({:#x}): {:?}", vaddr, e))
+            };
+            let read_bytes = |exec: &mut MipsExecutor<T, C>, vaddr: u64, n: usize| -> Result<Vec<u8>, String> {
+                let mut out = Vec::with_capacity(n);
+                // debug_read returns up to 8 bytes per call; chunk it.
+                let mut a = vaddr;
+                let mut remaining = n;
+                while remaining > 0 {
+                    let step = remaining.min(4);
+                    let v = exec.debug_read(a, step)
+                        .map_err(|e| format!("debug_read({:#x}): {:?}", a, e))?;
+                    // big-endian: high byte first within `step` bytes
+                    for i in (0..step).rev() {
+                        out.push(((v >> (i * 8)) & 0xff) as u8);
+                    }
+                    a += step as u64;
+                    remaining -= step;
+                }
+                Ok(out)
+            };
+            // Probe `utsname` symbol and read sysname/release.
+            let utsname_va = {
+                let symbols = exec.symbols.lock();
+                match symbols.get_addr("utsname") {
+                    Some(a) => a,
+                    None => return Err("symbol 'utsname' not found — run `loadsym <unix.nm>` first".to_string()),
+                }
+            };
+            // IRIX utsname has 5 fields of SYS_NMLN bytes each. SYS_NMLN is
+            // 257 on IRIX 5.3 (large for POSIX), but we only read the front
+            // null-terminated strings. Read 256 bytes per field to be safe.
+            const NMLN: usize = 257;
+            let buf = read_bytes(&mut exec, utsname_va, NMLN * 5)?;
+            let read_str = |off: usize| -> String {
+                let end = buf[off..off + NMLN].iter().position(|&b| b == 0).unwrap_or(NMLN);
+                String::from_utf8_lossy(&buf[off..off + end]).into_owned()
+            };
+            let sysname  = read_str(0 * NMLN);
+            let nodename = read_str(1 * NMLN);
+            let release  = read_str(2 * NMLN);
+            let version  = read_str(3 * NMLN);
+            let machine  = read_str(4 * NMLN);
+
+            let sub = actual_args.first().copied().unwrap_or("info");
+            if sub == "info" {
+                writeln!(writer, "utsname @ {:#x}:", utsname_va).unwrap();
+                writeln!(writer, "  sysname  = {:?}", sysname).unwrap();
+                writeln!(writer, "  nodename = {:?}", nodename).unwrap();
+                writeln!(writer, "  release  = {:?}", release).unwrap();
+                writeln!(writer, "  version  = {:?}", version).unwrap();
+                writeln!(writer, "  machine  = {:?}", machine).unwrap();
+                let nproc_va = exec.symbols.lock().get_addr("nproc").ok_or_else(|| "symbol 'nproc' not found".to_string())?;
+                let proc_va  = exec.symbols.lock().get_addr("proc").ok_or_else(|| "symbol 'proc' not found".to_string())?;
+                let nproc = read_u32(&mut exec, nproc_va)?;
+                let proc_ptr = read_u32(&mut exec, proc_va)?;
+                writeln!(writer, "nproc    @ {:#x} = {}", nproc_va, nproc).unwrap();
+                writeln!(writer, "proc[]   @ {:#x} -> {:#x}", proc_va, proc_ptr).unwrap();
+                return Ok(());
+            }
+            return Err("Usage: proc info".to_string());
         }
 
         if actual_cmd == "ll" {
