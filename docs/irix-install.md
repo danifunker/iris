@@ -170,24 +170,34 @@ ic ping     # liveness check
 ic start    # CPU thread does not auto-start in --ci mode
 ```
 
-### Watch prompts with `tools/inst-watch.py`
+### Step 0 — start the prompt watcher (do this BEFORE sections 1-N)
 
-The install asks 20+ interactive questions across a couple of hours.
-Driving it with chained `serial-wait` calls is fragile (stale buffer
-matches, prompt-shape variants, race against `serial-read`). Instead
-run `tools/inst-watch.py` as a persistent background watcher — it
-tails `irix-install-console.log` and emits one classified event per
-stall (`mkfs_confirm`, `numbered_choice`, `install_software_from`,
-`yn_confirm`, `inst_ready`, `cd_swap`, `restart_confirm`, etc.) with
-a hint for how to respond. From Claude Code:
-
-```
-Monitor: tools/inst-watch.py --log irix-install-console.log --quiet-secs 6 --json
-```
-
-From a shell, just run it in the foreground and react to each event
-line as it appears. The classifier is in the script's docstring;
-add new prompt shapes there if you find one it doesn't recognise.
+> ⚠️ **The sections below show `iris-ci serial-wait` calls in their
+> command blocks for readability, but you should not actually drive
+> the install that way.** Chained `serial-wait` patterns are fragile
+> (stale buffer matches, prompt-shape variants, race against
+> `serial-read`), and Claude Code in particular gets tripped up by
+> stale matches inside an active install. Before running any of
+> sections 1-N, start `tools/inst-watch.py` as a persistent
+> background watcher and react to its STALL events instead of to
+> `serial-wait` returns. From Claude Code:
+>
+> ```
+> Monitor: tools/inst-watch.py --log irix-install-console.log --quiet-secs 6 --json
+> ```
+>
+> Each event line is a classified prompt (`mkfs_confirm`,
+> `numbered_choice`, `install_software_from`, `yn_confirm`,
+> `inst_ready`, `cd_swap`, `restart_confirm`, etc.) with a
+> `hint` for how to respond. **If you find yourself debugging
+> stale `serial-wait` matches partway through the install, you
+> skipped step 0** — stop, start the watcher, and resume from
+> wherever the watcher next fires.
+>
+> From a regular shell, run inst-watch.py in the foreground and
+> react to each event line as it appears. The classifier is in the
+> script's docstring; add new prompt shapes there if you find one
+> it doesn't recognise.
 
 **Avoid `serial-read` while a `serial-wait` is in flight on the same
 socket** — they race and you'll see `connect /tmp/iris.sock: Resource
@@ -591,9 +601,26 @@ ic run "nvram console g"
 #    made from inside IRIX (nvram(1)) or from the PROM monitor (setenv).
 ic rtc-save
 
-# 3) Cleanly halt so XFS journals are flushed, then quit iris.
+# 3) Cleanly halt so the filesystem (XFS on 6.5.22, EFS on 5.3) is
+#    synced. `halt -y` does NOT return to the PROM Maintenance Menu
+#    in either version — IRIX puts up a graphical "Okay to power off
+#    the system now. Press any key to restart." dialog on the
+#    framebuffer and stops writing to the serial console. So
+#    `serial-wait` for "Maintenance Menu" will timeout silently.
+#    Take screenshots until you see the dialog, then either click
+#    Restart (in the visible window) or quit iris and relaunch.
 ic run "halt -y"
-ic serial-wait --timeout 60 "Maintenance Menu"
+# Snapshot the framebuffer every few seconds; open the PNG and look
+# for the "Okay to power off…" panel before quitting iris. A poll
+# loop drives the timing — visual confirmation is the gating step,
+# this guide can't OCR for you.
+for i in $(seq 1 20); do
+    sleep 3
+    ic screenshot /tmp/halted-$i.png
+done
+# Inspect /tmp/halted-*.png — once you see the dialog, iris is safe
+# to quit (or click Restart in the window to chain straight into a
+# fresh boot).
 ic quit
 ```
 
