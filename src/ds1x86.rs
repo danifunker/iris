@@ -23,10 +23,22 @@ struct RtcData {
 pub struct Ds1x86 {
     data: Mutex<RtcData>,
     size: usize,
+    /// When true (set by --headless), we override `console=g` to `console=d` in
+    /// the in-memory env so the PROM never tries to open `video()` and never
+    /// stores `NoAutoLoad=CONSOLE OPEN FAILED.` as a runtime artifact. On
+    /// save, the byte is restored to `g` so the on-disk NVRAM stays the way
+    /// the user wrote it. See `Self::patch_console_for_headless`.
+    headless_console_override: bool,
 }
 
+/// Offset of the single-byte `console` env-var slot inside the DS1386 NVRAM
+/// image, as used by the SGI 070-9101-011 Indy PROM. Determined empirically
+/// from `xxd nvram-irix53.bin` (slot header `da 08` at 0x40, value byte at
+/// 0x42, terminating `00` at 0x43).
+const CONSOLE_SLOT_OFFSET: usize = 0x42;
+
 impl Ds1x86 {
-    pub fn new(size: usize) -> Self {
+    pub fn new(size: usize, headless_console_override: bool) -> Self {
         // DS1286: 64 bytes, regs at 0
         // DS1386: 8K/32K, regs at 0 (first 16 bytes)
         let rtc = Self {
@@ -36,6 +48,7 @@ impl Ds1x86 {
                 time_base: Instant::now(),
             }),
             size,
+            headless_console_override,
         };
 
         // Initialize with current time
@@ -52,6 +65,54 @@ impl Ds1x86 {
         }
 
         rtc
+    }
+
+    /// If the loaded NVRAM has `console=g` and we're running headless, swap
+    /// the in-memory byte to `d`. Called from `load_nvram`. The on-disk file
+    /// is untouched; `save_nvram` reverts the byte before writing.
+    fn patch_console_for_headless(&self, regs: &mut [u8]) {
+        if !self.headless_console_override { return; }
+        if CONSOLE_SLOT_OFFSET >= regs.len() { return; }
+        if regs[CONSOLE_SLOT_OFFSET] == b'g' {
+            regs[CONSOLE_SLOT_OFFSET] = b'd';
+            dlog!(LogModule::Rtc, "RTC: --headless: NVRAM console=g overridden to console=d in-memory \
+                (on-disk NVRAM unchanged; PROM will use serial console). Note: PROM still probes \
+                video() regardless of console= and may set NoAutoLoad runtime-only; \
+                scrub_noautoload() prevents that from persisting.");
+        }
+    }
+
+    /// Mirror of `patch_console_for_headless` applied to a copy of `regs` just
+    /// before we write it to disk. Restores the original `console=g` byte so a
+    /// `rtc save` issued during a headless session doesn't silently rewrite
+    /// the user's NVRAM to `console=d`.
+    fn unpatch_console_for_save(&self, buf: &mut [u8]) {
+        if !self.headless_console_override { return; }
+        if CONSOLE_SLOT_OFFSET >= buf.len() { return; }
+        if buf[CONSOLE_SLOT_OFFSET] == b'd' {
+            buf[CONSOLE_SLOT_OFFSET] = b'g';
+        }
+    }
+
+    /// Scrub `NoAutoLoad=CONSOLE OPEN FAILED.` from a buffer about to be
+    /// written to NVRAM. The PROM sets this runtime-only var whenever a
+    /// `video()` open fails; persisting it permanently disables autoboot. The
+    /// value is unique enough (and the substring `CONSOLE OPEN FAILED`
+    /// distinctive enough) that a literal find-and-zero is safe.
+    fn scrub_noautoload(buf: &mut [u8]) {
+        let needle: &[u8] = b"CONSOLE OPEN FAILED";
+        if let Some(pos) = buf.windows(needle.len()).position(|w| w == needle) {
+            // Walk back to the null that separates the previous value from
+            // this one; zero from there forward through the terminator of
+            // this value.
+            let start = buf[..pos].iter().rposition(|&b| b == 0).map(|i| i + 1).unwrap_or(0);
+            let end = buf[pos..].iter().position(|&b| b == 0).map(|i| pos + i).unwrap_or(buf.len());
+            for b in &mut buf[start..end] {
+                *b = 0;
+            }
+            dlog!(LogModule::Rtc, "RTC: scrubbed NoAutoLoad=CONSOLE OPEN FAILED. from NVRAM save (\
+                bytes {:#x}..{:#x})", start, end);
+        }
     }
 
     fn to_bcd(val: u8) -> u8 {
@@ -177,8 +238,18 @@ impl Ds1x86 {
         if (data.regs[CMD_REG_OFFSET] & TE_BIT) != 0 {
             self.update_time(&mut data);
         }
+        // Write a sanitized copy, not the live regs:
+        //   - Scrub the runtime-only `NoAutoLoad=CONSOLE OPEN FAILED.` artifact
+        //     so a save taken during a failed-console boot doesn't permanently
+        //     disable autoboot.
+        //   - If we patched console=g -> console=d at load time (--headless),
+        //     restore the original 'g' byte so the on-disk NVRAM matches what
+        //     the user wrote.
+        let mut buf = data.regs.clone();
+        Self::scrub_noautoload(&mut buf);
+        self.unpatch_console_for_save(&mut buf);
         let mut file = File::create(filename)?;
-        file.write_all(&data.regs)?;
+        file.write_all(&buf)?;
         Ok(())
     }
 
@@ -190,12 +261,15 @@ impl Ds1x86 {
         let mut data = self.data.lock();
         let len = std::cmp::min(data.regs.len(), buffer.len());
         data.regs[..len].copy_from_slice(&buffer[..len]);
-        
+
+        // --headless override: force console=d in the in-memory NVRAM only.
+        self.patch_console_for_headless(&mut data.regs);
+
         // Update time base to current time (simulate battery backed clock continuing)
         self.set_current_time(&mut data.regs);
         data.base_centiseconds = self.regs_to_centiseconds(&data.regs, 0);
         data.time_base = Instant::now();
-        
+
         Ok(())
     }
 
@@ -404,7 +478,7 @@ mod tests {
     /// into regs when TE is set, so we clear TE first to make the test stable.
     #[test]
     fn save_load_round_trip() {
-        let src = Ds1x86::new(8192);
+        let src = Ds1x86::new(8192, false);
         // Disable transfer-enable so save_state doesn't tick the clock between
         // calls; mutate a few NVRAM bytes outside the time-keeping registers.
         {
@@ -416,7 +490,7 @@ mod tests {
         }
         let v1 = src.save_state();
 
-        let dst = Ds1x86::new(8192);
+        let dst = Ds1x86::new(8192, false);
         dst.load_state(&v1).expect("load_state");
         // Same: clear TE on dst before re-serializing so its save_state path
         // matches src's behavior. (load_state preserves the TE bit from v1, so

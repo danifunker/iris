@@ -996,14 +996,20 @@ pub struct Hpc3 {
 
 impl Hpc3 {
     pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>) -> Self {
-        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false)
+        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false, false)
     }
 
-    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, headless: bool) -> Self {
+    /// `no_audio` skips HAL2 audio init (used by `--noaudio` and also by full
+    /// `--headless`, which can't run audio in CI).
+    /// `force_serial_console` is true under `--headless` so the RTC layer
+    /// rewrites `console=g` → `console=d` in the in-memory NVRAM (preventing
+    /// the PROM from failing a `video()` open and persisting
+    /// `NoAutoLoad=CONSOLE OPEN FAILED.` to NVRAM on the next `rtc save`).
+    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, force_serial_console: bool) -> Self {
         let nfs = net.nfs;
         let port_forwards = net.port_forward;
         let subnet = net.nat_subnet.unwrap_or_default();
-        let rtc = Arc::new(Ds1x86::new(8192));
+        let rtc = Arc::new(Ds1x86::new(8192, force_serial_console));
         let pdma_dump = Arc::new(AtomicU32::new(0));
         
         let state = Arc::new(Mutex::new(Hpc3State {
@@ -1083,7 +1089,7 @@ impl Hpc3 {
 
         let scsi_dev = Arc::new(Wd33c93a::new(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone()));
         
-        let hal2 = if headless { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec()))) };
+        let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec()))) };
 
         Self {
             state,
