@@ -25,11 +25,11 @@ size_mb = 16
 
 # Single install CD at SCSI 4 — no changer (5.3 ships on one disc).
 [scsi.4]
-path  = "irix65/IRIX 5.3 for Indy.iso"
+path  = "irix53/IRIX 5.3 for Indy.iso"
 cdrom = true
 
 [vino]
-source = "test_pattern"
+source = "camera"
 
 [[port_forward]]
 proto      = "tcp"
