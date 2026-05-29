@@ -27,6 +27,8 @@
 
 use parking_lot::Mutex;
 
+use crate::devlog::LogModule;
+
 // ─── Register subaddresses ────────────────────────────────────────────────────
 //
 // Layout follows the IRIX indycam driver: low half is identification, the
@@ -182,7 +184,7 @@ impl Cdmc {
                 st.i2c_subaddr = st.i2c_subaddr.wrapping_add(1) % reg::COUNT as u8;
             }
             I2cState::DataRead => {
-                eprintln!("CDMC: I2C expected read but got write, returning to idle");
+                dlog_dev!(LogModule::Vino, "CDMC: I2C expected read but got write, returning to idle");
                 st.i2c_state = I2cState::Idle;
             }
         }
@@ -191,7 +193,7 @@ impl Cdmc {
     pub fn i2c_read(&self) -> u8 {
         let mut st = self.state.lock();
         if st.i2c_state != I2cState::DataRead {
-            eprintln!("CDMC: i2c_read called in state {:?}, returning to idle", st.i2c_state);
+            dlog_dev!(LogModule::Vino, "CDMC: i2c_read called in state {:?}, returning to idle", st.i2c_state);
             st.i2c_state = I2cState::Idle;
             return 0;
         }
@@ -216,7 +218,7 @@ impl Cdmc {
             }
         }
         let name = Self::reg_name(st.i2c_subaddr);
-        eprintln!("CDMC: write reg {:#04x} ({}) = {:#04x}", st.i2c_subaddr, name, data);
+        dlog_dev!(LogModule::Vino, "CDMC: write reg {:#04x} ({}) = {:#04x}", st.i2c_subaddr, name, data);
     }
 
     fn reg_name(subaddr: u8) -> &'static str {

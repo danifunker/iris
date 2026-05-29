@@ -463,12 +463,12 @@ impl Vino {
         chan.field_counter  = 0;
         chan.fifo_gio_ptr   = 0;
         chan.fifo_video_ptr = 0;
-        eprintln!("VINO: channel {} DMA enabled", if ch == 0 { 'A' } else { 'B' });
+        dlog_dev!(LogModule::Vino, "VINO: channel {} DMA enabled", if ch == 0 { 'A' } else { 'B' });
         // DMA thread is notified by control_w() after returning from here.
     }
 
     fn stop_channel(_st: &mut VinoState, ch: usize) {
-        eprintln!("VINO: channel {} DMA disabled", if ch == 0 { 'A' } else { 'B' });
+        dlog_dev!(LogModule::Vino, "VINO: channel {} DMA disabled", if ch == 0 { 'A' } else { 'B' });
     }
 
     // ── Interrupt status write (write 0 to individual bits to clear) ──────

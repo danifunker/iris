@@ -517,6 +517,13 @@ ic login
 ic run "uname -a; df -k / | tail -1"
 ```
 
+At this point the system boots and runs, but the framebuffer is
+still dark — Phase A left `console=d` in the PROM env, so all
+output goes to ttyd1. Continue to section 9 to clean up the
+volume header, then section 10 to switch to `console=g` and bring
+up the desktop. (**5.3** and **6.5.22** follow the same section 10
+procedure — only the underlying filesystem differs, EFS vs XFS.)
+
 ### 9. Remove the miniroot install stub from the volume header
 
 After the install completes, the SGI volume header on the boot disk
@@ -560,11 +567,17 @@ Current contents:
 You don't lose anything you'll miss — to reinstall later you'd boot
 from a CD anyway, which writes a fresh `ide` for that session.
 
-### 10. Switching to the Indigo Magic Desktop
+### 10. Switch to the graphical console (Indigo Magic Desktop)
 
-> ⚠️ **If you ran the install with `headless = true` (per step 0 of
-> this guide), the desktop will NOT come up cleanly — you need to
-> re-run the install with graphics on.** Inst's tag filters
+Applies to both **5.3** and **6.5.22**. After the install you're
+still booting with `console=d` (PROM env from Phase A), so kernel
+messages and the IRIS login prompt come out on serial and the
+framebuffer is dark even though `xdm` is enabled. This section flips
+the PROM env to `console=g` so the boot path renders to the Newport
+window and xdm draws the graphical login.
+
+> ⚠️ **Skip this and re-do the install if you originally ran Phase B
+> with `headless = true`.** Inst's tag filters
 > (`RGFXBOARD!=SERVER` on `x_eoe.sw.Server`, `x_eoe.sw.Xfonts`,
 > `eoe.sw.gfx` server bits, etc.) read the install-time hinv to
 > decide what to drop on disk. With `headless = true`, REX3 is
@@ -581,7 +594,9 @@ from a CD anyway, which writes a fresh `ide` for that session.
 > ("I") — the subsystem is there, but its hardware-tagged files
 > aren't. Symptom: xdm runs but no Xsgi is launched, `/var/X11/xdm/
 > Xservers` is empty, `hinv` doesn't show a graphics line, and
-> `/usr/bin/X11/X` prints `X: /usr/gfx/gfxinit not found`.
+> `/usr/bin/X11/X` prints `X: /usr/gfx/gfxinit not found`. (5.3 was
+> originally installed headless here and exhibited exactly this —
+> graphics packages on the ISO but never landed on disk.)
 >
 > **Fix**: rerun the install with `headless = false` (drop step 4's
 > `console=d` setenv, leave `console=g`), so miniroot probes graphics
@@ -590,10 +605,11 @@ from a CD anyway, which writes a fresh `ide` for that session.
 > simpler than reinstalling — the dropped files span multiple
 > subsystems and inst won't repaint them without the hinv override.
 
-The install brought in the desktop stack (`x_eoe`, `desktop_eoe`,
-4Dwm, the toolchest) and turned `desktop`/`visuallogin`/`xdm` on by
-default. Assuming you did *not* run the install headless, the
-remaining switchover steps are:
+Follow the steps in this section if you ran Phase B with `headless =
+false` (the recommended path for both versions). The install brought
+in the desktop stack (`x_eoe`, `desktop_eoe`, 4Dwm, the toolchest)
+and turned `desktop`/`visuallogin`/`xdm` on by default; the
+switchover is just a PROM-env flip plus a clean halt:
 
 ```bash
 # 1) From the IRIX shell: enable the X server + tell the PROM to use

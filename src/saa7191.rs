@@ -12,6 +12,8 @@
 
 use parking_lot::Mutex;
 
+use crate::devlog::LogModule;
+
 // ─── Register subaddresses ────────────────────────────────────────────────────
 
 pub mod reg {
@@ -178,7 +180,7 @@ impl Saa7191 {
                 st.i2c_subaddr = st.i2c_subaddr.wrapping_add(1) % reg::COUNT as u8;
             }
             I2cState::DataRead => {
-                eprintln!("SAA7191: I2C expected read but got write, returning to idle");
+                dlog_dev!(LogModule::Vino, "SAA7191: I2C expected read but got write, returning to idle");
                 st.i2c_state = I2cState::Idle;
             }
         }
@@ -189,7 +191,7 @@ impl Saa7191 {
     pub fn i2c_read(&self) -> u8 {
         let mut st = self.state.lock();
         if st.i2c_state != I2cState::DataRead {
-            eprintln!("SAA7191: i2c_read called in state {:?}, returning to idle", st.i2c_state);
+            dlog_dev!(LogModule::Vino, "SAA7191: i2c_read called in state {:?}, returning to idle", st.i2c_state);
             st.i2c_state = I2cState::Idle;
             return 0;
         }
@@ -200,7 +202,7 @@ impl Saa7191 {
             // Status register — only readable byte
             st.status
         } else {
-            eprintln!("SAA7191: i2c_read subaddr {:#04x} not readable, returning 0x00", subaddr);
+            dlog_dev!(LogModule::Vino, "SAA7191: i2c_read subaddr {:#04x} not readable, returning 0x00", subaddr);
             0x00
         }
     }
@@ -219,7 +221,7 @@ impl Saa7191 {
         }
         // Log writes for debugging
         let name = Self::reg_name(st.i2c_subaddr);
-        eprintln!("SAA7191: write reg {:#04x} ({}) = {:#04x}", st.i2c_subaddr, name, data);
+        dlog_dev!(LogModule::Vino, "SAA7191: write reg {:#04x} ({}) = {:#04x}", st.i2c_subaddr, name, data);
     }
 
     fn reg_name(subaddr: u8) -> &'static str {
