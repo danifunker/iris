@@ -23,14 +23,19 @@ with the corrections and shortcuts we found running it through iris.
     iris auto-creates a `.diff.chd` sidecar next to compressed parents;
     uncompressed CHDs are written in place, which is what you want for
     a fresh install (no sidecar accumulation).
-  - **5.3:** a raw sparse file is enough — 5.3 fits comfortably in
-    4 GB and the disk format `fx` writes is the same SGI VH iris's
-    raw-disk path understands. Create with:
+  - **5.3:** an uncompressed CHD as well — **always use a CHD, never a
+    raw file.** 5.3 fits comfortably in 4 GB, so the CHD can be smaller
+    than the 6.5.22 one, but the format is the same and keeps the disk
+    path, snapshot, and `.diff.chd` tooling uniform across both
+    versions. Create with `chdman`:
 
     ```bash
-    # 4 GB sparse raw — grows as inst writes
-    truncate -s 4G irix53.raw
+    # 4 GB uncompressed CHD — sparse on disk (~few MB used until written)
+    chdman createhd -o irix53.chd -s 4294967296 -ss 512 -c none
     ```
+
+    As with 6.5.22, an uncompressed CHD is written in place (no
+    `.diff.chd` sidecar), which is what you want for a fresh install.
 
 - `prom.bin` is **not** required — iris falls back to an embedded PROM
   image when the file is missing. You'll see one line at startup:
@@ -51,8 +56,19 @@ with the corrections and shortcuts we found running it through iris.
     If your filenames differ, edit the `discs = [...]` list in the
     toml to match. A clean template lives at `iris-irix65.toml`.
   - **5.3:** a single CD covers everything 5.3 ever shipped on Indy:
-    `IRIX 5.3 for Indy.iso`. No CD swapping during install. Template
-    at `iris-irix53.toml`.
+    `IRIX 5.3 for Indy.iso`. No CD swapping during the *base* install.
+    Template at `iris-irix53.toml`.
+  - **5.3 — Developer's Toolbox 6.0 (recommended, if available):** the
+    three `Developers Toolbox 6.0 Disc {1,2,3}.iso` CDs. **If you have
+    them, install them too** (see section 11) — they carry the GNU
+    toolchain (`gcc`, `binutils`, `gdb`, `bash`, …), the SGI Freeware
+    1.0/2.0 collection (emacs, perl5, python, tcl/tk, ghostscript,
+    netpbm, samba, netscape, …) and SGI dev kits (Open Inventor dev,
+    GLUT, `compiler_dev`, `dmedia_dev`). They are EFS distribution CDs
+    (`sgilabel` header, not ISO9660) installed from the booted system
+    via `inst`, *after* the base 5.3 install reboots. List all four
+    discs in the `[scsi.4]` changer so they can be cycled in with
+    `iris-ci cdrom-eject 4` — see the config and section 11 below.
 
 ## Install config
 
@@ -78,9 +94,8 @@ Launch with `--config <file> --ci --ci-display`.
 > iris-ci stays reachable while iris draws the Newport window
 > miniroot needs to see.
 
-The disk goes at SCSI 1, CD (or CD changer) at SCSI 4. Keep
-`[vino] source = "test_pattern"` for the install (avoid the 30 fps
-camera interrupt rate while booting); flip to `"camera"` after.
+The disk goes at SCSI 1, CD (or CD changer) at SCSI 4. `[vino]
+source = "camera"` is fine for the install.
 
 **6.5.22:** CD changer on SCSI 4 with Overlay 1 active and the rest
 in cycle order:
@@ -111,13 +126,17 @@ discs = [
 ]
 
 [vino]
-source = "test_pattern"
+source = "camera"
 
 [[port_forward]]
 proto = "tcp"; host_port = 2323; guest_port = 23; bind = "localhost"
 ```
 
-**5.3:** single CD, no `discs = [...]` list. The
+**5.3:** the base install only needs the single 5.3 CD, but list the
+three Developer's Toolbox 6.0 discs in the `[scsi.4]` changer too (if
+you have them) so they can be cycled in with `iris-ci cdrom-eject 4`
+for the section 11 add-on install. The 5.3 CD stays first/active, so
+the base install (sections 3-7) is unaffected by the extra discs. The
 [scsi.2] scratch volume gives the host an out-of-band channel for
 copying files in/out without networking; useful both during and
 after install:
@@ -131,7 +150,7 @@ nvram       = "nvram-irix53.bin"
 serial_log  = "irix-install-console.log"
 
 [scsi.1]
-path  = "irix53.raw"
+path  = "irix53.chd"
 cdrom = false
 
 [scsi.2]
@@ -141,12 +160,21 @@ overlay = false
 scratch = true
 size_mb = 16
 
+# 5.3 base CD active; Developer's Toolbox discs in the changer for
+# the section 11 add-on install (omit the discs = [...] list if you
+# don't have the Toolbox CDs). Adjust paths to your filenames.
 [scsi.4]
-path  = "irix65/IRIX 5.3 for Indy.iso"
+path  = "irix53/IRIX 5.3 for Indy including R5000.iso"
 cdrom = true
+discs = [
+  "irix53/IRIX 5.3 for Indy including R5000.iso",
+  "irix53/Developers Toolbox 6.0 Disc 1.iso",
+  "irix53/Developers Toolbox 6.0 Disc 2.iso",
+  "irix53/Developers Toolbox 6.0 Disc 3.iso",
+]
 
 [vino]
-source = "test_pattern"
+source = "camera"
 
 [[port_forward]]
 proto = "tcp"; host_port = 2323; guest_port = 23; bind = "localhost"
@@ -651,8 +679,7 @@ ic quit
 
 Now use a non-headless config for the launch. Simplest: in
 `$CFG`, remove `headless = true` (or set it `false`). The daily-use
-`iris.toml` is fine to keep for other disks. Flip vino back to
-`source = "camera"` here too if you want the IndyCam live.
+`iris.toml` is fine to keep for other disks.
 
 ```bash
 ./target/release/iris --config "$CFG" \
@@ -672,6 +699,145 @@ ic login
 ic run "ps -ef | grep -E 'Xsgi|4Dwm|toolchest' | grep -v grep"
 ic screenshot /tmp/desktop.png   # only with --ci-display
 ```
+
+### 11. Install the Developer's Toolbox 6.0 CDs (5.3, optional)
+
+Only for **5.3**, and only if you have the three `Developers Toolbox
+6.0 Disc {1,2,3}.iso` discs (they're in the `[scsi.4]` changer from the
+config above). Unlike the base OS, these install from the **booted**
+system — no miniroot.
+
+> ⚠️ **These CDs are NOT a flat `inst` distribution.** They are an SGI
+> "sifttree" — a web-browsable tree (`/CDROM/index.html`,
+> `/CDROM/toolbox/…`), not a `/CDROM/dist`. Two distinct kinds of
+> content:
+>
+> - **SGI-packaged inst images** live under
+>   `/CDROM/toolbox/inst/` — a per-disc "1-stop-shop" of symlinks to
+>   the real product trees on that disc. **This is what you point
+>   `inst` at.** Contents across the three discs (resident per disc):
+>   Disc 1 `DevDriver` (driver books), `glut_dev` (GLUT 3.0),
+>   `oasisIII` (help); Disc 2 `emacs19`(+contrib), `frame`
+>   (FrameMaker 4.0.3), `insight_dev`, `inst_dev` (swpkg),
+>   `netscape` (Navigator 2.01S), `psgl`; Disc 3 `gvi`,
+>   `speechManager`, `speech_dev`, `uucpVadmin`.
+> - **The SGI Freeware 1.0/2.0 collection** (GNU toolchain, perl,
+>   python, tcl/tk, ghostscript, …) lives under
+>   `/CDROM/toolbox/public/freeware{1,2}.0/` as per-product trees
+>   (Software Manager / `.tardist`), and its precompiled binaries are
+>   oriented at IRIX **6.2** (`/CDROM/toolbox/dist/6.2/`). On 5.3 the
+>   freeware is largely not cleanly installable; skip it. The steps
+>   below install only the SGI-packaged items.
+
+**Do this while serial is still the console** — i.e. after section 9
+and *before* section 10's `console=g` switch — so `iris-ci` can drive
+`inst` over ttyd1. (After section 10 you'd instead open a terminal in
+the Indigo Magic desktop.) The system must be at multi-user.
+
+**Two iris-specific gotchas before the recipe:**
+
+1. **`cdrom-eject 4` swaps the ISO at the SCSI layer but `mediad` does
+   NOT auto-remount `/CDROM`** — it keeps the stale mount of the
+   previous disc. After every eject you must unmount and re-mount by
+   hand:
+
+   ```bash
+   ic cdrom-eject 4
+   ic run "umount /CDROM"
+   ic run "mount -t efs -o ro /dev/dsk/dks0d4s7 /CDROM"
+   ```
+
+2. **The IRIX root shell is csh** — no `2>`, no `for/do/done`, no
+   `if/then/fi`. Use `egrep` (5.3 `grep` lacks `-E`). A botched
+   sh-style multi-line command drops csh to a `? ` continuation that
+   Ctrl-C will NOT break — send Ctrl-D (`serial-send --no-cr $'\004'`)
+   to force-evaluate the block. See `rules/`/memory for details.
+
+The changer *starts* on the 5.3 base CD, so eject once to reach
+Toolbox Disc 1, then repeat the block below for each of the three
+discs (replacing `dev_books`/`oasisIII` skips as noted):
+
+```bash
+ic login
+ic cdrom-eject 4
+ic run "umount /CDROM"
+ic run "mount -t efs -o ro /dev/dsk/dks0d4s7 /CDROM"
+ic run "ls -L /CDROM/toolbox/inst/*.idb"   # see which products are resident
+
+ic serial-send "inst -f /CDROM/toolbox/inst"   # NOT /CDROM/dist
+# at Inst> (keep inst-watch.py running):
+ic serial-send "set page_output off"
+ic serial-send "install *"
+ic serial-send "go"
+```
+
+**Resolving the conflicts (`go` will report them).** Every conflict is
+some toolbox dev piece whose prereq isn't present, or a newer toolbox
+version of a base component. The base 5.3 install has **no IDO**
+(`dev.sw.make`, `dev.hdr.lib`) and no `gl_dev`/`inventor_dev`, so the
+dependent pieces can't install. Pick the **"Do not install"** option
+for each (the system is consistent without them). Examples seen:
+
+- `glut_dev.sw*.dev` / `.fortran` / `.src.inventor` → need
+  `gl_dev`/`inventor_dev` → choose `Na` (do not install). This
+  cascades (fortran→dev) for a round or two; keep choosing `Na`.
+- `sgihelp_dev.sw.xhelp`, `insight_dev.sw.rules` → need IDO
+  `dev.sw.make`/`dev.hdr.lib` → `Na`.
+- `netscape.plugin.{MediaWH,Inventor}` → need `media_warehouse` /
+  `inventor_eoe` → `Na`.
+- `sgihelp_dev.sw.{xhelp,dev}` would replace base `insight` bits →
+  choose the **"Do not install"** sub-option to keep the base intact.
+
+```bash
+ic serial-send "conflicts 1a 2a 3a 4a …"   # one Na per conflict, then:
+ic serial-send "go"
+```
+
+**Handling bad archives.** Two files are damaged/absent in these
+images and abort `go` with an `Error/Interrupt Menu`:
+
+- `oasisIII.man` — **missing on all three discs** (`Stat failed`).
+- `dev_books.books` — **corrupt on Disc 2** (`checksum is …`).
+
+`continue` (3) only steps one file at a time and loops on a missing
+archive, so the clean fix is to **stop the command and deselect the
+whole product**:
+
+```bash
+# at the Interrupt> menu:
+ic serial-send "2"                 # stop (already-installed subsystems persist)
+ic serial-send "2"                 # "Execute the current exit-commands"
+# back at Inst>:
+ic serial-send "keep oasisIII"     # and/or: keep dev_books
+ic serial-send "go"                # installs the remaining good subsystems
+```
+
+If the bad product is the *last* subsystem (oasisIII.man often is),
+you can just `stop` and skip straight to quit.
+
+**Finish each disc:**
+
+```bash
+ic serial-send "quit"
+ic serial-send "yes"               # "products marked … really quit?" → yes
+```
+
+After all three discs, confirm what landed:
+
+```bash
+ic run "versions | egrep -i 'emacs|netscape|glut|gvi|speech|frame|insight_dev|inst_dev|DevDriver|oasisIII|uucpVadmin'"
+```
+
+Notes:
+- A clean run installs `DevDriver`, `emacs19`(+contrib), `frame`,
+  `glut_dev` (runtime/docs/examples/demos), `gvi`, `insight_dev`,
+  `inst_dev`, `netscape` (+plugins), `oasisIII`, `speechManager`,
+  `speech_dev`, `uucpVadmin`.
+- `emacs19` here is the SGI-packaged inst image (full GNU Emacs 19.28
+  with sources, VM, crypt) — it's part of `toolbox/inst`, distinct
+  from the skipped Freeware collection.
+- These are add-ons; nothing here touches the volume header or PROM
+  env, so no `dvhtool`/`rtc-save` follow-up is needed.
 
 ## Conflict resolution without `rulesoverride on`
 
