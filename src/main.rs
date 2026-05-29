@@ -2,6 +2,8 @@ use iris::config::{load_config, NfsConfig};
 use iris::machine::Machine;
 
 fn main() {
+    print_build_features();
+
     let (mut cfg, scale) = load_config();
     let headless = cfg.headless;
     let gdb_port = cfg.gdb_port;
@@ -111,6 +113,31 @@ fn main() {
     if let Some(proc) = nfs_proc {
         proc.kill();
     }
+}
+
+/// Print which compile-time feature flags this binary was built with. Handy
+/// when diagnosing behaviour that depends on the build (e.g. MIPS `jit` bypasses
+/// the interpreter's idle-park path, so an idle guest spins the host CPU).
+fn print_build_features() {
+    const FEATURES: &[(&str, bool)] = &[
+        ("jit", cfg!(feature = "jit")),
+        ("rex-jit", cfg!(feature = "rex-jit")),
+        ("lightning", cfg!(feature = "lightning")),
+        ("tlbvmap", cfg!(feature = "tlbvmap")),
+        ("tlbstats", cfg!(feature = "tlbstats")),
+        ("chd", cfg!(feature = "chd")),
+        ("camera", cfg!(feature = "camera")),
+        ("ci_clock", cfg!(feature = "ci_clock")),
+        ("mouseabs", cfg!(feature = "mouseabs")),
+        ("developer", cfg!(feature = "developer")),
+        ("developer_ip7", cfg!(feature = "developer_ip7")),
+        ("debug_cache", cfg!(feature = "debug_cache")),
+    ];
+    let on: Vec<&str> = FEATURES.iter().filter(|(_, e)| *e).map(|(n, _)| *n).collect();
+    eprintln!(
+        "iris: build features: {}",
+        if on.is_empty() { "(none)".to_string() } else { on.join(" ") }
+    );
 }
 
 struct UnfsdProc {
