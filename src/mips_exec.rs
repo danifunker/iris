@@ -5176,14 +5176,23 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                     // every state unique.
                     let mut state_repeated = false;
                     if ie && !interrupt_ready {
+                        // Hash PC + GPRs, but SKIP k0/k1 ($26/$27): those are the
+                        // kernel's exception-handler scratch registers and hold
+                        // leftover junk that differs whenever a timer tick fired
+                        // between iterations — they are not part of the loop's
+                        // real state. (Confirmed: across idle-loop iterations only
+                        // k0/k1 change; a delay loop changes a real reg like v1.)
                         let mut h = guard.core.pc;
-                        for &g in guard.core.gpr.iter() {
+                        for (i, &g) in guard.core.gpr.iter().enumerate() {
+                            if i == 26 || i == 27 { continue; }
                             h = h.rotate_left(7) ^ g;
                         }
                         if idle_ring[..idle_ring_len].contains(&h) {
+                            // State repeated → still idle. Keep the ring so that
+                            // after a timer tick wakes us the very next batch hash
+                            // matches again and we re-park immediately (otherwise
+                            // we'd re-accumulate the ring every tick, ~5% wasted).
                             state_repeated = true;
-                            idle_ring_len = 0; // re-detect freshly after waking
-                            idle_ring_pos = 0;
                         } else {
                             idle_ring[idle_ring_pos] = h;
                             idle_ring_pos = (idle_ring_pos + 1) % IDLE_RING;

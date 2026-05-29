@@ -153,28 +153,40 @@ break out as soon as an unmasked interrupt is pending. `IRIS_NO_IDLE` disables i
   dropped from **~100 % to ~2 %** (headless), the system stayed responsive (serial
   input echoes → wake-on-IRQ works) and the clock stayed correct (`date` in shell).
 
-**The detector is the unsolved part.** Distinguishing the kernel idle loop from a
-busy **delay loop** is the crux:
+### Detector — WORKING (architectural-state repeat, k0/k1 excluded)
+
+The crux was distinguishing the kernel idle loop from a busy **delay loop**:
 - IRIX boot calls a calibrated `DELAY()` at `0x88003d70`: `bgezl v1,-1; subu v1,v1,v0`
-  — a tight loop with **interrupts enabled and nothing pending**, identical to idle
-  by those signals, but it exits by counting `v1` down, not by an interrupt.
-  Parking it stalls boot.
-- Detector v1 (PC-window: tight PC footprint + IE + nothing pending): parks the idle
-  loop (✓ 2 %) but ALSO parks the delay loop (✗ boot stalls).
-- Detector v2 (architectural-state repeat — current code: hash PC+GPRs each batch,
-  park only when a hash repeats): correctly does NOT park the delay loop (boot
-  completes ✓) but also fails to park the login idle loop (✗ ~95 %) — its state
-  hash does not repeat within the window, implying some register changes per
-  iteration (needs confirming which) OR the batch-boundary phase/period interacts
-  badly. So the committed code is currently **safe but ineffective** (parks rarely).
-- **Next:** the robust distinguisher is the loop's EXIT CONDITION — idle waits on a
-  memory value an ISR changes (`bne t3,zero` where `t3=[s0]`), a delay loop counts a
-  register down. Options: (a) detect that the loop's branch-controlling value is
-  memory-backed and unchanging (needs a small branch/load hook in `step()` —
-  sample the controlling reg at the loop's backward branch, the one consistent
-  phase point); (b) PC-signature idle-skip (recognize the known idle-loop PCs,
-  per kernel version — `0x88011704`/`0x88020d90` for this 5.3); (c) confirm which
-  register the idle loop mutates per iteration (stop+regs+step a few — carefully,
-  resume of a live kernel is itself fragile) and exclude only true monotonic
-  counters. Given (a)/(c) risk, (b) (PC allowlist, learned via `idleprof`) is the
-  safest next step even if less generic.
+  — a tight loop with interrupts enabled and nothing pending, identical to idle by
+  those signals, but it exits by counting `v1` down, not by an interrupt. Parking
+  it would stall boot.
+
+The detector hashes **PC + all GPRs except k0/k1 (`$26`/`$27`)** once per batch and
+parks only when the hash **repeats** within a small ring:
+- A polling/idle loop revisits the same state → the hash repeats → park.
+- A delay loop's counter (`v1`) makes every state unique → no repeat → never parked
+  → boot proceeds.
+- **Excluding k0/k1 is essential**: they are the kernel exception-handler scratch
+  registers and hold leftover junk that differs whenever a timer tick fired between
+  iterations. Confirmed empirically: across consecutive idle-loop iterations
+  (breakpoint at `0x88020d90`), the ONLY registers that changed were k0/k1; with
+  them in the hash the idle loop never "repeats". The delay loop changes a real
+  register (`v1`), so it's still correctly excluded.
+- The ring is **kept across park/wake** (not reset), so after a timer tick wakes us
+  the next batch hash matches immediately and we re-park — otherwise we'd
+  re-accumulate the ring every tick and waste ~5 %.
+
+**Validated (headless, fresh boot):** at a logged-in idle shell, host CPU dropped
+from ~100 % to **~2–4 %**, the shell stayed responsive (commands run, wake-on-IRQ
+works), the clock stayed correct, and boot completes normally (the `DELAY()` loop
+is not frozen).
+
+**Known gap:** the login *getty* prompt is not parked as cleanly (measured higher)
+— its idle apparently isn't a pure state-repeating loop (getty may do periodic
+work, or its loop mutates more than k0/k1). The steady-state idle that matters
+(logged-in shell, blocked daemons, X) parks fine. If the login prompt matters, the
+fallback is a PC-signature idle-skip for the known idle-loop PCs
+(`0x88011704`/`0x88020d90` on this 5.3 kernel).
+
+**Other TODO:** the JIT path (`--features jit`) bypasses this run loop entirely
+(`jit/dispatch.rs`); idle park there is not yet implemented.
