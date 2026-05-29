@@ -482,7 +482,12 @@ impl Ui {
             );
         }
 
-        event_loop.set_control_flow(ControlFlow::Poll);
+        // Wait (not Poll): block the main thread until a real input event
+        // arrives, so an idle desktop doesn't busy-spin a host core. Rendering
+        // is driven by the REX3 refresh thread (RedrawRequested below is a
+        // no-op) and mouse-flush is on timer_manager, so the event loop has no
+        // reason to tick when idle.
+        event_loop.set_control_flow(ControlFlow::Wait);
         event_loop.run(move |event, elwt| {
             match event {
                 Event::WindowEvent { event, .. } => match event {
