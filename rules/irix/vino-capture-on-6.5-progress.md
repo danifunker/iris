@@ -4,6 +4,54 @@ Companion to [indycam-end-to-end-capture.md](indycam-end-to-end-capture.md)
 (which got capture working on **IRIX 5.3**). This note covers making it work
 on **6.5.22**, where it currently does NOT fully work yet.
 
+---
+## ★ START HERE (next-session handoff, 2026-05-30) ★
+
+**Status:** 6.5 IndyCam capture ENGAGES and the VINO DMA+interrupt path runs, but
+videod never delivers a frame to the client (vidtomem hangs). The blocker is now
+pinned to **one bit**. The dated sections below (cont. 1–11) are the full history,
+including several DEAD ENDS — read this block first, then cont. 11 + cont. 6/7/10.
+
+**Committed/shipped (safe, keep):**
+- `src/physical.rs` uncached-`0x4000_0000`-alias fix — commit `8426efd` on branch
+  `vino-6.5-capture-engage`. Makes 6.5 capture engage + DESC fire. 5.3-neutral.
+- Boot speed 292s→89s on the klindert guest (nsswitch files-first + FQDN + service
+  disables) — see [[project_klindert_boot_speed]]. `src/vino.rs` is at HEAD.
+
+**THE remaining gate (single bit):** delivery is the EOF-path fn `vino.o 0x60b4`
+(→ vinoFillInfo/dms_fifo_enq → pollwakeup mask 0xc0, which DOES match videod's poll
+mask `*(dev+0xb4)=0x140`). Its delivery tail (0x61e0; side-effect `*(conn+0xc4)+=2`)
+is reached iff `(parityODD || *(conn+0x118)&1==0) && byte0x133!=0`. Parity is
+STRUCTURALLY always-even (`*(conn+0xd2)` = `field_counter+(field_counter&1)`,
+confirmed by 3 even samples), byte0x133=1 (ok). So the ONLY route is
+**`*(conn+0x118)&1 == 0`** — but iris yields `*(conn+0x118)=0x27` (bit0 set), so
+`*(conn+0xc4)` stays 0 and nothing delivers.
+
+**NEXT STEP (do this):** `*(conn+0x118)=*(s1+0x3a)` and `byte0x133=(cfg&4)!=0`, both
+copied in `vinoSetupGetFrame` (0x30a8) from a request struct `s1`. Trace what fills
+`*(s1+0x3a)` bit0 — i.e. which VL capture-format/mode input it maps to — and whether
+iris presents a video format/capability that makes videod negotiate a mode with
+bit0 SET vs CLEAR. ALSO sanity-check the assumption that `0x60b4` is the delivery fn
+for this mode (only assumed): re-check callers of vinoFillInfo / dms_fifo_enq — if
+there's another delivery path used for this capture mode, 0x60b4 may be a red
+herring like the others.
+
+**DEFINITIVELY EXCLUDED (do NOT re-chase):** field_counter parity (instrumented,
+alternates fine), the 0x61cc parity counter, EOF/DESC simultaneity (split tested,
+no change), the buffer-ring / `*(conn+0xc)` timeout path, the A_DESC_TABLE_PTR
+live-cursor / drain-to-STOP (those made 0x77c0 return 2 and SKIP delivery — keep
+A_DESC_TABLE_PTR == buffer base, i.e. HEAD).
+
+**Tooling:** chaindump/chainwalk live in guest `/usr/tmp`. icrash recipe: the vino
+module RELOCATES per boot, so each boot re-derive: `icrash -e 'od vino_board 1'`
+→ device; `od (device+0x38) 1` → channel-A conn; `conn+0x14`=device(poll dev).
+`icrash -f cmdfile` batches `od` reads. `par` needs rtmond (disabled for boot
+speed — `chkconfig rtmond on` first). ALWAYS halt cleanly: `sync;halt -y; wait
+~30s; iris-ci quit` (abrupt quit corrupted the root XFS once already — see
+[[project_klindert_boot_speed]]). Capture: videod needs the X `:0.0` display (xdm
+kept on). config `iris-klindert.toml` (6.5, vino source=test_pattern).
+---
+
 ## 5.3-vs-6.5 differential (the key diagnostic) + geometry-fix attempt
 
 Ran the STOCK `/usr/sbin/vidtomem` on BOTH: it **succeeds on 5.3** ("saved image
@@ -564,3 +612,245 @@ icrash recipe (reusable): `icrash -e 'od <hexaddr> <words>'` reads /dev/kmem;
 `icrash -e 'nm <sym>'` resolves module symbols; `icrash -f cmdfile` batches.
 chaindump/chainwalk live in /usr/tmp in the guest (extract via dd bs=512 from
 /dev/rdsk/dks0d2s0 after iris-ci put, then truncate with bs=1 on the regular file).
+
+## 2026-05-30 (cont. 6) — COMPLETE delivery path traced via kmem; precise blocker = *(conn+0xc) never cleared
+
+icrash note: the vino module loads at a DIFFERENT base each boot, so re-derive
+addresses every boot: `od vino_board N` -> device ptr; device+0x38 = ch-A conn;
+conn+0x14 = device (poll dev). This boot: vino_board@0xc00db950 -> device
+0x927c9480 -> conn 0x93278900.
+
+### Delivery is the BLOCKING path, NOT poll
+- videod's worker blocks in vinoGetFrame (0x37d0): `sleep(conn, 0x13c)` at 0x3b64,
+  woken by `wakeup(conn)`; on wake it calls vinoFinishDMA and returns the frame.
+  (*(conn+0x118) is a STATIC config word set once at init (only store to 0x118 is
+  in vino_init@0x33a0); its bit3/bit&3 are mode flags, NOT a per-frame ready bit.)
+- The POLL path is DEAD: videod's selected mask *(dev+0xb4)=0x140 (live), but every
+  pollwakeup mask is disjoint from it — EOF=5, the 0x7640 frame-ready wrapper=0x30,
+  ioctl-path=0x1000/0x2000/0x4000. 0x140 & {5,0x30,...}=0, and *(dev+0xb8)=0
+  (pending), so vinoPoll never reports fd 7 ready. So delivery cannot come through
+  select(fd 7); it must be wakeup(conn).
+
+### The only wakeup(conn) and what gates it
+- `wakeup` exists once (vinoFinishDMA@0x751c). vinoFinishDMA is reached in the
+  capture path via vinoCheckDMA(flag&0x10)@0x6be4, and vinoCheckDMA is called by
+  **vinoWakeupTimeout** (a self-rescheduling timer, 0x5304) and vinoDMRBCallback.
+- vinoWakeupTimeout's finish gate: at 0x5324 `lw $v1,0xc($conn); bnez $v1,0x535c`
+  — if **`*(conn+0xc) != 0` it just RESCHEDULES** (no finish). Only when
+  `*(conn+0xc) == 0` does it switch on byte *(conn+0x135) and reach
+  vinoCheckDMA/vinoFinishDMA -> wakeup(conn) -> videod delivered.
+- LIVE: `*(conn+0xc) = 0x0861e000` (the buffer base) — never cleared. So the timer
+  loops forever and the frame is never delivered.
+
+### Who clears *(conn+0xc)
+vinoFinishDMA (0x72e0) and vinoEOD (0x69c8) clear it. vinoEOD's clear path (0x69c8)
+is taken only when vinoGetNextBuffer (called at 0x6900) returns < 0 (buffer ring
+exhausted: gated on *(conn+0x28), *(conn+0x18), byte *(conn+0x134), and the global
+in-progress flag .data+0x438[+0xe4]). So iris's DESC/EOF interrupt sequence is not
+driving vinoEOD->vinoGetNextBuffer into the "ring exhausted" state that clears
+*(conn+0xc). That is the precise remaining gap.
+
+Live conn (0x93278900) snapshot during a hung grab: +0x04=bufarray 0x972e1780,
++0x0c=0x0861e000(!), +0x14=dev, +0x100=0xa86214f0 (live desc ptr at STOP, KSEG1),
++0x104=0 (buf idx), +0x10c=5 (buf count), +0xc0=1 (last-delivered field), byte
+0xb8=1, byte 0x133=1, byte 0x136=0x1e(30), *(conn+0x118)=0x0027 (&3==3, &8==0).
+
+### Next step (next session): make iris drive the buffer ring to completion
+Trace vinoEOD + vinoGetNextBuffer against the live buffer-ring fields across the
+DESC sequence to find which register/state iris must present so vinoGetNextBuffer
+returns <0 (or vinoEOD otherwise clears *(conn+0xc)). This is a software
+state-machine match driven by the count/order of DESC interrupts vs the 5-deep
+buffer ring — NOT a single register value. field_counter free-run alone is
+insufficient (tested: build #1 failed) because the gate is *(conn+0xc), not the
+0x7640 field-delta.
+
+## 2026-05-30 (cont. 7) — CORRECTION: poll path IS viable (mask 0xc0); delivery gate = field-parity counter *(conn+0xd2)
+
+Earlier "poll path is dead" was WRONG — I had not found all the pollwakeup masks.
+The REAL frame delivery is the EOF-path static **0x60b4** (called by vinoInterrupt
+on EOF, with conn): it runs vinoFillInfo + dms_block_end_dma + dms_fifo_enq to
+finalize the captured buffer, then calls the pollwakeup wrapper 0x6fcc with
+**mask 0xc0** (at 0x6268). videod's selected mask *(dev+0xb4)=0x140, and
+0xc0 & 0x140 = 0x40 → **MATCH**. So EOF -> 0x60b4 -> pollwakeup(0xc0) wakes videod's
+select(fd 7). (The 0x30 wrapper in 0x7640 and EOF mask 5 are red herrings.)
+
+### The exact gate that blocks 0x60b4's delivery
+Walking 0x60b4 with live conn values (*(conn+0x118)=0x27): it reaches the delivery
+tail only past **0x61cc: `lw v1,0xd0(conn); andi v1,1; beql v1,zero,return`** —
+i.e. delivery requires the WORD at conn+0xd0 to be ODD (interlace even/odd pairing).
+LIVE: word@0xd0 = 0x00000002 (EVEN) -> returns, no delivery.
+
+word@0xd0 = (halfword 0xd0 << 16) | halfword 0xd2. 0x7640 increments only the HIGH
+half (sh@0x76c0), so the word's bit0 = bit0 of ***(conn+0xd2)**, written at 0x76c8:
+`*(conn+0xd2) = t2 = (A_FIELD_COUNTER + t1)`. So **delivery parity is driven by
+iris's A_FIELD_COUNTER value** (t1 derives from *(conn+0x118)&3 and field parity).
+LIVE *(conn+0xd2)=2 (even) and appears stuck even -> never delivers.
+
+So the whole chain reduces to: **iris must present A_FIELD_COUNTER such that the
+driver's 0x7640 sets *(conn+0xd2) ODD on the field whose EOF runs 0x60b4.** This is
+the interlace field-pairing, and HEAD's field_counter (resets to 0 per DMA-enable)
+isn't producing it. (Free-running field_counter alone — build #1 — also failed, so
+the exact A_FIELD_COUNTER sequence/parity the driver expects per re-arm needs to be
+matched, not just "made large". The 0x7640 counter arithmetic vs the live
+field_counter values still needs untangling.)
+
+Live conn this run (0x93278d80): +0xc=0x0861e000, +0xc0=1, word@0xd0=0x00000002
+(=> *(conn+0xd0)=0, *(conn+0xd2)=2), +0x118=0x0027, +0x10c=5, +0x104=0.
+icrash addresses change per boot (module reloc): vino_board@0xc00db950 ->
+device 0x927c9480 -> conn *(device+0x38).
+
+### Refined next step
+Correlate the live A_FIELD_COUNTER register reads (iris log) with *(conn+0xd2)
+across the DESC/EOF sequence to learn the exact parity the driver expects, then
+adjust how iris reports CH_FIELD_COUNTER (and possibly when it raises EOF vs DESC)
+so *(conn+0xd2) lands ODD on a delivering field. This is now a bounded
+field-counter/parity problem on a KNOWN-viable poll delivery path — a much better
+position than "poll is impossible".
+
+## 2026-05-30 (cont. 8) — free-running field_counter fixes the parity COUNTER but not delivery; suspect EOF+DESC simultaneity
+
+Applied free-running field_counter (removed the reset in start_channel). Confirmed:
+A_FIELD_COUNTER now VARIES (0x676,0x677,...) instead of being stuck at 1, and the
+driver's parity word now counts: live word@conn+0xd0 went 0x000029fe -> 0x00002a00
+(*(conn+0xd2) incrementing ~1/field, so it DOES pass through odd values e.g.
+0x29ff). So the delivery parity gate (0x60b4 @ 0x61cc requires word@0xd0 ODD) is now
+SATISFIABLE — but still NO frame delivered (no /usr/tmp/cap-00000.rgb; INTR still
+0x05; vino.rs otherwise HEAD; conn this run 0x920c2c00, *(conn+0x118)=0x0027).
+
+So field_counter was necessary (parity was structurally stuck before) but not
+sufficient. The remaining suspicion: the EOF handler 0x60b4 reads *(conn+0xd2) at a
+moment it is consistently EVEN, because iris raises EOF and DESC TOGETHER as a
+single INTR=0x05. In vinoInterrupt the EOF bit (-> 0x60b4, which READS the parity)
+and the DESC/dispatch path (-> 0x7640, which WRITES the parity) are processed in the
+same ISR pass, so 0x60b4 likely always sees the just-written (even) value and the
+odd half-cycle is never observed at an EOF. Real VINO raises EOF (end of active
+video) and DESC (descriptor STOP) as SEPARATE, temporally-ordered interrupts.
+
+### Strong next hypothesis (was old hypothesis #2, now well-motivated)
+Make iris raise EOF and DESC as DISTINCT interrupt events with the driver's ISR
+running between them (e.g. raise EOF at end of the field's active-video pump, wait
+for the driver to ack/clear it, THEN raise DESC when the descriptor cursor consumes
+STOP) — so 0x60b4's *(conn+0xd2) read lands on the ODD half-cycle. Keep the
+free-running field_counter (it is hardware-correct and a prerequisite). This is the
+last identified gate on a KNOWN-viable poll-delivery path (pollwakeup mask 0xc0
+matches videod's 0x140). Working tree currently: physical.rs(committed alias) +
+vino.rs(free-running field_counter, uncommitted, correct-but-insufficient).
+
+## 2026-05-30 (cont. 9) — EOF/DESC split WORKS mechanically + parity reaches odd, but STILL no delivery
+
+Implemented the EOF/DESC separation (defer DESC: dma_emit_dword records
+stop_reached instead of raising DESC; pump_field raises EOF, polls until the
+driver clears the EOF bit, then raises DESC) + kept free-running field_counter.
+Build verified: INTR now shows **0x01 (EOF alone) and 0x04 (DESC alone) as
+SEPARATE events** (1768x / 1485x), no longer the combined 0x05. And the driver's
+parity word @conn+0xd0 now passes through ODD (live reads 0x2ae3 odd, 0x2aec,
+0x2af0). So the field-parity gate (0x60b4 @ 0x61cc) is now genuinely satisfiable.
+**Yet still NO frame delivered** (no /usr/tmp/cap-00000.rgb).
+
+So neither the EOF+DESC simultaneity NOR the field-parity counter was the final
+blocker — both are now correct and delivery still fails. Also note: 0x7640 (the
+parity WRITER) is gated by intr&9 = bits {0,3} = EOF, and 0x60b4 (the READER) is
+also the EOF handler — so both already happen on the SAME EOF interrupt regardless
+of the split; splitting EOF/DESC therefore can't change their relative order. The
+split was a dead end for this gate (though it's more hardware-faithful).
+
+Remaining suspects (past 0x61cc, in 0x60b4's delivery tail, all UNVERIFIED):
+- 0x60b4 may not actually REACH 0x61cc on an odd-parity EOF (an earlier branch:
+  *(conn+0x118)&0x20 routing at 0x6174, the vinoGetNextBuffer call at 0x61a0, or
+  the byte 0x13a/0x13b compare at 0x614c). Verify by reading *(conn+0xc4) (the
+  delivery path does `*(conn+0xc4)+=2` at 0x61e0) — if it never increments, 0x60b4
+  never reaches delivery even when parity is odd.
+- The finalize calls vinoFillInfo / dms_block_end_dma / dms_fifo_enq may fail on
+  the captured buffer (bad metadata), or the pollwakeup(0xc0) fires but videod's
+  vinoPoll still reports not-ready (check *(dev+0xb8) becomes nonzero at delivery).
+NOTE: par tracing now needs rtmond, which I disabled for boot speed — re-enable
+(`chkconfig rtmond on`) before using par.
+
+Working tree: physical.rs(committed alias) + vino.rs(free-running field_counter +
+EOF/DESC split, uncommitted, mechanically-correct-but-still-no-delivery, untested
+on 5.3). Build ~12. Stopping here per plan — no new concrete lead without more
+kmem cycles on whether 0x60b4 reaches its delivery tail.
+
+### DECISIVE: 0x60b4 never reaches its delivery tail (*(conn+0xc4) stuck at 0)
+Read *(conn+0xc4) twice ~13s apart during an active capture: BOTH 0x00000000. The
+0x60b4 delivery path does `*(conn+0xc4) += 2` (0x61e0), so 0x60b4 is RETURNING
+before 0x61e0 on every EOF — i.e. the parity check at 0x61cc sees EVEN at the
+EOF-ISR moment every time, even though *(conn+0xd2) (only written by 0x7640) is
+observed ODD at random kmem-read times. So the WRITE (0x7640, parity) and the READ
+(0x60b4, same EOF ISR) are not aligning to an odd value at the read, contradicting
+the naive "0x7640 in the dispatch loop runs before 0x60b4 in the bit-handler".
+Resolve next time by single-stepping the value 0x7640 writes vs what 0x60b4 reads
+on ONE EOF (e.g. instrument iris to log A_FIELD_COUNTER at the exact EOF raise, and
+read *(conn+0xd2) right after) — the +t1 term / which field's counter the driver
+samples is the missing piece. The free-running field_counter and EOF/DESC split are
+mechanically correct (verified: INTR 0x01/0x04 separate; parity word alternates)
+but neither opens delivery, so they were REVERTED to keep the committed state clean
+(physical.rs alias only). Re-enable rtmond before par. Build ~12; stopping.
+
+## 2026-05-30 (cont. 10) — INSTRUMENTATION: field_counter parity is FINE; the parity line is ruled out
+
+Added a FCREAD log (every CH_FIELD_COUNTER read -> val, parity, int_status) with
+free-running field_counter. Result: channel-A A_FIELD_COUNTER reads increment
+cleanly 0x1,0x2,0x3,0x4,... with ALTERNATING parity (the parity=0 skew is just
+channel-B reads which are always 0x0). So iris presents alternating parity, NOT a
+pinned value. => **The field_counter parity is NOT the delivery blocker.** The
+whole field-parity line (free-running field_counter, EOF/DESC split) was chasing a
+non-issue and is abandoned.
+
+Reconciles the earlier contradiction: my 0x7640 read "*(conn+0xd2) =
+A_FIELD_COUNTER + (field_counter&1)" must be WRONG — kmem showed *(conn+0xd2)~10979
+(odd) while A_FIELD_COUNTER~1663, so *(conn+0xd2) is a different/larger counter, not
+field_counter+small. The 0x60b4 0x61cc parity check is therefore NOT the thing
+field_counter controls.
+
+### Real remaining lead (new direction): the capture-mode config *(conn+0x118)
+Delivery in 0x60b4 reaches its tail only if byte 0x133 == 0 (0x61ac) OR
+*(conn+0x118)&1 == 0 (0x61c0 skips the parity check) OR the 0x61cc parity is odd.
+Live: byte 0x133 = 1 and *(conn+0x118) = 0x27 (bit0 set), so it is forced through
+the 0x61cc parity check — and *(conn+0xc4) stays 0, proving it never passes. So the
+question is why iris's capture setup makes the driver configure *(conn+0x118)=0x27 /
+byte 0x133=1 (the interlace/field mode), vs a mode where bit0 is clear (direct
+delivery). *(conn+0x118) is written once (0x33a0); trace what value it stores and
+what capture-mode input (VL request / register) it depends on. Also worth checking:
+whether the *(conn+0xd0)/0xd2 counters are MSC/UST (frame stream counts) rather than
+field parity, which would mean 0x61cc gates on stream progress not field parity.
+
+Instrumentation reverted; committed state remains physical.rs alias only (8426efd).
+
+## 2026-05-30 (cont. 11) — RESOLVED to a single bit: delivery needs *(conn+0x118)&1 == 0 (a capture-mode config bit)
+
+Settled the parity contradiction: sampled *(conn+0xd0) word 3x during capture —
+0x2a36, 0x2d88, 0x30aa, ALL EVEN. So *(conn+0xd2) (= field_counter+(field_counter&1)
+per 0x7640, the ONLY writer) really is ALWAYS EVEN; the earlier "0x2ae3 odd" was a
+torn read. => the 0x60b4 @ 0x61cc parity check is STRUCTURALLY always-failing (even
+on real hw).
+
+Full 0x60b4 delivery condition to reach the finalize tail (0x61e0: *(conn+0xc4)+=2,
+vinoFillInfo, dms_block_end_dma, dms_fifo_enq, pollwakeup wrapper mask 0xc0):
+  (0x61cc parity ODD  OR  0x61c0: *(conn+0x118)&1 == 0)   AND   0x61dc: byte 0x133 != 0
+Parity is always even, so the only route is **\*(conn+0x118)&1 == 0** (and byte
+0x133 != 0, which is satisfied =1). LIVE iris: *(conn+0x118)=0x27 (bit0 SET) -> the
+sole delivery route is closed -> *(conn+0xc4) stays 0 -> never delivers. CONFIRMED.
+
+Both gate fields are CAPTURE-MODE config copied in vinoSetupGetFrame (0x30a8):
+  - *(conn+0x118) = *(s1+0x3a)          (writer 0x33a0)
+  - byte 0x133    = (src & 4) != 0      (writer 0x3414-0x3420; bit2 of a config word)
+s1 is the capture request/params (vinoSetupGetFrame's working struct, kern_malloc
+0x6c + filled from the VL request / camera defaults). So the driver is in a capture
+MODE (interlace/field flags) whose *(conn+0x118) bit0 is set, which routes 0x60b4
+through the dead parity path.
+
+### THE remaining question (single, precise, fresh direction)
+Why does iris's capture produce *(conn+0x118) bit0 = 1? It comes from *(s1+0x3a)
+bit0 in vinoSetupGetFrame's request struct, which encodes the capture format/mode
+videod negotiated. Either (a) videod requests a mode (interlaced 2-field) that on
+real hw ALSO sets bit0 but real hw delivers via a DIFFERENT path than 0x60b4 (i.e.
+0x60b4 may NOT be the delivery fn for this mode — re-check vinoFillInfo/dms_fifo_enq
+callers; only 0x60b4 was assumed), OR (b) iris presents a video format/capability
+that makes videod pick the wrong mode and a correct format would clear bit0. Trace
+vinoSetupGetFrame's s1 population (what fills +0x3a) and which VL/format input it
+maps to. This is a capture-mode-negotiation question, NOT field_counter/parity (both
+now definitively excluded).
+
+Committed state remains physical.rs alias only (8426efd). Session reached the floor
+of the delivery chain: a single capture-mode config bit. Next session starts here.
