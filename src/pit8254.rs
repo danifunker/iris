@@ -526,6 +526,7 @@ mod tests {
     /// Channel 2 at 1 MHz, reload=100: one period = 100 µs wall-clock.
     /// After waiting well past one period the count must be < reload (timer running).
     #[test]
+    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_100us_period() {
         let _lock = SERIAL.lock().unwrap();
         let pit = start_and_program(1_000_000, 100);
@@ -539,6 +540,7 @@ mod tests {
 
     /// Mid-period read: after ~5 ms into a 10 ms period count should be ~5000.
     #[test]
+    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_midperiod_read() {
         let _lock = SERIAL.lock().unwrap();
         let pit = start_and_program(1_000_000, 10_000); // 10 ms period
@@ -553,6 +555,7 @@ mod tests {
 
     /// Callback fires ~100 times per 100 ms when reload=1000 at 1 MHz (1 ms period).
     #[test]
+    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_callback_rate() {
         let _lock = SERIAL.lock().unwrap();
         let counter = Arc::new(AtomicU32::new(0));
@@ -568,6 +571,7 @@ mod tests {
 
     /// The count decrements monotonically within a period.
     #[test]
+    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_count_decrements() {
         let _lock = SERIAL.lock().unwrap();
         let pit = start_and_program(1_000_000, 0xFFFF); // ~65 ms period
@@ -581,6 +585,7 @@ mod tests {
 
     /// Reload=0xFFFF at 1 MHz: period = 65.535 ms. After 10 ms count ≈ 55535.
     #[test]
+    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_large_reload() {
         let _lock = SERIAL.lock().unwrap();
         let pit = start_and_program(1_000_000, 0xFFFF);

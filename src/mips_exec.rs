@@ -387,6 +387,11 @@ pub type RawInstrFn = usize;
 /// Non-generic, suitable for storage in L1I cache lines.
 pub struct DecodedInstr {
     pub handler: RawInstrFn,        // type-erased fn ptr
+    /// Intrusive hash-chain link for the global decode cache (gdc feature only).
+    /// Each unique raw word has one slab entry; entries with the same hash bucket are
+    /// linked via this field. Null = end of chain.
+    #[cfg(feature = "gdc")]
+    pub next: *const DecodedInstr,
     /// Pre-processed immediate/target. Encoding per opcode:
     ///   J/JAL:              (target26 << 2) as u32  — 28-bit pre-shifted jump offset
     ///   LUI:                (imm16 << 16) as i32 as u32  — sign bit in bit 31
@@ -396,7 +401,10 @@ pub struct DecodedInstr {
     /// Getters immi64()/imms64() widen to u64/i64 on the fly.
     pub imm:     u32,
     pub raw:     u32,
-    pub decoded: bool,              // true when all fields below are valid for this raw
+    /// True when all fields are valid for this raw word. Not present under `gdc` —
+    /// a non-null slab pointer is the decode signal there.
+    #[cfg(not(feature = "gdc"))]
+    pub decoded: bool,
     pub op:      u8,                // bits [31:26]
     pub rs:      u8,                // bits [25:21]  (also: base for loads/stores, fs for FPU)
     pub rt:      u8,                // bits [20:16]  (also: ft for FPU)
@@ -447,7 +455,10 @@ impl DecodedInstr {
 impl Default for DecodedInstr {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "gdc")]
+            next:    std::ptr::null(),
             raw:     0,
+            #[cfg(not(feature = "gdc"))]
             decoded: false,
             op:      0,
             rs:      0,
@@ -460,6 +471,11 @@ impl Default for DecodedInstr {
         }
     }
 }
+
+#[cfg(feature = "gdc")]
+impl Clone for DecodedInstr { fn clone(&self) -> Self { *self } }
+#[cfg(feature = "gdc")]
+impl Copy for DecodedInstr {}
 
 // Non-exception status tags in bits [15:8]
 pub const EXEC_COMPLETE:           ExecStatus = 0x0000_0000; // normal completion (advance PC by 4)
@@ -697,6 +713,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // Build unified cache hierarchy. Cache geometry is fixed at compile time;
         // IC_SIZE/IC_LINE/DC_SIZE/DC_LINE/L2_SIZE/L2_LINE are consts from mips_cache_v2.
         let mut cache = C::from(sysad.clone());
+        #[cfg(feature = "gdc")]
+        cache.set_decode_fn(decode_into::<T, C>);
 
         // Build CP0 Config register from architecture constants.
         let mut config = 0u32;
@@ -820,6 +838,15 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         executor.rebind_atomic_ptrs();
         executor.update_translate_fn();
         executor.update_fpr_mode();
+
+        #[cfg(feature = "gdc")]
+        {
+            let raw_words = crate::decode_cache_profile::load_raw_words();
+            for raw in raw_words {
+                executor.cache.decode_cache_get(raw);
+            }
+        }
+
         executor
     }
 
@@ -922,7 +949,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// Execute a single instruction (decode into scratch, then execute).
     pub fn exec(&mut self, instr: u32) -> ExecStatus {
         self.ins.raw = instr;
-        self.ins.decoded = false;
+        #[cfg(not(feature = "gdc"))]
+        { self.ins.decoded = false; }
         decode_into::<T, C>(&mut self.ins);
         let d: *const DecodedInstr = &self.ins;
         self.exec_decoded(unsafe { &*d })
@@ -1021,15 +1049,20 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 
         let fetch = self.fetch_instr(pc);
         let result = if fetch.status == EXEC_COMPLETE {
-            let slot = fetch.instr as *mut DecodedInstr;
-            let d = unsafe { &mut *slot };
-            if !d.decoded {
-                decode_into::<T, C>(d);
-            } else {
-                #[cfg(feature = "developer")]
-                self.decoded_count.fetch_add(1, Ordering::Relaxed);
+            #[cfg(not(feature = "gdc"))]
+            {
+                let slot = fetch.instr as *mut DecodedInstr;
+                let d = unsafe { &mut *slot };
+                if !d.decoded {
+                    decode_into::<T, C>(d);
+                } else {
+                    #[cfg(feature = "developer")]
+                    self.decoded_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            let d = unsafe { &*slot };
+            let d = unsafe { &*fetch.instr };
+            #[cfg(all(feature = "gdc", feature = "developer"))]
+            self.decoded_count.fetch_add(1, Ordering::Relaxed);
             #[cfg(not(feature = "lightning"))]
             self.traceback.push(pc, d.raw);
             self.exec_decoded(d)
@@ -1081,12 +1114,13 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                 fetch.status
             };
         }
-        let slot = fetch.instr as *mut DecodedInstr;
-        let d = unsafe { &mut *slot };
-        if !d.decoded {
-            decode_into::<T, C>(d);
+        #[cfg(not(feature = "gdc"))]
+        {
+            let slot = fetch.instr as *mut DecodedInstr;
+            let d = unsafe { &mut *slot };
+            if !d.decoded { decode_into::<T, C>(d); }
         }
-        self.exec_decoded(unsafe { &*slot })
+        self.exec_decoded(unsafe { &*fetch.instr })
     }
 
     #[inline(always)]
@@ -1648,9 +1682,14 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             self.uncached_fetch_count.fetch_add(1, Ordering::Relaxed);
             let r = self.sysad.read32(phys_addr);
             if r.is_ok() {
-                if self.ins.raw != r.data { self.ins.decoded = false; }
-                self.ins.raw = r.data;
-                FetchInstrResult::hit(&self.ins as *const DecodedInstr)
+                #[cfg(feature = "gdc")]
+                { FetchInstrResult::hit(self.cache.decode_cache_get(r.data)) }
+                #[cfg(not(feature = "gdc"))]
+                {
+                    if self.ins.raw != r.data { self.ins.decoded = false; }
+                    self.ins.raw = r.data;
+                    FetchInstrResult::hit(&self.ins as *const DecodedInstr)
+                }
             } else {
                 // BUS_BUSY == EXEC_RETRY (compile-time asserted in traits.rs); pass status through.
                 if r.status != BUS_BUSY {
@@ -4619,7 +4658,8 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
     ins.sa      = sa;
     ins.funct   = funct;
     ins.handler = handler as usize;
-    ins.decoded = true;
+    #[cfg(not(feature = "gdc"))]
+    { ins.decoded = true; }
 }
 
 // Field extraction helpers have been replaced by DecodedInstr fields
@@ -4799,6 +4839,14 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         self.idle_profile_on.store(false, Ordering::SeqCst);
     }
 
+    #[cfg(feature = "gdc")]
+    pub fn save_decode_cache(&self) {
+        let exec = self.executor.lock();
+        let words = exec.cache.decode_cache_keys();
+        if let Err(e) = crate::decode_cache_profile::save_raw_words(&words) {
+            eprintln!("Decode cache: save failed: {}", e);
+        }
+    }
 
     pub fn run_debug_loop(&self, mut count: Option<usize>, wait: bool, mut writer: Box<dyn Write + Send>) {
         self.stop(); // Ensure stopped before running

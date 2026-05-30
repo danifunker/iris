@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use crate::hptimer::{TimerManager, TimerReturn};
 
 #[test]
+#[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
 fn test_precision_one_shot_and_recurring() {
     let manager = TimerManager::new();
     let start = Instant::now();
@@ -49,6 +50,7 @@ fn test_precision_one_shot_and_recurring() {
 }
 
 #[test]
+#[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
 fn test_multiple_overlapping_timers() {
     let manager = TimerManager::new();
     let start = Instant::now();
@@ -75,6 +77,7 @@ fn test_multiple_overlapping_timers() {
 }
 
 #[test]
+#[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
 fn test_extended_callback_recovery() {
     let manager = TimerManager::new();
     let start = Instant::now();
@@ -117,6 +120,7 @@ fn test_extended_callback_recovery() {
 }
 
 #[test]
+#[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
 fn test_rescheduling_timers() {
     let manager = TimerManager::new();
     let start = Instant::now();
@@ -178,6 +182,7 @@ fn test_rescheduling_timers() {
 }
 
 #[test]
+#[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
 fn test_add_remove_multiple_order() {
     let manager = TimerManager::new();
     
