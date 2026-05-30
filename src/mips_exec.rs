@@ -63,8 +63,9 @@ pub const EXC_VCED: u32 = 31;     // Virtual Coherency Exception (Data)
 pub const CONFIG_CM: u32 = 31;    // Master checker mode
 pub const CONFIG_EC: u32 = 28;    // 3 bits, clock ratio  0 - 2, 1 - 3...
 pub const CONFIG_EP: u32 = 24;    // 4 bits transmit data pattern for writeback
-pub const CONFIG_SB: u32 = 22;    // 2 bits secondary cache size, 0 - 4 words, 1 - 8 ...
-pub const CONFIG_SS: u32 = 21;    // split secondary cache mode
+pub const CONFIG_SB: u32 = 22;    // 2 bits secondary cache block size: 1=8 words (32B) on R5K
+pub const CONFIG_SS: u32 = 21;    // R4K: 1 bit split secondary cache mode
+pub const CONFIG_TR_SS: u32 = 20; // Triton: 2 bits secondary cache size [21:20]: 00=512KB 01=1MB 10=2MB 11=none
 pub const CONFIG_SW: u32 = 20;    // secondary cache port width 0 - 128bit, 1 - 64bit
 pub const CONFIG_EW: u32 = 18;    // 2 bits system port width 0 - 64 bit, 1 - 32 bit
 pub const CONFIG_SC: u32 = 17;    // secondary cache present 0 - present, 1 - absent
@@ -72,6 +73,7 @@ pub const CONFIG_SM: u32 = 16;    // dirty shared coherency state 0 - enabled, 1
 pub const CONFIG_BE: u32 = 15;    // 1 - big endian, 0 - little endian
 pub const CONFIG_EM: u32 = 14;    // 1 - ecc enabled, 0 - parity enabled
 pub const CONFIG_EB: u32 = 13;    // 1 block ordering 1 - sequential 0 - sub block
+pub const CONFIG_SE: u32 = 12;    // R5K/Triton: secondary cache enable (R/W); 1=enabled
 pub const CONFIG_IC: u32 = 9;     // 3 bits ICache size 2^12+IC
 pub const CONFIG_DC: u32 = 6;     // 3 bits DCache size 2^12+IC
 pub const CONFIG_IB: u32 = 5;     // icache block size 0=16B 1=32B (R4000/R4400=0, R5000=1)
@@ -188,15 +190,17 @@ impl UndoBuffer {
     }
 
     fn push(&mut self, snapshot: CpuSnapshot) {
-        if !self.enabled {
-            return;
-        }
+        self.push_get_idx(snapshot);
+    }
 
-        self.snapshots[self.head] = Some(snapshot);
+    fn push_get_idx(&mut self, snapshot: CpuSnapshot) -> usize {
+        let idx = self.head;
+        self.snapshots[idx] = Some(snapshot);
         self.head = (self.head + 1) % UNDO_BUFFER_SIZE;
         if self.count < UNDO_BUFFER_SIZE {
             self.count += 1;
         }
+        idx
     }
 
     fn can_undo(&self, steps: usize) -> bool {
@@ -215,6 +219,13 @@ impl UndoBuffer {
         };
 
         self.snapshots[index].as_ref()
+    }
+
+    fn pop(&mut self) {
+        if self.count == 0 { return; }
+        self.head = if self.head == 0 { UNDO_BUFFER_SIZE - 1 } else { self.head - 1 };
+        self.snapshots[self.head] = None;
+        self.count -= 1;
     }
 
     fn clear(&mut self) {
@@ -685,7 +696,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 
         // Build unified cache hierarchy. Cache geometry is fixed at compile time;
         // IC_SIZE/IC_LINE/DC_SIZE/DC_LINE/L2_SIZE/L2_LINE are consts from mips_cache_v2.
-        let cache = C::from(sysad.clone());
+        let mut cache = C::from(sysad.clone());
 
         // Build CP0 Config register from architecture constants.
         let mut config = 0u32;
@@ -709,7 +720,20 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         config |= 1 << CONFIG_BE;
 
         // SC (bit 17): Secondary cache present. 0=present, 1=absent.
-        config |= (if L2_SIZE > 0 { 0 } else { 1 }) << CONFIG_SC;
+        // SC=0: PROM detects L2 via CACH_SD|C_ILT probe → rmi_cacheflush (inclusive L2 path).
+        // SC=1: size_2nd_cache() returns 0 → PROM reads L2 size from EEPROM, sets
+        //       _two_set_pcaches=icache/2 → __cache_wb_inval does index IWBINV on both
+        //       L1D ways + index IINV on both L1I ways (correct for R5K non-inclusive L2).
+        // r5ksc_triton: SC=0 — Triton reports integrated L2 (PROM detects it via probe).
+        // r5k without r5ksc: SC=1 — no L2 present; PROM uses 2-way index flush.
+        // r5k + r5ksc (external): SC=1 — external cache sized via EEPROM; 2-way flush.
+        // R4K: SC=0 when L2 present, SC=1 when absent.
+        #[cfg(feature = "r5ksc_triton")]
+        { config |= 0 << CONFIG_SC; } // Triton: SC=0, integrated L2 present
+        #[cfg(all(feature = "r5k", not(feature = "r5ksc_triton")))]
+        { config |= 1 << CONFIG_SC; } // R5K non-Triton: SC=1, PROM uses 2-way index flush
+        #[cfg(not(feature = "r5k"))]
+        { config |= (if L2_SIZE > 0 { 0 } else { 1 }) << CONFIG_SC; }
 
         // SB (bits 23:22): Secondary cache block size.
         // 00=4 words (16B), 01=8 words (32B), 10=16 words (64B), 11=32 words (128B).
@@ -720,31 +744,27 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             128 => 0b11,
             _   => 0b11,
         }) << CONFIG_SB;
-/*
-For R4000SC/MC CPUs:
 
-  The size is determined algorithmically by the size_2nd_cache function.
-   1. Presence Check: It first reads CP0_CONFIG and checks the CONFIG_SC bit (bit 17). If this bit is 0, an L2 cache is present, and the test proceeds.
-   2. Sizing Algorithm:
-       * It writes data to memory addresses that are powers of two (128KB, 256KB, 512KB, etc.) to fill the cache.
-       * It then invalidates the cache tag at index 0, creating a unique "marker."
-       * It begins checking addresses again, starting from the smallest possible cache size, and uses a cache instruction to read the tag at each power-of-two boundary.
-       * When it reads a tag and finds the "marker" it wrote, it knows the cache has just "wrapped around." The address at which this wrap-around occurred indicates the total size of the
-         cache.
-   3. Set Variable: The final calculated size is then stored in the _sidcache_size global variable.
+        // Triton CONFIG_TR_SS (bits 21:20): secondary cache size.
+        // IP22 PROM probes L2 dynamically and ignores these bits.
+        // IP32 (O2) reads CONFIG[21:20] directly — must match for correct L2 detection.
+        #[cfg(feature = "r5ksc_triton")]
+        {
+            let ss: u32 = match L2_SIZE {
+                524288  => 0b00,  // 512 KB
+                1048576 => 0b01,  // 1 MB
+                2097152 => 0b10,  // 2 MB
+                _       => 0b11,  // none / 4 MB
+            };
+            config |= ss << CONFIG_TR_SS;
+        }
 
-*/
-/*
- L2 size on R5K
-
- The size is read directly from a bitfield in CP0_CONFIG.
-   1. The code reads CP0_CONFIG and masks for the CONFIG_TR_SS bits (bits 21-20).
-   2. The 2-bit value (00, 01, 10, or 11) is extracted.
-   3. This value is used as a multiplier for a base size (512KB) to calculate the total L2 cache size (512KB, 1MB, 2MB, or 4MB).
-
-*/        
         core.cp0_config = config;
         core.tlb_entries = cfg.tlb_entries as u32;
+
+        // Triton: sync initial L2 enabled state from Config SE bit (starts 0 = disabled).
+        #[cfg(feature = "r5ksc_triton")]
+        cache.set_l2_enabled((config >> CONFIG_SE) & 1 != 0);
 
         /*eprintln!("Cache config: L1I {}KB/{}B-line  L1D {}KB/{}B-line  L2 {}KB/{}B-line  CP0.Config={:#010x}",
             ic_size / 1024, ic_line,
@@ -1081,8 +1101,12 @@ For R4000SC/MC CPUs:
         let mut hit = false;
         for bp in &self.breakpoints {
             if bp.enabled && bp.kind as u8 == KIND {
-                // Ignore bottom 2 bits for address comparison
-                if (bp.addr & !3) == (addr & !3) {
+                // Normalize to physical: strip sign-extension and kseg bits (top 3 of
+                // low 32), then mask bottom 2 for word alignment.  This makes a bp set
+                // on physical 0x1fbb0010 hit whether the CPU access came through kseg0
+                // (0x9fbb0010) or kseg1 (0xbfbb0010).
+                const PHYS_MASK: u64 = 0x1FFF_FFF8;
+                if (bp.addr & PHYS_MASK) == (addr & PHYS_MASK) {
                     // Check optional register condition
                     if let Some(expr) = &bp.condition {
                         let symbols = self.symbols.lock();
@@ -1091,6 +1115,10 @@ For R4000SC/MC CPUs:
                             // If evaluation fails, we assume the condition is not met (or maybe we should break to show error?)
                             Err(_) => continue, 
                         }
+                    }
+                    if KIND != BpType::Pc as u8 {
+                        eprintln!("[bp] mem bp {} hit: kind={:?} bp_addr={:#010x} access_addr={:#010x} pc={:#018x}",
+                            bp.id, bp.kind, bp.addr, addr, self.core.pc);
                     }
                     self.last_bp_hit = Some(bp.id);
                     hit = true;
@@ -3166,6 +3194,7 @@ For R4000SC/MC CPUs:
         let rd_val = d.rd as u32;
         // Sign-extend from 32 bits
         self.core.write_cp0(rd_val, rt_val as u32 as i32 as i64 as u64);
+        self.handle_cp0_side_effects(rd_val);
         EXEC_COMPLETE
     }
 
@@ -3174,7 +3203,17 @@ For R4000SC/MC CPUs:
         let rt_val = self.core.read_gpr(d.rt as u32);
         let rd_val = d.rd as u32;
         self.core.write_cp0(rd_val, rt_val);
+        self.handle_cp0_side_effects(rd_val);
         EXEC_COMPLETE
+    }
+
+    fn handle_cp0_side_effects(&mut self, reg: u32) {
+        #[cfg(feature = "r5ksc_triton")]
+        if reg == 16 {
+            // CONFIG_SE (bit 12): wire L2 enable/disable to cache.
+            let se = (self.core.cp0_config >> CONFIG_SE) & 1 != 0;
+            self.cache.set_l2_enabled(se);
+        }
     }
 
     // TLB Instructions
@@ -4713,6 +4752,7 @@ pub struct MipsCpu<T: Tlb, C: MipsCache> {
     pub fasttick_count: Arc<AtomicU64>,
     debug: Arc<AtomicBool>,
     exception_mask: Arc<AtomicU32>,
+    trace_file: Arc<Mutex<Option<std::io::BufWriter<std::fs::File>>>>,
     /// Shared with the executor: lock-free idle-profiler arm + reset flags.
     /// Toggling these does NOT require the executor lock, so the CPU is never
     /// paused/resumed to arm the profiler (resuming corrupts a live kernel).
@@ -4740,6 +4780,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
             fasttick_count,
             debug: Arc::new(AtomicBool::new(false)),
             exception_mask: Arc::new(AtomicU32::new(0)),
+            trace_file: Arc::new(Mutex::new(None)),
             idle_profile_on,
             idle_profile_reset,
         }
@@ -4768,6 +4809,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         let running = self.running.clone();
         let debug = self.debug.clone();
         let exception_mask = self.exception_mask.clone();
+        let trace_file = self.trace_file.clone();
 
         let task = move || {
             let mut exec = executor.lock();
@@ -4790,13 +4832,18 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                     count = Some(c - 1);
                 }
 
-                // Capture snapshot before executing instruction (for undo)
+                // Capture snapshot BEFORE executing — this is the state to restore on undo.
+                // memory_writes are collected during step() into pending_memory_writes, then
+                // patched into the snapshot afterwards so a single undo entry is self-contained.
                 #[cfg(feature = "developer")]
-                if exec.undo_buffer.is_enabled() {
-                    let mut snapshot = exec.create_snapshot();
-                    snapshot.memory_writes = Vec::new();
-                    exec.undo_buffer.push(snapshot);
-                }
+                let undo_snap_idx = if exec.undo_buffer.is_enabled() {
+                    exec.pending_memory_writes.clear();
+                    let snapshot = exec.create_snapshot();
+                    let idx = exec.undo_buffer.push_get_idx(snapshot);
+                    Some(idx)
+                } else {
+                    None
+                };
 
                 // Try step with breakpoints enabled.
                 // step() now pushes (pc, instr) into traceback on successful fetch.
@@ -4818,15 +4865,18 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                     first_step = false;
                 }
 
-                // Commit memory writes to the last snapshot after successful execution
+                // Patch the memory writes collected during step() into the pre-step snapshot.
                 #[cfg(feature = "developer")]
-                if exec.undo_buffer.is_enabled() {
-                    exec.commit_undo_snapshot();
+                if let Some(idx) = undo_snap_idx {
+                    let writes = std::mem::take(&mut exec.pending_memory_writes);
+                    if let Some(ref mut snap) = exec.undo_buffer.snapshots[idx] {
+                        snap.memory_writes = writes;
+                    }
                 }
 
                 // Display executed instruction from traceback (already captured by step())
                 let insn_trace = debug.load(Ordering::Relaxed) || mips_log(MIPS_LOG_INSN);
-                if insn_trace || count.is_some() {
+                if insn_trace || count.is_some() || trace_file.lock().is_some() {
                     if let Some(entry) = exec.traceback.get_last(1).into_iter().next() {
                         let symbols = exec.symbols.lock();
                         let sym_str = format_pc_symbol(entry.pc, &symbols);
@@ -4837,7 +4887,12 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                             writeln!(writer, "{}", info).unwrap();
                         }
                         if count.is_some() {
-                            writeln!(writer, "Exec: {}", info).unwrap();
+                            // Route through devlog writers so Exec: lines serialize with
+                            // cache/device dlog output on the same TCP socket.
+                            crate::dlog_unconditional!("Exec: {}", info);
+                        }
+                        if let Some(ref mut f) = *trace_file.lock() {
+                            let _ = writeln!(f, "{}", info);
                         }
                     } else if insn_trace {
                         writeln!(writer, "PC: {:016x} (Fetch failed)", exec.core.pc).unwrap();
@@ -4894,6 +4949,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                 }
             }
             exec.flush_cycles();
+            if let Some(ref mut f) = *trace_file.lock() { let _ = f.flush(); }
 
             // Print next instruction
             let next_pc = exec.core.pc;
@@ -5335,7 +5391,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             ("setreg".to_string(), "Set register value: setreg <reg> <value>".to_string()),
             ("translate".to_string(), "Translate virtual address: translate <addr>".to_string()),
             ("t".to_string(), "Alias for translate".to_string()),
-            ("debug".to_string(), "Enable/disable CPU tracing: debug <on|off> [DEV]".to_string()),
+            ("debug".to_string(), "CPU instruction trace: debug <on|off|file <path>> [DEV]".to_string()),
             ("ex".to_string(), "Alias for exception".to_string()),
             ("undo".to_string(), "Undo N instructions or control undo buffer: undo [count] | undo <on|off|clear> [DEV]".to_string()),
             ("dt".to_string(), "Disassemble traceback: dt [count]".to_string()),
@@ -6009,15 +6065,33 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             }
             "debug" => {
                 if actual_args.is_empty() {
-                    return Err("Usage: debug <on|off>".to_string());
+                    return Err("Usage: debug <on|off|file> [filename]".to_string());
                 }
-                let val = match actual_args[0] {
-                    "on" | "1" => true,
-                    "off" | "0" => false,
-                    _ => return Err("Usage: debug <on|off>".to_string()),
-                };
-                self.debug.store(val, Ordering::Relaxed);
-                writeln!(writer, "CPU debug {}", if val { "enabled" } else { "disabled" }).unwrap();
+                match actual_args[0] {
+                    "on" | "1" => {
+                        self.debug.store(true, Ordering::Relaxed);
+                        *self.trace_file.lock() = None;
+                        writeln!(writer, "CPU debug enabled (console output)").unwrap();
+                    }
+                    "off" | "0" => {
+                        self.debug.store(false, Ordering::Relaxed);
+                        *self.trace_file.lock() = None;
+                        writeln!(writer, "CPU debug disabled").unwrap();
+                    }
+                    "file" => {
+                        // file <path>: trace to file only, no socket spam
+                        let path = actual_args.get(1).ok_or("Usage: debug file <filename>")?;
+                        match std::fs::File::create(path) {
+                            Ok(f) => {
+                                self.debug.store(false, Ordering::Relaxed);
+                                *self.trace_file.lock() = Some(std::io::BufWriter::new(f));
+                                writeln!(writer, "CPU trace -> {}", path).unwrap();
+                            }
+                            Err(e) => return Err(format!("Cannot open {}: {}", path, e)),
+                        }
+                    }
+                    _ => return Err("Usage: debug <on|off|file> [filename]".to_string()),
+                }
                 Ok(())
             }
             "ex" | "exception" | "exc" => {
@@ -6135,6 +6209,11 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                     // Restore memory writes in reverse order
                     for mem_write in snapshot.memory_writes.iter().rev() {
                         let _ = exec.debug_write(mem_write.virt_addr, mem_write.old_value, mem_write.size, 0);
+                    }
+
+                    // Pop the consumed snapshots so subsequent undos go further back.
+                    for _ in 0..count {
+                        exec.undo_buffer.pop();
                     }
 
                     writeln!(writer, "Undid {} instruction(s), PC now at {:016x}", count, exec.core.pc).unwrap();

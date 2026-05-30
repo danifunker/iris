@@ -24,6 +24,17 @@ tlbvmap = []
 # TLB translation statistics: per-AccessType counters for nanotlb, vmap, and
 # MRU scan paths including entries-walked totals.  Print at emulator exit.
 tlbstats = []
+# R5000 CPU: 2-way set-associative 32KB L1I/L1D (32B lines), non-inclusive cache hierarchy.
+# Switches PRID/FIR to R5000 values and selects 2-way L1 probe/fill paths.
+r5k = []
+# Secondary cache present. Without this flag the CPU reports SC=1 (no secondary cache)
+# and the L2 is bypassed entirely. Use alone for external R4600SC-style cache sized via
+# EEPROM, or together with r5ksc_triton for Triton on-die L2.
+r5ksc = []
+# Triton integrated L2: on-die 1MB/32B cache reported via CONFIG.SC=0, controlled via
+# CONFIG.SE (bit 12 enable/disable), and sized via CONFIG.SS (bits 23:22).
+# Implies r5ksc (Triton always has secondary cache present).
+r5ksc_triton = ["r5ksc"]
 default = ["tlbvmap"]
 # Cranelift-based JIT compiler for MIPS → native translation.
 jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon"]

@@ -136,6 +136,15 @@ impl Machine {
 
         // 0. Shared EEPROM
         let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
+        // CACHSZ_REG (word 0x11): secondary cache size in 4KB pages.
+        // PROM reads this when SC=1 (size_2nd_cache probe returns 0) to determine L2 size.
+        // r5ksc without r5ksc_triton: external SC sized via EEPROM. 256 = 1MB (256 × 4KB).
+        // r5ksc_triton: Triton reports L2 size via CONFIG_TR_SS — EEPROM word left 0.
+        // r5k without r5ksc: no L2 — leave 0 so PROM sees no secondary cache.
+        #[cfg(all(feature = "r5ksc", not(feature = "r5ksc_triton")))]
+        eeprom.lock().set_cachsz((crate::mips_cache_v2::L2_SIZE / 4096) as u16);
+        #[cfg(all(feature = "r5k", not(feature = "r5ksc")))]
+        eeprom.lock().set_cachsz(0);
 
         // 1. Create all devices first
         // Memory Controller

@@ -311,7 +311,10 @@ impl MipsCore {
             self.compare_last_instant = std::time::Instant::now();
             self.cp0_random = self.tlb_entries - 1;
             self.cp0_random_cycle = 0;
-            self.cp0_prid = 0x00000440; // R4400, imp=0x04, majrev=4, minrev=0
+            #[cfg(not(feature = "r5k"))]
+            { self.cp0_prid = 0x00000440; } // R4400, imp=0x04, majrev=4, minrev=0
+            #[cfg(feature = "r5k")]
+            { self.cp0_prid = 0x00002321; } // R5000, imp=0x23, rev=2.1
             self.cp0_watchlo = 0;
             self.cp0_watchhi = 0;
             self.cp0_xcontext = 0;
@@ -321,7 +324,10 @@ impl MipsCore {
             self.cp0_taghi = 0;
 
             // CP1 registers
-            self.fpu_fir = 0x00000500; // R4000 FPU: imp=0x05, rev=0
+            #[cfg(not(feature = "r5k"))]
+            { self.fpu_fir = 0x00000500; } // R4000 FPU: imp=0x05, rev=0
+            #[cfg(feature = "r5k")]
+            { self.fpu_fir = 0x00002300; } // R5000 FPU: imp=0x23, rev=0
             self.fpu_fccr = 0;
             self.fpu_fexr = 0;
             self.fpu_fenr = 0;
@@ -637,8 +643,12 @@ impl MipsCore {
             14 => self.cp0_epc = value,
             15 => { /* PRId is read-only */ }
             16 => {
-                // Only bits 5:0 are writable (K0, CU, DB, IB)
+                // Bits 5:0 always writable (K0, CU, DB, IB).
+                // Triton: bit 12 (CONFIG_SE) also writable.
+                #[cfg(not(feature = "r5ksc_triton"))]
                 let mask = 0x3F;
+                #[cfg(feature = "r5ksc_triton")]
+                let mask = 0x103F; // adds bit 12 (SE)
                 let old = self.cp0_config;
                 let new = (old & !mask) | ((value as u32) & mask);
                 if new != old {

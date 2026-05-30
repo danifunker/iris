@@ -246,3 +246,7 @@ pub const C_HWBINV: u32 = 0x14;   // Hit Writeback Invalidate (D, SD)
 pub const C_FILL: u32 = 0x14;     // Fill (I)
 pub const C_HWB: u32 = 0x18;      // Hit Writeback
 pub const C_HSV: u32 = 0x1C;      // Hit Set Virtual (SI, SD)
+
+// R5K/Triton-specific secondary cache ops (target must be SI or SD)
+pub const C_INVALL:  u32 = 0x00;  // Triton: Invalidate all secondary cache lines (same encoding as C_IINV)
+pub const C_INVPAGE: u32 = 0x14;  // Triton: Invalidate secondary cache page (same encoding as C_HWBINV)

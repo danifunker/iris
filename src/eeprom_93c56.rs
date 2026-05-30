@@ -256,6 +256,13 @@ impl Eeprom93c56 {
         }
     }
 
+    /// Set the secondary cache size register (CACHSZ_REG = word 0x11).
+    /// `pages` = L2 size in 4KB pages (e.g. 256 for 1MB, 128 for 512KB).
+    /// Used by R5K/R4600SC/R4700 PROM to determine secondary cache size.
+    pub fn set_cachsz(&mut self, pages: u16) {
+        self.data[0x11] = pages;
+    }
+
     /// Helper to inspect memory (for debugging)
     pub fn get_data(&self) -> &[u16] {
         &self.data

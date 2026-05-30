@@ -2718,6 +2718,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "r5k"))]
     fn test_virtual_coherency_exception() {
         #[allow(unused_imports)]
         use crate::mips_exec::{MipsExecutor, MipsCpuConfig, EXC_VCED, EXC_VCEI};

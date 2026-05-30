@@ -96,6 +96,23 @@ See [HELP.md](HELP.md) for the full rundown: serial ports, monitor console,
 NVRAM/MAC address setup, disk image prep, and more.
 
 
+## R5000 CPU (`--features r5k`)
+
+Switches the emulated CPU from R4400 to R5000:
+
+- 32KB 2-way set-associative L1I and L1D (32B lines) instead of 16KB direct-mapped (16B lines)
+- PRID `0x00002321` (R5000 rev 2.1), FPU FIR `0x00002300` (imp 0x23)
+- CP0 Config reports `SC=1` (no secondary cache); PROM uses the 2-way index-flush path
+
+The 2-way associativity requires probing both ways on every fetch/read/write, which
+carries a small performance cost compared to the R4K direct-mapped path — expect
+roughly 5% lower instruction throughput.
+
+```
+cargo run --release --features r5k
+```
+
+
 ## JIT compilers
 
 ### MIPS JIT (`--features jit`)

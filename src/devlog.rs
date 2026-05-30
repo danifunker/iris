@@ -32,10 +32,18 @@ pub enum LogModule {
     Ps2    = 17,
     Rtc    = 18,
     Eeprom = 19,
+    L1i    = 20,  // L1 instruction cache: fetch hit/miss, fill, cache ops
+    L1d    = 21,  // L1 data cache: read/write hit/miss, fill, cache ops
+    L2c    = 22,  // L2 unified cache: fill, writeback, invalidate, cache ops
 }
 
+// Mask bits shared by L1i / L1d / L2c
+pub const CACHE_LOG_HIT:  u32 = 0x1;  // log hits (hot path — verbose)
+pub const CACHE_LOG_MISS: u32 = 0x2;  // log misses and fills
+pub const CACHE_LOG_OP:   u32 = 0x4;  // log CACHE instruction ops
+
 impl LogModule {
-    pub const COUNT: usize = 20;
+    pub const COUNT: usize = 23;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -59,6 +67,9 @@ impl LogModule {
             "ps2"    => Some(Self::Ps2),
             "rtc"    => Some(Self::Rtc),
             "eeprom" => Some(Self::Eeprom),
+            "l1i"    => Some(Self::L1i),
+            "l1d"    => Some(Self::L1d),
+            "l2c"    => Some(Self::L2c),
             _        => None,
         }
     }
@@ -85,6 +96,9 @@ impl LogModule {
             Self::Ps2    => "ps2",
             Self::Rtc    => "rtc",
             Self::Eeprom => "eeprom",
+            Self::L1i    => "l1i",
+            Self::L1d    => "l1d",
+            Self::L2c    => "l2c",
         }
     }
 
@@ -94,6 +108,7 @@ impl LogModule {
             Self::Rex3, Self::Mips, Self::Ioc, Self::Scsi, Self::Pdma,
             Self::Vino, Self::Dcb, Self::Vc2, Self::Cmap, Self::Xmap,
             Self::Bt445, Self::Scc, Self::Ps2, Self::Rtc, Self::Eeprom,
+            Self::L1i, Self::L1d, Self::L2c,
         ]
     }
 
@@ -121,6 +136,16 @@ impl LogModule {
                 if rest != 0 { s.push_str(&format!("+{:#010x}", rest)); }
                 if s.is_empty() { format!("{:#010x}", mask) } else { s }
             }
+            Self::L1i | Self::L1d | Self::L2c => {
+                let mut parts = Vec::new();
+                if mask & CACHE_LOG_HIT  != 0 { parts.push("hit"); }
+                if mask & CACHE_LOG_MISS != 0 { parts.push("miss"); }
+                if mask & CACHE_LOG_OP   != 0 { parts.push("op"); }
+                let rest = mask & !(CACHE_LOG_HIT | CACHE_LOG_MISS | CACHE_LOG_OP);
+                let mut s = parts.join("+");
+                if rest != 0 { s.push_str(&format!("+{:#010x}", rest)); }
+                if s.is_empty() { format!("{:#010x}", mask) } else { s }
+            }
             _ => format!("{:#010x}", mask),
         }
     }
@@ -142,6 +167,14 @@ impl LogModule {
                 "insn" => Some(0x0001),
                 "tlb"  => Some(0x0002),
                 "mem"  => Some(0x0004),
+                "on" | "all"   => Some(0xFFFF_FFFF),
+                "off" | "none" => Some(0x0000_0000),
+                _ => u32::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
+            },
+            Self::L1i | Self::L1d | Self::L2c => match s {
+                "hit"  => Some(CACHE_LOG_HIT),
+                "miss" => Some(CACHE_LOG_MISS),
+                "op"   => Some(CACHE_LOG_OP),
                 "on" | "all"   => Some(0xFFFF_FFFF),
                 "off" | "none" => Some(0x0000_0000),
                 _ => u32::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
@@ -206,6 +239,7 @@ impl DevLog {
                 ModuleLog::new(), ModuleLog::new(), ModuleLog::new(),
                 ModuleLog::new(), ModuleLog::new(), // Bt445, Scc
                 ModuleLog::new(), ModuleLog::new(), ModuleLog::new(), // Ps2, Rtc, Eeprom
+                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(), // L1i, L1d, L2c
             ],
         }
     }
@@ -263,6 +297,18 @@ impl DevLog {
         *self.modules[m as usize].file_sink.lock() = None;
         *self.modules[m as usize].file_path.lock() = None;
         self.recompute_any_active();
+    }
+
+    /// Write a log message unconditionally — bypasses the module enabled flag.
+    /// Use for output that must interleave with dlog output (e.g. step Exec: lines).
+    /// No-ops silently if there are no writers.
+    pub fn write_unconditional(&self, args: fmt::Arguments) {
+        let msg = fmt::format(args);
+        let mut writers = self.writers.lock();
+        writers.retain(|w| {
+            let mut guard = w.lock();
+            write!(guard, "{}\n", msg).is_ok() && guard.flush().is_ok()
+        });
     }
 
     /// Write a log message for a module. Called only when devlog_is_active() returned true.
@@ -345,6 +391,18 @@ macro_rules! dlog {
     };
 }
 
+/// Unconditional log — bypasses module enabled flag, goes to all monitor writers.
+/// Use when output must interleave with dlog! output on the same connection.
+/// No-ops if no writers are connected.
+#[macro_export]
+macro_rules! dlog_unconditional {
+    ($($arg:tt)*) => {
+        if let Some(dl) = $crate::devlog::DEVLOG.get() {
+            dl.write_unconditional(format_args!($($arg)*));
+        }
+    };
+}
+
 /// Hot-path log. Compiles to nothing in non-developer (release) builds.
 #[macro_export]
 macro_rules! dlog_dev {
@@ -369,9 +427,10 @@ impl Device for DevLog {
         vec![(
             "log".to_string(),
             "[DEV] log <module|all> <on|off>  |  log <module> mask <cat|hex>  |  log <module> file <path|off>  |  log status\n\
-             \x20             modules: net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap xmap bt445 scc ps2 rtc eeprom\n\
+             \x20             modules: net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap xmap bt445 scc ps2 rtc eeprom l1i l1d l2c\n\
              \x20             pdma mask categories: hal enet scsi on/all off/none <hex>\n\
              \x20             mips mask categories: insn tlb mem on/all off/none <hex>\n\
+             \x20             l1i/l1d/l2c mask categories: hit miss op on/all off/none <hex>\n\
              \x20             [DEV] = requires --features developer build to produce output".to_string(),
         )]
     }
@@ -405,7 +464,7 @@ impl Device for DevLog {
         } else {
             match LogModule::from_str(arg0) {
                 Some(m) => vec![m],
-                None => return Err(format!("Unknown module '{}'. Try: net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap xmap bt445 scc ps2 rtc eeprom all", arg0)),
+                None => return Err(format!("Unknown module '{}'. Try: net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap xmap bt445 scc ps2 rtc eeprom l1i l1d l2c all", arg0)),
             }
         };
 
