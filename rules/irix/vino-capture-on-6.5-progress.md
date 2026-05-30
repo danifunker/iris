@@ -7,10 +7,33 @@ on **6.5.22**, where it currently does NOT fully work yet.
 ---
 ## ★ START HERE (next-session handoff, 2026-05-30) ★
 
-**Status:** 6.5 IndyCam capture ENGAGES and the VINO DMA+interrupt path runs, but
-videod never delivers a frame to the client (vidtomem hangs). The blocker is now
-pinned to **one bit**. The dated sections below (cont. 1–11) are the full history,
-including several DEAD ENDS — read this block first, then cont. 11 + cont. 6/7/10.
+**Status: ★ SOLVED + CLEAN IMAGE (cont. 15–16) ★** — `vidtomem` delivers a **clean,
+correctly-coloured 640×480 SMPTE-bar frame** on IRIX 6.5, reproducibly (no hang, no
+scramble). First successful end-to-end IndyCam capture on 6.5. FOUR fixes in
+`src/vino.rs` + a fast-exchange fix in `src/iris_ci_main.rs` (all uncommitted on
+`vino-6.5-capture-engage`, alongside committed physical.rs alias 8426efd). Read cont. 16
+(latest) then 15. The vino.rs fixes:
+1. **`dma_emit_dword` defer** (delivery): interlaced first field (`field_counter==0`)
+   defers STOP/DESC (EOF only); 2nd field completes (EOF+DESC+disable). → parity odd,
+   `conn+0xb8` clears.
+2. **`read_channel_reg` CH_DESC_TABLE_PTR = base+0x780 on 2nd field** (delivery): the
+   kernel's field-boundary descriptor (`*(bufentry+0x10)`); makes `0x77c0` return 1 so
+   `0x7640` doesn't abort → `0x60b4` delivers + clears `conn+0xc` → wakeup → frame.
+3. **`shift_descriptors` JUMP `& 0x3FFF_FFF0`** (geometry): 16-byte-align the jump-bug
+   JUMP target (strips its +4 offset) so all 300 data pages land in order — was
+   scrambling via `& 0x3FFF_FFFF`.
+4. **`render_and_pump` Rgba32 emits A,B,G,R** (colour): VINO RGB is A,B,G,R; emitting
+   A,R,G,B swapped red↔blue.
+
+`iris-ci get`/`put` also fixed (shell-aware: detect sh vs csh) so the scratch-volume
+pull works fast (~1.8s) on the sh-root klindert disk; this is also why `iris-ci run`
+had been printing `guest exit -1` (csh `$status` empty under sh).
+
+**FOLLOW-UPS (not blockers):** (a) `FIELD_DESC_SPAN=0x780` is constant, tuned for
+640×480 — derive from clip height for other geometries. (b) 5.3 regression: the
+geometry+colour fixes now affect 5.3's interlace path too — verify stock vidtomem still
+saves a correct frame on the 5.3 guest. (c) commit. (d) any residual sub-pixel artifact
+not chased — the bars/ramp look clean.
 
 **Committed/shipped (safe, keep):**
 - `src/physical.rs` uncached-`0x4000_0000`-alias fix — commit `8426efd` on branch
@@ -18,29 +41,73 @@ including several DEAD ENDS — read this block first, then cont. 11 + cont. 6/7
 - Boot speed 292s→89s on the klindert guest (nsswitch files-first + FQDN + service
   disables) — see [[project_klindert_boot_speed]]. `src/vino.rs` is at HEAD.
 
-**THE remaining gate (single bit):** delivery is the EOF-path fn `vino.o 0x60b4`
-(→ vinoFillInfo/dms_fifo_enq → pollwakeup mask 0xc0, which DOES match videod's poll
-mask `*(dev+0xb4)=0x140`). Its delivery tail (0x61e0; side-effect `*(conn+0xc4)+=2`)
-is reached iff `(parityODD || *(conn+0x118)&1==0) && byte0x133!=0`. Parity is
-STRUCTURALLY always-even (`*(conn+0xd2)` = `field_counter+(field_counter&1)`,
-confirmed by 3 even samples), byte0x133=1 (ok). So the ONLY route is
-**`*(conn+0x118)&1 == 0`** — but iris yields `*(conn+0x118)=0x27` (bit0 set), so
-`*(conn+0xc4)` stays 0 and nothing delivers.
+**THE delivery path (unified — cont. 6 and cont. 11 are the SAME gate):** videod's
+worker blocks in the kernel `vinoGetFrame` on `sleep(conn,0x13c)` (0x118&8==0 ⇒
+blocking mode), woken by the only `wakeup(conn)` (in `vinoFinishDMA`). `vinoFinishDMA`
+runs from the self-rescheduling timer `vinoWakeupTimeout` ONLY when `*(conn+0xc)==0`
+(else it reschedules forever; live `*(conn+0xc)=0x0861e000`, never cleared). The EOF
+finalizer `0x60b4` both enqueues the frame (vinoFillInfo/dms_fifo_enq) AND clears
+`*(conn+0xc)` (0x6360) — but ONLY if it reaches its delivery tail. So: **0x60b4
+reaching its tail is the one gate; it both delivers and unblocks `vinoGetFrame`.**
 
-**NEXT STEP (do this):** `*(conn+0x118)=*(s1+0x3a)` and `byte0x133=(cfg&4)!=0`, both
-copied in `vinoSetupGetFrame` (0x30a8) from a request struct `s1`. Trace what fills
-`*(s1+0x3a)` bit0 — i.e. which VL capture-format/mode input it maps to — and whether
-iris presents a video format/capability that makes videod negotiate a mode with
-bit0 SET vs CLEAR. ALSO sanity-check the assumption that `0x60b4` is the delivery fn
-for this mode (only assumed): re-check callers of vinoFillInfo / dms_fifo_enq — if
-there's another delivery path used for this capture mode, 0x60b4 may be a red
-herring like the others.
+**Why 0x60b4 is blocked, and the REAL gate (cont. 12):** 0x60b4's tail needs
+`byte0x133==0 OR 0x118&1==0 OR word@0xd0 parity ODD`. `0x118` and `byte0x133` come
+straight from videod's `copyin`'d VL request (`vinoSetupGetFrame`: `0x118=*(s1+0x3a)`,
+`byte0x133=(*(s1+0x38)&4)`) — iris CANNOT change them and real HW sends the same
+(`0x118=0x27`,`0x133=1`). So real HW delivers via **parity ODD**. The parity writer
+`0x7640` computes `*(conn+0xd2)`; in mode `0x118&3==3` it has TWO branches:
+- `conn+0xb8 != 0` → `field_counter + (field_counter&1)` = **always EVEN** (dead).
+- `conn+0xb8 == 0` AND `(field_counter - conn+0xc0)==1` → `field_counter + prev_parity`
+  = **ALWAYS ODD** (delivers). `conn+0xc0`/`conn+0xbc` are the previous field's
+  counter/parity, saved by the prior `0x7640`.
 
-**DEFINITIVELY EXCLUDED (do NOT re-chase):** field_counter parity (instrumented,
-alternates fine), the 0x61cc parity counter, EOF/DESC simultaneity (split tested,
-no change), the buffer-ring / `*(conn+0xc)` timeout path, the A_DESC_TABLE_PTR
-live-cursor / drain-to-STOP (those made 0x77c0 return 2 and SKIP delivery — keep
-A_DESC_TABLE_PTR == buffer base, i.e. HEAD).
+`conn+0xb8` is the "first field after a DMA (re)start" flag: SET to 1 on every DMA
+arm/restart (0x5028, 0x6ae8), CLEARED by the first field's `0x7640`. So a clean
+two-field frame delivers on **field 2** (0xb8 cleared by field1, delta==1 ⇒ odd).
+
+**iris ROOT CAUSE:** iris hits a STOP descriptor and **disables DMA every field**
+(`vino.rs:588`, the per-field rewind at `vino.rs:707` + per-row interleave skip make
+the cursor reach STOP each field). The kernel then re-arms DMA every field, setting
+`conn+0xb8=1` EVERY field → `0x7640` always takes the EVEN branch → parity never odd
+→ `0x60b4` never reaches its tail → `*(conn+0xc)` never clears → videod never woken.
+
+**THE FIX (IMPLEMENTED in `dma_emit_dword`, `src/vino.rs`):** model one DMA-enable
+cycle as one interlaced frame. `field_counter` is 0 for the cycle's first field (reset
+in `start_channel`) and >=1 after. When the DMA cursor reaches a STOP descriptor, if
+`interleave && field_counter == 0` (the FIRST field), DO NOT raise DESC and DO NOT
+disable DMA — just end the field's pump (EOF still fires in `pump_field`). The SECOND
+field (`field_counter>=1`) reaches STOP and raises EOF+DESC + disables DMA as before.
+So INTR goes **0x01 on the even/first field, 0x05 on the odd/second** instead of 0x05
+every field. The kernel then restarts capture once per frame (not per field), so
+`conn+0xb8` is cleared by the first field and is 0 at the second field's EOF; delta==1
+holds (consecutive `field_counter` 0→1 within the cycle, kernel reads post-increment
+1→2); parity goes ODD; `0x60b4` delivers + clears `*(conn+0xc)`; the timer
+`vinoFinishDMA`→`wakeup(conn)` unblocks videod's `vinoGetFrame`.
+Keyed on `field_counter==0` (not source parity) so it's robust to where the
+even/odd source field lands relative to the DMA-enable boundary.
+**5.3 GATE (structural):** 5.3 capture is EOF-driven and page-steps NEXT_4_DESC per
+field, so it NEVER reaches a STOP descriptor in `dma_emit_dword` — this branch never
+runs for 5.3. The change is also `interleave`-gated. So 5.3 delivery is untouched;
+still REGRESSION-TEST it live (stock vidtomem on the 5.3 guest must still save a frame).
+NOTE: the early "even=EOF, odd=EOF+DESC didn't deliver" attempt (top of doc, the
+"geometry-fix attempt") PREDATES the physical.rs alias fix, so the kernel ring polling
+was broken then — that test was INVALID and does NOT refute this.
+
+**DECISIVE CHEAP VERIFY (do before/with the fix):** with the current HEAD build, read
+`conn+0xb8` (byte) during a capture — expect **1** (confirms re-arm-every-field). After
+the fix, read `conn+0xb8` at the odd field's EOF (expect 0) and `*(conn+0xd2)` (expect
+ODD) and `*(conn+0xc)` (expect it to reach 0). icrash recipe below.
+
+**SUPERSEDED — do NOT chase (cont. 12 corrections):** the cont. 7–11 "`*(conn+0x118)&1`
+single bit" and "trace what VL format makes videod clear bit0" — `0x118` is copyin'd
+from videod, normal, and real HW uses the same value; the 0x118/parity path delivers
+via `conn+0xb8`, NOT via clearing bit0. cont. 10's "field_counter parity ruled out"
+was WRONG to exclude parity: parity IS the gate, just driven by `conn+0xb8`+delta, not
+by field_counter's own parity. cont. 8/9 EOF/DESC *split* is HARMFUL: `vinoEOD` aborts
+unless EOF fired in the SAME ISR pass (`a2!=0`), so DESC must come WITH EOF on the odd
+field (combined 0x05 is correct there) — the split made `a2=0` and aborted vinoEOD.
+The 0x60b4 pollwakeup(0xc0)/select path is a real but SECONDARY path (videod uses
+blocking sleep, not select); don't optimize for it.
 
 **Tooling:** chaindump/chainwalk live in guest `/usr/tmp`. icrash recipe: the vino
 module RELOCATES per boot, so each boot re-derive: `icrash -e 'od vino_board 1'`
@@ -854,3 +921,329 @@ now definitively excluded).
 
 Committed state remains physical.rs alias only (8426efd). Session reached the floor
 of the delivery chain: a single capture-mode config bit. Next session starts here.
+
+## 2026-05-30 (cont. 12) — FULL delivery path re-derived; cont. 7–11 was a dead path; iris root cause + fix found
+
+Re-disassembled the ENTIRE 6.5 kernel delivery path from vino.o (capstone, symbol +
+reloc aware; `/tmp/dv2.py`, `/tmp/vino.o`). This SUPERSEDES the cont. 7–11 "single
+bit `*(conn+0x118)&1`" conclusion — that path is structurally dead and was never how
+real HW delivers. Findings, each grounded in the disassembly:
+
+### 1. `0x118` and `byte0x133` come from videod, not iris (so chasing them is futile)
+`vinoSetupGetFrame` (0x30a8) `kern_malloc`s a 0x6c struct `s1` and `copyin`s it from
+userspace (0x3134) — it is videod's VL request. Then:
+  - 0x339c/0x33a0: `*(conn+0x118) = halfword *(s1+0x3a)`
+  - 0x3414/0x3420: `byte *(conn+0x133) = (*(s1+0x38) & 4) != 0`
+iris cannot influence these; real HW gets the SAME values (`0x118=0x27`, `0x133=1`).
+So the cont. 11 "trace what makes videod clear bit0" direction is a dead end.
+
+### 2. `0x60b4` IS the unique frame finalizer (sanity check passed)
+`vinoFillInfo` and `dms_fifo_enq` are each called from exactly ONE site, both inside
+`0x60b4`. So `0x60b4` is not a red herring — it is the only enqueue path. Its delivery
+tail (0x61e0/0x6308) is reached iff `byte0x133==0 OR 0x118&1==0 OR word@0xd0 parity
+ODD`. Live (`0x118=0x27`,`0x133=1`) ⇒ needs parity ODD.
+
+### 3. Parity is gated by `conn+0xb8`, NOT by field_counter's own parity
+Decoded the parity writer `0x7640` (called from the per-channel dispatcher `0x5e7c`
+on EOF, with `a1 = A_FIELD_COUNTER` = VINO reg 0x4c = iris `chan.field_counter`). In
+mode `0x118&3==3`:
+  - `conn+0xb8 != 0`: `*(conn+0xd2) = a1 + (a1&1)` → ALWAYS EVEN.
+  - `conn+0xb8 == 0` AND `(a1 - conn+0xc0) == 1`: `*(conn+0xd2) = a1 + conn+0xbc`
+    (prev field's parity) → `field+1+(prevfield&1)` = ALWAYS ODD (delta==1 ⇒ odd
+    regardless of which field is even).
+`conn+0xb8` = "first field after DMA (re)start" flag: SET=1 on every arm/restart
+(0x5028 in the start-capture fn `0x4e1c`; 0x6ae8 in the buffer-restart fn `0x6a70`);
+CLEARED by the first field's `0x7640` (0x769c). So a clean 2-field frame delivers on
+**field 2**: field1 EOF clears 0xb8 (parity even), field2 EOF sees 0xb8==0 + delta==1
+→ parity ODD → `0x60b4` tail.
+
+### 4. The delivery MECHANISM is `wakeup(conn)`, and `0x60b4`'s tail unblocks it
+videod blocks in `vinoGetFrame` `sleep(conn,0x13c)` (0x3b64; `0x118&8==0` ⇒ blocking).
+Only `wakeup(conn)` is in `vinoFinishDMA` (0x751c). `vinoFinishDMA` runs from the timer
+`vinoWakeupTimeout` ONLY when `*(conn+0xc)==0` (0x5324: `lw v1,0xc(conn); bnez ...
+reschedule`). `0x60b4`'s tail clears `*(conn+0xc)` at 0x6360 (when the buffer's current
+descriptor is not a JUMP, i.e. STOP/end). So `0x60b4` reaching its tail BOTH enqueues
+the frame AND clears `*(conn+0xc)` → next timer tick → `vinoFinishDMA` → `wakeup` →
+`vinoGetFrame` returns. cont. 6 (wakeup path) and cont. 11 (0x60b4 gate) are ONE gate.
+
+### 5. `vinoEOD` (DESC) requires EOF in the same ISR pass — so combined 0x05 is RIGHT
+`vinoEOD` (0x6890): `beqz a2, 0x6970` (abort) where `a2` = "EOF-A also fired this pass"
+(set by vinoInterrupt at 0x5cf0 when bit0 handled, passed to vinoEOD at 0x5d5c). So
+DESC alone aborts vinoEOD; the cont. 8/9 EOF/DESC SPLIT made `a2=0` and was harmful.
+On the odd field, EOF+DESC together (0x05) is correct. Order within one ISR pass:
+dispatcher `0x5e7c`→`0x7640` (writes parity) FIRST, then bit0 handler `0x60b4` (reads
+parity), then bit2 handler `vinoEOD` — so `0x60b4` reads the parity `0x7640` just wrote.
+
+### 6. iris ROOT CAUSE
+iris hits a STOP descriptor and disables DMA EVERY field (`vino.rs:588`; the per-field
+cursor rewind at `vino.rs:707` + per-row interleave skip make the cursor reach the
+chain STOP each field). The kernel re-arms DMA each field → `conn+0xb8=1` each field →
+`0x7640` always EVEN branch → parity never odd → `0x60b4` tail never reached →
+`*(conn+0xc)` never clears → videod never woken. (Matches live: `conn+0xc=0x0861e000`
+forever; `*(conn+0xd2)` sampled even.)
+
+### 7. THE FIX (IMPLEMENTED — compiles + unit-tested; live validation pending)
+Implemented in `dma_emit_dword` (`src/vino.rs`), NOT via the pump_field rewind. Insight:
+a DMA-enable cycle = one interlaced frame; `field_counter` (reset to 0 in
+`start_channel`, incremented per field) IS the in-cycle field index. At the STOP
+descriptor, `if interleave && field_counter == 0` (first field) → return false WITHOUT
+raising DESC or disabling DMA (EOF still fires in pump_field); the second field
+(`field_counter>=1`) raises EOF+DESC + disables DMA as before. Result: INTR `0x01` on
+field 1, `0x05` on field 2 (was `0x05` every field). Kernel restarts once per frame, so
+`conn+0xb8` is cleared by field 1 and 0 at field 2's EOF; delta==1 (kernel reads
+post-increment counters 1 then 2, conn+0xc0=1 ⇒ 2-1=1); parity ODD; `0x60b4` delivers +
+clears `*(conn+0xc)`; `vinoFinishDMA`→`wakeup` unblocks `vinoGetFrame`. Keyed on
+`field_counter==0` rather than source parity so it's robust to even/odd alignment vs the
+DMA-enable boundary. Did NOT touch the `pump_field` rewind (`vino.rs:707`) — both fields
+still rewind to the buffer base and write their own rows (even rows / odd rows) into the
+shared frame buffer; only the DESC interrupt is deferred. **5.3 GATE (structural):** 5.3
+is EOF-driven, page-steps NEXT_4_DESC per field, never reaches a STOP descriptor here ⇒
+this branch never runs for 5.3; also `interleave`-gated. New unit tests:
+`interleave_defers_desc_to_second_field`, `non_interleave_stop_completes_immediately`.
+STILL must regression-test 5.3 live. The earlier "even=EOF/odd=EOF+DESC didn't deliver"
+attempt (top of doc) is NOT a counter-example: it predates the physical.rs alias fix, so
+the kernel ring polling was broken and that test was invalid.
+
+### Decisive cheap verification (live kmem, ~1 boot)
+- HEAD build now: read byte `conn+0xb8` during capture → expect 1 (confirms #6).
+- After the fix: at the odd field's EOF read `conn+0xb8` (→0), `*(conn+0xd2)` (→odd),
+  `*(conn+0xc)` (→reaches 0). Any one of these confirms/refutes the chain.
+icrash (module relocates per boot — re-derive each boot): `od vino_board 1`→device;
+`od (device+0x38) 1`→ch-A conn; then `od (conn+0xb8) 1`, `od (conn+0xd0) 1`, etc.
+
+### Tooling note
+`/tmp/dv2.py` (host) is the symbol/reloc-aware disassembler used this session:
+`python3 /tmp/dv2.py <symbol>` | `-r <start> <end>` (raw range) | `-c <symbol>`
+(callers via relocs). vino.o at `/tmp/vino.o`. Committed state unchanged: physical.rs
+alias only (8426efd); src/vino.rs at HEAD.
+
+## 2026-05-30 (cont. 13) — LIVE TEST of the cont.12 fix: parity now reaches ODD, but delivery still blocked
+
+Built `--release --features chd,camera,lightning,developer`, booted the klindert 6.5
+guest (`iris --config iris-klindert.toml --ci --ci-display`; autoboots straight to the
+login prompt, no PROM menu), started `/usr/etc/videod` (DISPLAY=:0.0; Xsgi is up via
+xdm), ran stock `/usr/sbin/vidtomem -f /var/tmp/cap -v 0`. Added env-gated `VINOTRACE`
+eprintln hooks (since removed) to log per-field behavior.
+
+### The fix works mechanically (VINOTRACE, steady repeating cycle)
+```
+start_channel ch0 fc_reset(was 2)
+STOP ch0 fc=0 interleave=true -> skip(defer)
+pump ch0 parity=Odd  fc->1 intr=0x01
+STOP ch0 fc=1 interleave=true -> DESC+disable
+pump ch0 parity=Even fc->2 intr=0x05
+(repeat)
+```
+So exactly the intended pattern: 2 fields per DMA-enable cycle, field 1 (fc=0) defers
+its STOP (EOF only, INTR 0x01), field 2 (fc=1) completes (EOF+DESC, INTR 0x05). Was
+`0x05` every field before. (Source parity happens to be Odd-then-Even here; the gate is
+keyed on fc, not parity, so that's fine.)
+
+### Kernel state advanced — parity now ODD (icrash, live, 6 samples)
+Re-derived per boot: `vino_board`→device→`*(device+0x38)`=conn. Sampled `*(conn+0xc)`
+and the `0xb8..0xd4` block repeatedly:
+- `conn+0xb8` (byte) now CLEARS to 0 after field 1 (was STUCK at 1 every field before
+  the fix) — re-set to 1 by the per-frame restart after field 2.
+- `*(conn+0xd0)` word ALTERNATES `0x....0002` (even, with `conn+0xc0`=1) and
+  **`0x....0003` (ODD, with `conn+0xc0`=2)**. So `*(conn+0xd2)` now reaches ODD on
+  field 2 — the cont.11 "structurally always even" gate is SATISFIED. The high half
+  (MSC/frame count) increments steadily (0x11ac,0x1320,0x14a4,0x161e,0x179d,0x1923).
+
+### But delivery STILL fails (the real remaining gate)
+- `*(conn+0xc4)` = 0 in ALL samples. The `0x60b4` delivery tail does `*(conn+0xc4)+=2`
+  (0x61e0), so `0x60b4` is NOT reaching its tail even though parity is odd.
+- `*(conn+0xc)` = `0x0861e000` (buffer base), never cleared → `vinoWakeupTimeout` keeps
+  rescheduling, `vinoFinishDMA`/`wakeup(conn)` never runs.
+- `vidtomem` never produces `cap-00000.rgb` (NO_FRAME); it stays blocked in vinoGetFrame.
+So clearing `conn+0xb8` + getting odd parity is NECESSARY but NOT SUFFICIENT.
+
+### Where the next gate is (analysis, not yet resolved)
+vinoInterrupt calls `0x60b4` (EOF handler / reader of the parity) ONLY when the
+per-channel dispatcher `0x5e7c` RETURNS 0 (at 0x5ad4: `beqz (s1|s2), 0x5cb8`, where
+s1/s2 are the dispatcher returns; 0x5cb8 is the `0x60b4` block). The dispatcher returns
+NONZERO (→ `0x60b4` skipped, loop re-reads INTR) when:
+- `0x77c0` (completion check) returns 2 (→ 0x5f80, return 1), OR
+- `0x7640` (parity writer) returns 1 — its abort path at 0x7794 (`xor at,a0,v0; andi 1;
+  beqz 0x7794` → vinoAbortDMA, v0=1). `0x7640`'s return depends on `0x77c0`'s return
+  (passed in as a2/v0) and the parity.
+Crucially `0x7640` writes `*(conn+0xd2)` at 0x76c8 BEFORE computing its return value, so
+the odd parity we observe can be written while `0x60b4` is still skipped that ISR.
+Also note the loop earlier calls `0x7530` (scan buffers for the `0x80020202` done
+sentinel) and, if it returns nonzero, calls `0x75a4` (a restart/abort) and SKIPS the
+dispatcher+`0x60b4` for that channel entirely.
+
+So the next investigation is the **completion state machine** `0x7530`/`0x77c0`/`0x7640`
+(+ `0x75a4`, vinoEOD) and the dispatcher `0x5e7c` return path — specifically why, on the
+odd field, the dispatcher returns nonzero (or `0x7530` fires the restart) so `0x60b4`'s
+delivery is bypassed. Needs the dispatcher arg mapping pinned (a1=reg0x74
+A_DESC_TABLE_PTR vs a3=reg0x4c field_counter; iris returns `CH_DESC_TABLE_PTR` =
+`start_desc_ptr` = buffer base, `CH_FIELD_COUNTER` = `field_counter`) and live values of
+`0x77c0`'s inputs (`*(conn+0x104)` buf idx, `*(conn+4)` buf array, `*(conn+0xc)`) on the
+delivering field. icrash + a kernel-side correlation (or more VINOTRACE on the iris reg
+reads the kernel makes during the odd-field ISR).
+
+### Mechanics / harness notes (this session)
+- Launch: `iris --config iris-klindert.toml --ci --ci-display` (REX3 on for Xsgi/videod;
+  XQuartz present). Autoboots → `iris-ci start` then `serial-wait 'IRIS console login:'`
+  (~90s), `iris-ci login`. `iris-ci boot` times out waiting for "Option?" because the
+  PROM autoboots — use `start` + `serial-wait login` instead.
+- videod isn't auto-running on klindert; start it: `DISPLAY=:0.0 /usr/etc/videod &`.
+  `vlinfo` then shows `vino 0` + Memory Drain nodes. Run `vidtomem` with `DISPLAY=:0.0`.
+- icrash through `iris-ci run` truncates on pipes and prints a spurious
+  `guest exit -1`; redirect icrash to a file (`>/var/tmp/x 2>&1`) and `cat` it back. A
+  6×-icrash loop exceeds the 60s `run` wait — keep batches small or bump the timeout.
+- Halt cleanly (`sync;sync; halt -y`, wait for "THE SYSTEM IS BEING SHUT DOWN", ~30s)
+  before `iris-ci quit` to avoid XFS damage. Did so this session.
+- Fix kept (uncommitted), VINOTRACE instrumentation removed; 10 vino unit tests pass.
+
+## 2026-05-30 (cont. 14) — EXACT abort gate pinpointed; DESC_TABLE_PTR=base+0x10 fix tried LIVE and REGRESSED
+
+Continued from cont. 13 (parity now reaches ODD but `*(conn+0xc4)` stuck at 0 / no
+delivery). Re-disassembled the dispatcher `0x5e7c` + `0x77c0` + `0x7640` and traced the
+exact reason `0x60b4` is skipped on the odd field.
+
+### The exact instruction that kills delivery (`0x7640` @ 0x7710)
+```
+0x7710 xor   $at, $a0, $v0      ; v0 = a2 = 0x77c0's return value
+0x7714 andi  $at, $at, 1
+0x7718 beqz  $at, 0x7794        ; (a0 ^ v0)&1 == 0  ->  0x7794 = vinoAbortDMA, return 1
+```
+- `v0` = `0x77c0`'s return (passed as `0x7640`'s 3rd arg `a2`); unchanged from entry.
+- `a0` = 0 on the **odd**-parity field (0x76fc/0x770c), 1 on the **even** field (0x7730).
+- `0x7640` writes the parity `*(conn+0xd2)` at 0x76c8 (and `*(conn+0xc0)`=field_counter
+  at 0x76b4) BEFORE this abort decision — so odd parity is *recorded* even when it then
+  aborts. (Explains why icrash sees `conn+0xd2` odd yet nothing delivers.)
+
+`0x60b4` (the EOF delivery fn) runs ONLY if the per-channel dispatcher `0x5e7c` returns
+0 (vinoInterrupt 0x5ad4 `beqz (s1|s2), 0x5cb8`). The dispatcher returns nonzero — and
+SKIPS `0x60b4` — when `0x77c0` returns 2 OR `0x7640` returns 1 (its abort path).
+
+`0x77c0` returns: **0** if `A_DESC_TABLE_PTR(reg 0x74) == *(conn+0xc)` (==buffer base),
+**1** if `== phys(buffer desc)` or `phys+0x10`, **2** otherwise. iris reports reg 0x74 =
+`start_desc_ptr` = base, and `*(conn+0xc)` = base, so `0x77c0` returns **0** → on the
+odd field `v0=0, a0=0` → `(0^0)&1==0` → **ABORT** → `0x60b4` skipped → `*(conn+0xc4)`
+stays 0. THIS is the precise delivery blocker.
+
+### Tried (live): make 0x77c0 return 1 on the odd field — REGRESSED, reverted
+Hypothesis: report `CH_DESC_TABLE_PTR` = `start_desc_ptr + 0x10` on the 2nd field
+(`interleave && field_counter >= 2`) so `0x77c0` hits its `phys+0x10` case → returns 1 →
+`v0=1` → odd field `(0^1)&1=1` → no abort → `0x60b4` runs → delivers. Built, booted 6.5,
+ran vidtomem. **RESULT: NO delivery AND a REGRESSION** — icrash (8 samples) showed
+`conn+0xc0` STUCK at 1 (was toggling 1↔2) and `conn+0xd0` low half STUCK at 0x0002
+(even; was alternating 0002/0003). So the change broke the field pairing that had been
+producing odd parity: the odd field's `0x7640` no longer ran with `a1=2`. CONCLUSION:
+the `0x7640` **abort/`vinoAbortDMA` is load-bearing** — it drives the restart that
+produces the next even/odd pair. Naively suppressing it via the DESC_TABLE_PTR readback
+desyncs the cycle. **Reverted** the read_channel_reg change; kept the `dma_emit_dword`
+fix (which still gets parity to odd). 10 vino unit tests pass.
+
+### State + next direction
+- KEPT (uncommitted): `dma_emit_dword` defer-DESC-to-2nd-field fix → parity reaches odd,
+  `conn+0xb8` clears, INTR 0x01/0x05. Necessary but not sufficient; 5.3-safe.
+- The delivery blocker is the `0x7640` abort at 0x7710, which fires because `0x77c0`
+  returns 0 on the odd field (A_DESC_TABLE_PTR == buffer base == *(conn+0xc)). On real
+  HW the hardware would have ADVANCED the descriptor-table pointer so `0x77c0` returns 1
+  WITHOUT desyncing the pairing — i.e. the readback must advance as a faithful live
+  consequence of DMA progress, not a field_counter hack. The naive `+0x10` failed
+  because it isn't tied to the actual descriptor consumption and the abort is part of
+  the cycle.
+- NEXT: model the descriptor-table-pointer readback (reg 0x70/0x74) as the TRUE live
+  cursor AND make the per-field DMA consume exactly one descriptor group per field so
+  the cursor reads base→base+0x10→… in step with the kernel's completion handshake;
+  understand `vinoAbortDMA`'s role + the `0x7530` done-sentinel (`0x80020202`) scan +
+  `*(conn+0x104)` buffer-index advance, so the odd field's `0x77c0` returns 1 while the
+  even/odd pairing (and the restart) stays intact. Also re-pin the dispatcher arg map
+  (a1=reg0x74 A_DESC_TABLE_PTR vs a3=reg0x4c field_counter) — the static trace had
+  residual uncertainty there, which is why the single-register fix mispredicted.
+- 5.3 regression test still NOT run.
+
+## 2026-05-30 (cont. 15) — ★ SOLVED: vidtomem delivers a 640×480 frame on IRIX 6.5 ★
+
+Continued from cont. 14's exact-abort-gate finding. Instrumented the descriptor
+registers (VINOTRACE on NEXT_4_DESC/DESC_TABLE_PTR writes+reads, since removed) and
+read the live buffer entry via icrash. **Found the missing value and DELIVERED a frame.**
+
+### The decisive datum (icrash, buffer entry 0)
+`bufarray = *(conn+4)`, `bufidx = *(conn+0x104) = 0`, so `bufentry = bufarray`:
+```
+bufentry+0x0c = 0xa861e000   (chain base, KSEG1 — what 0x7530 scans for the sentinel)
+bufentry+0x10 = 0xa861e780   (the FIELD-BOUNDARY descriptor — what 0x77c0 compares!)
+```
+`0x77c0` does `kvtophys(*(bufentry+0x10))` = `0x0861e780` = **`base + 0x780`** (NOT base).
+It returns 1 (→ `0x7640` does NOT abort → `0x60b4` delivers) only if `A_DESC_TABLE_PTR`
+(reg 0x74) equals that phys (or +0x10). cont.14's `base+0x10` guess was wrong because it
+assumed `phys==base`; the kernel actually records the field boundary at `base+0x780`
+(≈ descriptor group 120 — exactly the "cursor freezes at 0x0861e780" from cont. 3, and
+= rows-per-field 240 × 8).
+
+### THE FIX (two parts, both in src/vino.rs — VERIFIED LIVE)
+1. **`dma_emit_dword`** (from cont.12): on an interlaced capture, the FIRST field of a
+   DMA-enable cycle (`field_counter==0`) reaches STOP but DEFERS — no DESC, no DMA
+   disable (EOF only); the SECOND field raises EOF+DESC. → INTR 0x01 then 0x05, parity
+   reaches odd, `conn+0xb8` clears.
+2. **`read_channel_reg` CH_DESC_TABLE_PTR**: report `start_desc_ptr + 0x780` on the
+   second field (`field_counter >= 2`), `start_desc_ptr` otherwise. This makes `0x77c0`
+   return 1 on the delivering field so `0x7640` (0x7710) does NOT abort, the dispatcher
+   returns 0, `0x60b4` runs, reads odd parity, reaches its tail (`conn+0xc4 += 2`,
+   `dms_fifo_enq`, clears `conn+0xc`) → `vinoWakeupTimeout` sees `conn+0xc==0` →
+   `vinoFinishDMA` → `wakeup(conn)` → `vinoGetFrame` returns the frame to videod.
+
+### Result (live, klindert 6.5.22)
+`/usr/sbin/vidtomem -f /var/tmp/cap -v 0` → `saved image to file` →
+`cap-00000.rgb: SGI imagelib image (640 x 480)` (header `01 da 01 01 00 03 02 80 01 e0
+00 03` = SGI RLE, 640×480×3). **Reproducible** across boots and across repeated grabs;
+the clean (non-instrumented) release build delivers; vidtomem runs to completion (no
+hang). FIRST successful end-to-end IndyCam capture on 6.5.
+
+### Caveats / follow-ups (not blockers, but worth doing)
+- `FIELD_DESC_SPAN = 0x780` is the kernel's field-boundary offset for the standard
+  640×480 IndyCam capture (`= 240 rows/field × 8`). It is currently a constant; other
+  capture geometries would need it derived (from clip height / the chain layout). The
+  live cursor `next_desc_ptr` is NOT a usable substitute — at the ISR it reads
+  `base+0x10` (per-field rewind race) or chain-end mid-pump, never the boundary.
+- 5.3 regression test STILL not run (both fixes are interleave + 2nd-field gated and
+  5.3 is EOF-driven / never reaches a STOP descriptor here, so expected no-op — but
+  verify: stock `vidtomem` must still save a frame on the 5.3 guest).
+- Image fidelity/geometry not re-checked this session (the cont. notes mention a 1-px
+  diagonal artifact); delivery is the milestone — quality is a separate pass.
+- Changes are UNCOMMITTED on branch `vino-6.5-capture-engage` (alongside the committed
+  physical.rs alias 8426efd). 11 vino unit tests pass (3 new: interleave-defer,
+  non-interleave-stop, desc-table-ptr-advance).
+
+## 2026-05-30 (cont. 16) — image UNSCRAMBLED: JUMP alignment + R/B byte order; iris-ci get fixed
+
+After delivery (cont. 15) the saved frame was scrambled. Two more fixes (src/vino.rs)
+produce a clean, correctly-coloured 640×480 SMPTE bar capture (verified live — pulled
+via `iris-ci get`, converted with ImageMagick, visually correct: white/yellow/cyan/
+green/magenta/red/blue/black bars + luma ramp):
+
+1. **JUMP 16-byte alignment** (`shift_descriptors`): the jump-bug chain's JUMP targets
+   carry a +4 low-bit offset; following them with `& 0x3FFF_FFFF` (unaligned) read each
+   next 4-descriptor group 4 bytes high, dropping the first data page of every group
+   (~181/300 pages) and scrambling the frame. Changed to `& 0x3FFF_FFF0` so the walk
+   stays group-aligned and all 300 data pages land in order. (This is the cont.4 fix;
+   it had been reverted earlier because it killed DESC — but with the cont.15 delivery
+   model DESC still fires, so it's safe now. Confirmed: delivery still works.)
+2. **RGBA byte order A B G R** (`render_and_pump` Rgba32): VINO 32-bit RGB lands as
+   A,B,G,R; iris emitted A,R,G,B, swapping red↔blue (yellow↔cyan, red↔blue; white/
+   green/magenta/black unchanged — the tell-tale R/B-swap signature). Emit A,B,G,R.
+   Unit test `rgba32_emits_abgr_two_pixels_per_dword` updated.
+
+### Bonus: `iris-ci get`/`put` fixed for sh-root guests (src/iris_ci_main.rs)
+`iris-ci get` was failing ("sh: /dev/null: bad file unit number") because it hardcoded
+csh redirect `>& /dev/null` + `$status`, but the klindert root shell is `/bin/sh`
+(needs `2>&1` + `$?`). This is also why every `iris-ci run` reported `guest exit -1`
+(empty `$status`). Added `detect_guest_shell()` (probes `$0` with a sentinel, no
+rc-marker dependence) + `devnull_redirect()`; `cmd_get`/`cmd_put` now pick the matching
+redirect + shell. Result: `iris-ci get /var/tmp/c-00000.rgb` pulls 294 KB in ~1.8 s
+over the scratch volume (vs minutes of flaky uuencode-over-serial). Works for both
+sh-root (6.5 klindert) and csh-root (classic 5.3) guests.
+
+### State
+Full pipeline works end to end on 6.5: capture → videod → vidtomem → a clean, correctly
+coloured 640×480 SGI frame, pulled to the host fast. Uncommitted on
+`vino-6.5-capture-engage`: src/vino.rs (delivery defer + DESC_TABLE_PTR span + JUMP
+align + ABGR) and src/iris_ci_main.rs (shell-aware get/put). 11 vino unit tests pass.
+Remaining follow-ups: derive FIELD_DESC_SPAN (0x780) from geometry for non-640×480;
+5.3 regression (geometry/colour now apply to 5.3's interlace path too — verify stock
+vidtomem still saves a correct frame on 5.3); commit.
