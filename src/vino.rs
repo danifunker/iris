@@ -211,8 +211,15 @@ pub mod frame_rate {
 // descriptors per channel as u64 with validity/control flags in the upper half.
 
 pub mod desc {
-    /// Physical page address mask (bits [31:4], 16-byte aligned).
-    pub const PTR_MASK: u32     = 0xFFFF_FFF0;
+    /// Physical address mask (bits [29:4], 16-byte aligned). The address field of
+    /// a descriptor / descriptor-table pointer is only 30 bits wide: bits 31 and
+    /// 30 are the STOP and JUMP control bits, NOT part of the address. The 6.5
+    /// kernel encodes pointers as `JUMP_BIT | kvtophys(addr)` (see
+    /// `vinoBuildJumpBugDAPS`), so masking with this — stripping bits 31/30 — is
+    /// what recovers the real lomem address (e.g. 0x4861e000 → 0x0861e000). Indy
+    /// RAM lives at 0x08000000..0x18000000, so a legitimate address never sets
+    /// bits 31/30; there is no 0x40000000 RAM alias on the hardware.
+    pub const PTR_MASK: u32     = 0x3FFF_FFF0;
     /// Control bit: STOP — terminate DMA after this descriptor; raise DESC interrupt.
     pub const STOP_BIT: u64     = 1 << 31;
     /// Control bit: JUMP — bits [29:0] are a pointer to the next descriptor block.
@@ -556,7 +563,18 @@ impl Vino {
             Self::descriptor_fetch(chan, ptr, mem);
             chan.next_desc_ptr = chan.next_desc_ptr.wrapping_add(16);
         } else if chan.descriptors[0] & desc::JUMP_BIT != 0 {
-            let target = (chan.descriptors[0] as u32) & 0x3FFF_FFFF;
+            // The 6.5 jump-bug descriptor chain (vinoBuildJumpBugDAPS) ends most
+            // 4-descriptor groups with a JUMP whose encoded word is
+            // `JUMP_BIT | kvtophys(next)` and whose target carries a +4 (sometimes
+            // +8) low-bit offset — a workaround for the hardware's 4-at-a-time
+            // descriptor-cache prefetch. PTR_MASK both strips the JUMP control bit
+            // (bit 30) to recover the real lomem address and 16-byte-aligns it: the
+            // real fetch is always 16-byte-group-aligned, so the +4/+8 offset must
+            // be masked off; following it unaligned reads each next group 4 bytes
+            // high, dropping the first data page of every group (~181 of 300 pages
+            // reached) and scrambling the captured frame. Masking keeps the walk in
+            // step so all 300 data pages land in order.
+            let target = (chan.descriptors[0] as u32) & desc::PTR_MASK;
             Self::descriptor_fetch(chan, target, mem);
         }
     }
@@ -576,11 +594,34 @@ impl Vino {
             return false;
         }
 
-        let chan = &mut st.channels[ch];
+        let interleave = st.control & [ctrl::CHA_INTERLEAVE_EN, ctrl::CHB_INTERLEAVE_EN][ch] != 0;
 
-        if chan.descriptors[0] & desc::VALID_BIT != 0
-            && chan.descriptors[0] & desc::STOP_BIT  != 0
+        if st.channels[ch].descriptors[0] & desc::VALID_BIT != 0
+            && st.channels[ch].descriptors[0] & desc::STOP_BIT  != 0
         {
+            // Interlaced capture (IRIX 6.5): the kernel lays out ONE dense
+            // descriptor chain spanning the whole frame buffer, and BOTH fields
+            // traverse it to the same terminating STOP. Real VINO keeps DMA
+            // running across both fields and raises end-of-descriptor (DESC) only
+            // when the chain completes after the SECOND field. We model a
+            // DMA-enable cycle as one interlaced frame: `field_counter` is 0 for
+            // the first field of the cycle (reset in start_channel) and >=1
+            // after. On the FIRST field, reaching STOP must NOT raise DESC or
+            // disable DMA — otherwise the kernel restarts capture every field,
+            // which re-sets its "first field of capture" flag (conn+0xb8) and
+            // forces its field-parity counter even, so vinoEOD's completion check
+            // never clears *(conn+0xc) and videod's vinoGetFrame is never woken.
+            // Deferring completion to the second field lets the kernel's parity go
+            // odd and the frame deliver. Both fields still render their own rows
+            // into the shared buffer; only the DESC interrupt is deferred.
+            // (Full derivation: rules/irix/vino-capture-on-6.5-progress.md cont.12.)
+            //
+            // 5.3 GATE: IRIX 5.3 capture is EOF-driven and page-steps NEXT_4_DESC
+            // per field, so it never reaches a STOP descriptor here — this branch
+            // never executes for 5.3 and its delivery path is untouched.
+            if interleave && st.channels[ch].field_counter == 0 {
+                return false;
+            }
             let isr_desc = [isr::CHA_DESC, isr::CHB_DESC][ch];
             let new_status = st.int_status | isr_desc;
             let irq = self.irq.lock().clone();
@@ -589,6 +630,7 @@ impl Vino {
             return false;
         }
 
+        let chan = &mut st.channels[ch];
         let desc_base  = (chan.descriptors[0] as u32) & desc::PTR_MASK as u32;
         let write_addr = desc_base | (chan.page_index & 0x0FF8);
         drop(st);
@@ -822,11 +864,15 @@ impl Vino {
                     }
                     PixelFormat::Rgba32 => {
                         let (r, g, b) = yuv_to_rgb(y_s, u, v);
-                        // SGI RGBA in memory: A R G B (alpha in the high byte).
+                        // VINO 32-bit RGB lands in memory as A B G R (alpha high,
+                        // then blue, green, red) — that's the order videod/the SGI
+                        // imagelib reads back. Emitting A R G B instead swaps the
+                        // red and blue channels (yellow↔cyan, red↔blue) in the
+                        // captured frame. Bytes are packed MSB-first, so emit A,B,G,R.
                         emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, 0xFF);
-                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, r);
-                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, g);
                         emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, b);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, g);
+                        emit_byte(self, ch, mem, &mut accum, &mut bytes_in, &mut stopped, &mut line_bytes, r);
                     }
                     PixelFormat::Rgba8 => {
                         let (r, g, b) = yuv_to_rgb(y_s, u, v);
@@ -946,7 +992,30 @@ impl Vino {
             reg::CH_LINE_COUNT     => chan.line_counter,
             reg::CH_PAGE_INDEX     => chan.page_index,
             reg::CH_NEXT_4_DESC    => chan.next_desc_ptr,
-            reg::CH_DESC_TABLE_PTR => chan.start_desc_ptr,
+            // Descriptor-table-pointer readback. The 6.5 kernel's buffer-completion
+            // check (vino.o `0x77c0`) compares this against the buffer's recorded
+            // field-boundary descriptor `*(bufentry+0x10)` = `base + FIELD_DESC_SPAN`
+            // and the EOF/parity path (`0x7640` @ 0x7710) ABORTS the capture (so the
+            // delivery fn `0x60b4` is skipped and no frame is ever handed to videod)
+            // UNLESS, on the SECOND interlaced field, `0x77c0` returns 1 — which it
+            // does only when this readback equals that boundary (or +0x10). On the
+            // FIRST field it must read the base (so `0x77c0` returns 0 and the even
+            // field doesn't abort either). `field_counter` is reset to 0 per
+            // DMA-enable in start_channel and reaches 2 at the 2nd field's interrupt.
+            // With this, vidtomem delivers a 640x480 frame on 6.5 (verified live,
+            // cont. 15). FIELD_DESC_SPAN is the kernel's field-boundary offset for the
+            // standard IndyCam capture (= rows-per-field 240 * 8); generalizing it for
+            // other geometries is follow-up. 5.3 GATE: 5.3 capture is EOF-driven /
+            // page-steps NEXT_4_DESC and uses neither this completion check nor a 2nd
+            // interlaced field, so its readback stays at the base.
+            reg::CH_DESC_TABLE_PTR => {
+                const FIELD_DESC_SPAN: u32 = 0x780;
+                if chan.field_counter >= 2 {
+                    chan.start_desc_ptr.wrapping_add(FIELD_DESC_SPAN)
+                } else {
+                    chan.start_desc_ptr
+                }
+            }
             reg::CH_DESC_0         => (chan.descriptors[0] & desc::DATA_MASK) as u32,
             reg::CH_DESC_1         => (chan.descriptors[1] & desc::DATA_MASK) as u32,
             reg::CH_DESC_2         => (chan.descriptors[2] & desc::DATA_MASK) as u32,
@@ -1509,7 +1578,7 @@ mod tests {
     }
 
     #[test]
-    fn rgba32_emits_argb_two_pixels_per_dword() {
+    fn rgba32_emits_abgr_two_pixels_per_dword() {
         let (vino, mem) = setup_vino(PixelFormat::Rgba32, 1, false, 2, 1, 0x3000);
         let field       = make_field(2, 1);
         let mem_dyn: Arc<dyn BusDevice> = mem.clone();
@@ -1521,12 +1590,13 @@ mod tests {
         // Alpha is always 0xFF in slots [0] and [4].
         assert_eq!(bytes[0], 0xFF);
         assert_eq!(bytes[4], 0xFF);
-        // R/G/B for each pixel come from yuv_to_rgb of that pixel's (Y, U, V).
+        // VINO writes A B G R (blue before red); emitting A R G B swaps red/blue
+        // in the captured frame (verified live — see render_and_pump).
         let (r0, g0, b0) = yuv_to_rgb(field.pixels[1], field.pixels[0], field.pixels[2]);
         let (r1, g1, b1) = yuv_to_rgb(field.pixels[3], field.pixels[0], field.pixels[2]);
         assert_eq!(&bytes[..],
-                   &[0xFF, r0, g0, b0, 0xFF, r1, g1, b1][..],
-                   "ARGB packing for the two pixels");
+                   &[0xFF, b0, g0, r0, 0xFF, b1, g1, r1][..],
+                   "ABGR packing for the two pixels");
     }
 
     #[test]
@@ -1547,6 +1617,114 @@ mod tests {
         let st = vino.state.lock();
         assert_ne!(st.int_status & isr::CHA_EOF, 0, "EOF must still fire on dropped fields");
         assert_eq!(st.channels[0].field_counter, 1, "field_counter advances even when dropped");
+    }
+
+    /// Interlaced (6.5) capture: hitting a STOP descriptor on the FIRST field of
+    /// a DMA-enable cycle (field_counter == 0) must NOT raise DESC or disable DMA
+    /// — the completion is deferred to the second field so the kernel's field
+    /// pairing delivers the frame. The second field (field_counter >= 1) does
+    /// raise DESC and disable DMA. See dma_emit_dword + cont.12 in the rules note.
+    #[test]
+    fn interleave_defers_desc_to_second_field() {
+        let vino = Vino::new();
+        let mem  = MockMem::new();
+        vino.set_phys(mem.clone());
+        let mem_dyn: Arc<dyn BusDevice> = mem.clone();
+
+        // DMA + interleave on channel A, with DESC interrupts enabled so a raised
+        // DESC actually surfaces in int_status.
+        {
+            let mut st = vino.state.lock();
+            st.control = ctrl::CHA_DMA_EN | ctrl::CHA_INTERLEAVE_EN | ctrl::CHA_DESC_INT_EN;
+            let chan = &mut st.channels[0];
+            // Head descriptor carries the STOP bit (chain terminator).
+            chan.descriptors[0] = (desc::STOP_BIT | 1) | desc::VALID_BIT;
+            chan.field_counter  = 0; // first field of the cycle
+        }
+
+        // First field: STOP reached, but DESC deferred and DMA left enabled.
+        assert!(!vino.dma_emit_dword(0, 0, &mem_dyn), "STOP still stops the field pump");
+        {
+            let st = vino.state.lock();
+            assert_eq!(st.int_status & isr::CHA_DESC, 0,
+                "DESC must NOT fire on the first interleaved field");
+            assert_ne!(st.control & ctrl::CHA_DMA_EN, 0,
+                "DMA must stay enabled across the first field");
+        }
+
+        // Second field of the cycle: now the STOP completes the frame.
+        vino.state.lock().channels[0].field_counter = 1;
+        assert!(!vino.dma_emit_dword(0, 0, &mem_dyn), "STOP stops the field pump");
+        {
+            let st = vino.state.lock();
+            assert_ne!(st.int_status & isr::CHA_DESC, 0,
+                "DESC must fire on the second interleaved field");
+            assert_eq!(st.control & ctrl::CHA_DMA_EN, 0,
+                "DMA is disabled once the frame completes");
+        }
+    }
+
+    /// Non-interleaved capture (e.g. the IRIX 5.3 path is EOF-driven and never
+    /// actually reaches a STOP here, but guard the gate anyway): a STOP on the
+    /// first field still raises DESC and disables DMA — the deferral is
+    /// interleave-only.
+    #[test]
+    fn non_interleave_stop_completes_immediately() {
+        let vino = Vino::new();
+        let mem  = MockMem::new();
+        vino.set_phys(mem.clone());
+        let mem_dyn: Arc<dyn BusDevice> = mem.clone();
+        {
+            let mut st = vino.state.lock();
+            st.control = ctrl::CHA_DMA_EN | ctrl::CHA_DESC_INT_EN; // no INTERLEAVE
+            let chan = &mut st.channels[0];
+            chan.descriptors[0] = (desc::STOP_BIT | 1) | desc::VALID_BIT;
+            chan.field_counter  = 0;
+        }
+        assert!(!vino.dma_emit_dword(0, 0, &mem_dyn));
+        let st = vino.state.lock();
+        assert_ne!(st.int_status & isr::CHA_DESC, 0,
+            "non-interleaved STOP raises DESC even on the first field");
+        assert_eq!(st.control & ctrl::CHA_DMA_EN, 0, "non-interleaved STOP disables DMA");
+    }
+
+    /// CH_DESC_TABLE_PTR readback: the 6.5 kernel's buffer-completion check needs
+    /// this to equal the field-boundary descriptor (base + 0x780) on the SECOND
+    /// interlaced field (field_counter >= 2) so it doesn't abort and delivery
+    /// proceeds; on the first field it stays at the base. (reg 0x70 is the
+    /// A_DESC_TABLE_PTR slot; read_reg masks bit 2 to collapse the 64-bit pair.)
+    #[test]
+    fn desc_table_ptr_advances_on_second_interlaced_field() {
+        let vino = Vino::new();
+        {
+            let mut st = vino.state.lock();
+            st.channels[0].start_desc_ptr = 0x0861_e000;
+            st.channels[0].field_counter  = 1; // first field's interrupt
+        }
+        assert_eq!(vino.read_reg(reg::CHA_BASE + reg::CH_DESC_TABLE_PTR), 0x0861_e000,
+            "first interlaced field reads the descriptor-table base");
+        vino.state.lock().channels[0].field_counter = 2; // second field's interrupt
+        assert_eq!(vino.read_reg(reg::CHA_BASE + reg::CH_DESC_TABLE_PTR), 0x0861_e780,
+            "second interlaced field reads base + field-boundary span (0x780)");
+    }
+
+    /// Descriptor-pointer registers carry the kernel's bit-30 control flag: the
+    /// 6.5 driver programs them as `JUMP_BIT | kvtophys(table)` (e.g. 0x4861e000).
+    /// The address field is only bits [29:4], so PTR_MASK must strip bits 31/30 to
+    /// recover the real lomem address (0x0861e000). This is what lets VINO DMA hit
+    /// real RAM directly — there is no 0x40000000 RAM alias on the hardware, so
+    /// the strip has to happen here at the source, not in the physical bus map.
+    #[test]
+    fn desc_pointer_registers_strip_bit30_control_flag() {
+        let vino = Vino::new();
+        let encoded = desc::JUMP_BIT as u32 | 0x0861_e000; // 0x4861e000
+        vino.write_reg(reg::CHA_BASE + reg::CH_DESC_TABLE_PTR, encoded);
+        vino.write_reg(reg::CHA_BASE + reg::CH_NEXT_4_DESC, encoded);
+        let st = vino.state.lock();
+        assert_eq!(st.channels[0].start_desc_ptr, 0x0861_e000,
+            "DESC_TABLE_PTR must mask off bit 30 → real lomem address");
+        assert_eq!(st.channels[0].next_desc_ptr, 0x0861_e000,
+            "NEXT_4_DESC must mask off bit 30 → real lomem address");
     }
 
     // ─── I2C bus tests: SAA7191 + CDMC coexist on a shared bus ───────────
