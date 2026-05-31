@@ -490,7 +490,12 @@ impl App {
                 }
                 ui.horizontal(|ui| {
                     ui.label("UI scale");
-                    if ui.add(egui::Slider::new(&mut self.prefs.ui_scale, 0.75..=2.5)).changed() {
+                    // Adjust the slider freely; only commit to the live zoom
+                    // factor on Apply. Applying mid-drag rescales the whole UI
+                    // (slider included) under the cursor, which makes the value
+                    // jump around — hence the explicit button.
+                    ui.add(egui::Slider::new(&mut self.prefs.ui_scale, 0.75..=2.5));
+                    if ui.button("Apply").clicked() {
                         ctx.set_zoom_factor(self.prefs.ui_scale);
                     }
                 });
@@ -612,12 +617,28 @@ impl App {
             });
         }
 
-        // Pump egui input → PS/2 controller. Only fires when the cursor
-        // is inside the framebuffer rect (so menu clicks don't leak
-        // into the guest).
+        // Pump egui input → PS/2 controller. Mouse/keyboard only reach the
+        // guest while captured (click the framebuffer to capture, Esc to
+        // release), so menu clicks and config typing don't leak in.
         let ps2 = self.emu.ps2.lock().clone();
         if let Some(ps2) = ps2 {
             input::pump(ui.ctx(), fb_rect, &ps2, &mut self.input_state);
+        }
+
+        // Capture hint, drawn over the framebuffer.
+        if fb_rect.is_positive() {
+            let hint = if self.input_state.captured {
+                "Esc to release mouse"
+            } else {
+                "Click to capture mouse / keyboard"
+            };
+            ui.painter().text(
+                fb_rect.center_bottom() + egui::vec2(0.0, -6.0),
+                egui::Align2::CENTER_BOTTOM,
+                hint,
+                egui::FontId::proportional(12.0),
+                Color32::from_white_alpha(140),
+            );
         }
     }
 
@@ -730,7 +751,7 @@ impl eframe::App for App {
         ));
         if zoom_in    { self.prefs.ui_scale = (self.prefs.ui_scale + 0.1).min(3.0); ctx.set_zoom_factor(self.prefs.ui_scale); }
         if zoom_out   { self.prefs.ui_scale = (self.prefs.ui_scale - 0.1).max(0.5); ctx.set_zoom_factor(self.prefs.ui_scale); }
-        if zoom_reset { self.prefs.ui_scale = 1.15; ctx.set_zoom_factor(self.prefs.ui_scale); }
+        if zoom_reset { self.prefs.ui_scale = 1.0; ctx.set_zoom_factor(self.prefs.ui_scale); }
 
         // In fullscreen, only reveal menu/toolbar when the cursor is near the top.
         let pointer_y = ctx.input(|i| i.pointer.latest_pos().map(|p| p.y).unwrap_or(f32::MAX));
@@ -744,16 +765,37 @@ impl eframe::App for App {
             egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| self.status_bar(ui));
         }
 
+        // Config editor lives in a collapsible side panel so the emulator
+        // screen (central panel) is never hidden by it. The toolbar's
+        // "Edit config… / Hide config editor" toggle drives the collapse;
+        // `show_animated` slides it in/out.
+        egui::SidePanel::right("config_editor")
+            .resizable(true)
+            .default_width(420.0)
+            .show_animated(ctx, self.show_config_editor, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Configuration");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("✕").on_hover_text("Hide config editor").clicked() {
+                            self.show_config_editor = false;
+                        }
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| self.central_tabs(ui));
+            });
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Priority order for the central panel:
-            //   1. Config editor (when the user explicitly toggled it on).
-            //   2. REX3 framebuffer (when the emulator is running).
-            //   3. Welcome / status summary (idle).
-            if self.show_config_editor {
-                self.central_tabs(ui);
-            } else if self.emu.is_running() {
+            // The central panel always shows the emulator screen when the
+            // machine is running (the REX3 framebuffer), falling back to the
+            // welcome / status summary when idle. The config editor no longer
+            // takes this space — it's the side panel above.
+            if self.emu.is_running() {
                 self.framebuffer_panel(ui);
             } else {
+                // Emulator not running: make sure a leftover mouse capture is
+                // released so the host cursor isn't stuck hidden/locked.
+                input::force_release(ui.ctx(), &mut self.input_state);
                 self.welcome_panel(ui);
             }
         });

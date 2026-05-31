@@ -440,13 +440,27 @@ struct TcpSocketBackend {
 }
 
 impl TcpSocketBackend {
-    fn new<A: std::net::ToSocketAddrs>(addr: A) -> Self {
-        let listener = TcpListener::bind(addr).expect("Failed to bind serial TCP socket");
-        listener.set_nonblocking(true).expect("Failed to set nonblocking");
-        Self {
+    /// Bind a TCP serial backend. Returns `None` (rather than panicking) if the
+    /// port can't be bound — most commonly because a stale emulator process from
+    /// an earlier crash is still holding it. Callers fall back to a NullBackend
+    /// so the machine still boots; that serial channel is simply unavailable
+    /// until the port frees.
+    fn new<A: std::net::ToSocketAddrs>(addr: A) -> Option<Self> {
+        let listener = match TcpListener::bind(addr) {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn!("serial TCP backend disabled: failed to bind socket: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = listener.set_nonblocking(true) {
+            log::warn!("serial TCP backend disabled: failed to set nonblocking: {e}");
+            return None;
+        }
+        Some(Self {
             listener,
             conn: Mutex::new(None),
-        }
+        })
     }
 }
 
@@ -561,9 +575,15 @@ impl Z85c30 {
         let ip_b = Arc::new(AtomicU8::new(0));
 
         let (backend_a, backend_b): (Arc<dyn SerialBackend>, Arc<dyn SerialBackend>) = if bind_tcp {
+            let tcp_or_null = |addr| -> Arc<dyn SerialBackend> {
+                match TcpSocketBackend::new(addr) {
+                    Some(b) => Arc::new(b),
+                    None => Arc::new(NullBackend),
+                }
+            };
             (
-                Arc::new(TcpSocketBackend::new("127.0.0.1:8880")),
-                Arc::new(TcpSocketBackend::new("127.0.0.1:8881")),
+                tcp_or_null("127.0.0.1:8880"),
+                tcp_or_null("127.0.0.1:8881"),
             )
         } else {
             (Arc::new(NullBackend), Arc::new(NullBackend))

@@ -1,81 +1,158 @@
 //! Translate egui keyboard / pointer events into iris PS2 controller writes.
 //!
-//! The framebuffer panel calls `pump(...)` each frame with the rect the
-//! REX3 image occupies in screen space. We then:
+//! ## Mouse / keyboard capture
 //!
-//! 1. Track previous modifier state and synthesise ShiftLeft / ControlLeft
-//!    / AltLeft / SuperLeft press / release events as needed (egui delivers
-//!    modifiers as a separate field, not as Key events).
-//! 2. Forward every egui::Event::Key whose `Key` we can map to a winit
-//!    `KeyCode`, in the order egui produced them.
-//! 3. Build PS/2 mouse packets from button state changes and cursor
-//!    motion, but only when the cursor is inside the framebuffer rect
-//!    (so menu / config clicks don't leak into the guest).
+//! The guest's PS/2 mouse is *relative*: it reports motion deltas, and IRIX
+//! draws its own pointer with its own acceleration. There is no way to keep a
+//! relative guest pointer pixel-aligned with a visible host cursor — they
+//! drift. So we adopt the standard emulator model (mirroring `src/ui.rs`):
+//! **click the framebuffer to capture.** On capture we hide the host cursor
+//! and lock it in place (`CursorGrab::Locked`); raw motion then arrives as
+//! `egui::Event::MouseMoved` deltas (eframe forwards `DeviceEvent::MouseMotion`
+//! regardless of grab), which we feed straight to the guest. Only the guest's
+//! own pointer is visible, so there is nothing to misalign. **Esc releases.**
+//!
+//! While captured we also forward keyboard input to the guest; while *not*
+//! captured we forward nothing, so menu clicks and typing into the config
+//! side panel stay with egui.
+//!
+//! The framebuffer panel calls `pump(...)` each frame with the rect the REX3
+//! image occupies in screen space (used only to decide where a capturing
+//! click counts).
 
-use egui::{Event, Key, Modifiers, PointerButton, Rect};
+use egui::{CursorGrab, Event, Key, Modifiers, PointerButton, Rect, ViewportCommand};
 use iris::ps2::Ps2Controller;
 use winit::keyboard::KeyCode;
 
 pub struct InputState {
     last_mods: Modifiers,
     last_buttons: u8,         // bit0=L, bit1=R, bit2=M
-    last_pos: Option<egui::Pos2>,
+    /// True while the host cursor is grabbed and input is routed to the guest.
+    pub captured: bool,
 }
 
 impl Default for InputState {
     fn default() -> Self {
-        Self { last_mods: Modifiers::NONE, last_buttons: 0, last_pos: None }
+        Self { last_mods: Modifiers::NONE, last_buttons: 0, captured: false }
     }
 }
 
 pub fn pump(ctx: &egui::Context, fb_rect: Rect, ps2: &Ps2Controller, state: &mut InputState) {
-    ctx.input(|i| {
-        // ---- modifiers: diff previous → current, synth press/release. ----
-        let m = i.modifiers;
-        if m.shift && !state.last_mods.shift { ps2.push_kb(KeyCode::ShiftLeft, true); }
-        if !m.shift && state.last_mods.shift { ps2.push_kb(KeyCode::ShiftLeft, false); }
-        if m.ctrl  && !state.last_mods.ctrl  { ps2.push_kb(KeyCode::ControlLeft, true); }
-        if !m.ctrl  && state.last_mods.ctrl  { ps2.push_kb(KeyCode::ControlLeft, false); }
-        if m.alt   && !state.last_mods.alt   { ps2.push_kb(KeyCode::AltLeft, true); }
-        if !m.alt   && state.last_mods.alt   { ps2.push_kb(KeyCode::AltLeft, false); }
-        if m.mac_cmd && !state.last_mods.mac_cmd { ps2.push_kb(KeyCode::SuperLeft, true); }
-        if !m.mac_cmd && state.last_mods.mac_cmd { ps2.push_kb(KeyCode::SuperLeft, false); }
-        state.last_mods = m;
+    // Collect everything we need inside the input borrow, then act afterwards
+    // (sending viewport commands / PS2 writes outside the `input()` closure).
+    let mut want_enter = false;
+    let mut want_release = false;
+    let mut dx = 0.0f32;
+    let mut dy = 0.0f32;
+    let mut buttons = state.last_buttons;
+    let mut mods = state.last_mods;
+    let mut keys: Vec<(KeyCode, bool)> = Vec::new();
 
-        // ---- key events ----
-        for ev in &i.events {
-            if let Event::Key { key, pressed, repeat: _, modifiers: _, .. } = ev {
-                if let Some(kc) = map_key(*key) {
-                    ps2.push_kb(kc, *pressed);
+    ctx.input(|i| {
+        if !state.captured {
+            // Not captured: the only thing we care about is a primary click
+            // inside the framebuffer, which grabs input. Everything else is
+            // left to egui (menus, config side panel, …).
+            if i.pointer.button_pressed(PointerButton::Primary) {
+                if let Some(p) = i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()) {
+                    if fb_rect.contains(p) { want_enter = true; }
                 }
             }
-        }
-
-        // ---- mouse: only when the pointer is over the framebuffer ----
-        let Some(pos) = i.pointer.latest_pos() else { return; };
-        if !fb_rect.contains(pos) {
-            state.last_pos = None;
             return;
         }
 
-        // Button state diff.
-        let mut buttons = 0u8;
-        if i.pointer.button_down(PointerButton::Primary)   { buttons |= 0x01; }
-        if i.pointer.button_down(PointerButton::Secondary) { buttons |= 0x02; }
-        if i.pointer.button_down(PointerButton::Middle)    { buttons |= 0x04; }
-
-        // Motion: skip the very first sample (no anchor), then send deltas.
-        let (dx, dy) = match state.last_pos {
-            Some(prev) => ((pos.x - prev.x) as i32, (pos.y - prev.y) as i32),
-            None => (0, 0),
-        };
-        state.last_pos = Some(pos);
-
-        if buttons != state.last_buttons || dx != 0 || dy != 0 {
-            send_mouse_packet(ps2, buttons, dx, -dy); // PS/2 Y axis is up-positive
-            state.last_buttons = buttons;
+        // Captured. Esc — or losing window focus (alt-tab) — releases.
+        if i.key_pressed(Key::Escape) || !i.focused {
+            want_release = true;
+            return;
         }
+
+        mods = i.modifiers;
+
+        for ev in &i.events {
+            match ev {
+                // Raw relative motion (eframe → DeviceEvent::MouseMotion).
+                Event::MouseMoved(d) => { dx += d.x; dy += d.y; }
+                Event::Key { key, pressed, .. } => {
+                    if let Some(kc) = map_key(*key) { keys.push((kc, *pressed)); }
+                }
+                _ => {}
+            }
+        }
+
+        let mut b = 0u8;
+        if i.pointer.button_down(PointerButton::Primary)   { b |= 0x01; }
+        if i.pointer.button_down(PointerButton::Secondary) { b |= 0x02; }
+        if i.pointer.button_down(PointerButton::Middle)    { b |= 0x04; }
+        buttons = b;
     });
+
+    if want_enter {
+        state.captured = true;
+        // Anchor modifier/button state so we don't synth a spurious press for
+        // a key/button already held at capture time.
+        state.last_mods = ctx.input(|i| i.modifiers);
+        state.last_buttons = 0;
+        ctx.send_viewport_cmd(ViewportCommand::CursorVisible(false));
+        ctx.send_viewport_cmd(ViewportCommand::CursorGrab(CursorGrab::Locked));
+        return;
+    }
+
+    if want_release {
+        release_capture(ctx, ps2, state);
+        return;
+    }
+
+    // ---- modifiers: diff previous → current, synth press/release. ----
+    let m = mods;
+    if m.shift && !state.last_mods.shift { ps2.push_kb(KeyCode::ShiftLeft, true); }
+    if !m.shift && state.last_mods.shift { ps2.push_kb(KeyCode::ShiftLeft, false); }
+    if m.ctrl  && !state.last_mods.ctrl  { ps2.push_kb(KeyCode::ControlLeft, true); }
+    if !m.ctrl  && state.last_mods.ctrl  { ps2.push_kb(KeyCode::ControlLeft, false); }
+    if m.alt   && !state.last_mods.alt   { ps2.push_kb(KeyCode::AltLeft, true); }
+    if !m.alt   && state.last_mods.alt   { ps2.push_kb(KeyCode::AltLeft, false); }
+    if m.mac_cmd && !state.last_mods.mac_cmd { ps2.push_kb(KeyCode::SuperLeft, true); }
+    if !m.mac_cmd && state.last_mods.mac_cmd { ps2.push_kb(KeyCode::SuperLeft, false); }
+    state.last_mods = m;
+
+    // ---- key events ----
+    for (kc, pressed) in keys { ps2.push_kb(kc, pressed); }
+
+    // ---- mouse: raw per-frame delta + button diff. ----
+    let (mdx, mdy) = (dx as i32, dy as i32);
+    if buttons != state.last_buttons || mdx != 0 || mdy != 0 {
+        send_mouse_packet(ps2, buttons, mdx, -mdy); // PS/2 Y axis is up-positive
+        state.last_buttons = buttons;
+    }
+}
+
+/// Release a capture: show + ungrab the host cursor and lift any modifiers
+/// we'd synthesised, so the guest doesn't see stuck keys. Safe to call when
+/// not captured (no-op). Used both for Esc/focus-loss and when the emulator
+/// stops while the framebuffer still had the grab.
+pub fn release_capture(ctx: &egui::Context, ps2: &Ps2Controller, state: &mut InputState) {
+    if !state.captured { return; }
+    if state.last_mods.shift   { ps2.push_kb(KeyCode::ShiftLeft, false); }
+    if state.last_mods.ctrl    { ps2.push_kb(KeyCode::ControlLeft, false); }
+    if state.last_mods.alt     { ps2.push_kb(KeyCode::AltLeft, false); }
+    if state.last_mods.mac_cmd { ps2.push_kb(KeyCode::SuperLeft, false); }
+    state.captured = false;
+    state.last_mods = Modifiers::NONE;
+    state.last_buttons = 0;
+    ctx.send_viewport_cmd(ViewportCommand::CursorVisible(true));
+    ctx.send_viewport_cmd(ViewportCommand::CursorGrab(CursorGrab::None));
+}
+
+/// Ungrab the cursor without touching the guest (it may already be gone).
+/// Called when the emulator stops while the framebuffer still held capture,
+/// so the host cursor doesn't stay hidden/locked. No-op when not captured.
+pub fn force_release(ctx: &egui::Context, state: &mut InputState) {
+    if !state.captured { return; }
+    state.captured = false;
+    state.last_mods = Modifiers::NONE;
+    state.last_buttons = 0;
+    ctx.send_viewport_cmd(ViewportCommand::CursorVisible(true));
+    ctx.send_viewport_cmd(ViewportCommand::CursorGrab(CursorGrab::None));
 }
 
 /// Build and dispatch one PS/2 mouse packet. Mirrors `src/ui.rs:646–658`:

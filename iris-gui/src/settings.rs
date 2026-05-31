@@ -39,7 +39,7 @@ pub struct GuiSettings {
     pub last_config: Option<PathBuf>,
 }
 
-fn default_ui_scale() -> f32 { 1.15 }
+fn default_ui_scale() -> f32 { 1.0 }
 
 impl GuiSettings {
     pub fn config_path() -> Option<PathBuf> {

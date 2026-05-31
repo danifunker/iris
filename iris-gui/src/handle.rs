@@ -71,7 +71,14 @@ impl EmulatorHandle {
         let ps2_for_worker = ps2.clone();
         let thread = std::thread::Builder::new()
             .name("iris-gui-emu".into())
-            .stack_size(8 * 1024 * 1024)
+            // Machine::new alone puts >1 MB on the stack (Physical::device_map),
+            // and unlike the CLI — which builds the machine on a minimal,
+            // dedicated thread — we call it from inside worker_loop's deeper
+            // frame (catch_unwind + loop). With unoptimized debug-sized frames
+            // the 8 MB the CLI uses overflows during Rex3::new, so give the
+            // worker generous headroom. This is virtual address space, lazily
+            // committed, so the large reservation has no real cost.
+            .stack_size(64 * 1024 * 1024)
             .spawn(move || worker_loop(cmd_rx, evt_tx, sink_for_worker, ps2_for_worker))
             .expect("spawn iris-gui-emu thread");
         Self {

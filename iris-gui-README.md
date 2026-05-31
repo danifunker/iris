@@ -108,17 +108,29 @@ drives. Each ID shows its current state inline:
 
 - **▶ Start** / **■ Stop** (Stop opens the safe-stop dialog if needed)
 - **💾 Save state** / **↶ Restore state** — calls `Machine::save_snapshot` / `Machine::ci_restore` against `saves/<name>/`
-- **Edit config…** — toggles a tabbed editor for advanced settings that
-  aren't surfaced as menu actions (Network, Video-In, Debug/JIT, CI)
+- **Edit config… / Hide config editor** — toggles the collapsible config
+  side panel (see Central panel below) for advanced settings that aren't
+  surfaced as menu actions (Network, Video-In, Debug/JIT, CI)
 - Right side: status pill (PROM / IRIX running / halted / stopped) and
   MIPS counter
 
 ### Central panel
 
-Default view is the **welcome / status panel**: shows the active machine
-name, PROM/NVRAM/RAM summary, attached drive list, network mode, and the
-big Start button. The **Edit config…** toolbar toggle swaps in the tabbed
-editor.
+The central panel **always shows the emulator screen** once a machine is
+running — the live REX3 framebuffer, drawn aspect-fit and centered. While
+idle it falls back to the **welcome / status panel**: active machine name,
+PROM/NVRAM/RAM summary, attached drive list, network mode, and the big
+Start button.
+
+### Config side panel
+
+The **Edit config… / Hide config editor** toolbar toggle slides in a
+collapsible **right-hand side panel** with the tabbed editor (Network /
+Video-In / Debug/JIT / CI). It no longer covers the central panel, so you
+can change settings while watching the emulator screen. The panel is
+resizable — drag its left edge to trade width with the screen — and is
+dismissed with either the toolbar toggle or the **✕** in its header. It
+starts collapsed on each launch (open/closed state isn't persisted).
 
 ### Keyboard shortcuts
 
@@ -202,6 +214,31 @@ guards every reachable exit:
 
 Behavior of the standalone `iris` binary is unchanged — it doesn't set
 the env var, so the soft-power-off `exit(0)` still happens as before.
+
+### Serial TCP ports & stale processes
+
+iris binds two TCP serial backends on fixed ports —
+`127.0.0.1:8880` (channel A / tty2) and `127.0.0.1:8881` (channel B /
+tty1, used by **Send IRIX halt**). Two consequences:
+
+- **You can't run two emulators at once.** A second instance can't bind
+  the same ports; its serial channels fall back to null backends (see
+  below).
+- **A crashed run can orphan the ports.** If iris-gui dies without fully
+  tearing down (a hard crash, `kill -9`), the emulator threads may keep
+  the listeners open. The next start then hits `AddrInUse` on bind.
+
+Previously that bind failure `.expect()`-panicked and aborted the whole
+process. It now fails soft: `TcpSocketBackend::new` logs a warning and
+the channel falls back to a `NullBackend`, so the machine still boots —
+that serial channel is just unavailable until the port frees.
+
+If you *need* the serial console back, clear the stale listener:
+
+```
+lsof -nP -iTCP:8880 -sTCP:LISTEN     # find who's holding it
+pkill -f iris-gui                    # or: kill <pid> from the line above
+```
 
 ### Safe-stop dialog
 
