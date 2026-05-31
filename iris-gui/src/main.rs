@@ -776,7 +776,7 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.heading("Configuration");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✕").on_hover_text("Hide config editor").clicked() {
+                        if ui.button("×").on_hover_text("Hide config editor").clicked() {
                             self.show_config_editor = false;
                         }
                     });

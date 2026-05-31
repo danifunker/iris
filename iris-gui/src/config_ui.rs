@@ -188,6 +188,7 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) {
                 }
 
                 ui.label("Type");
+                let was_cd = dev.cdrom;
                 let mut is_cd = dev.cdrom;
                 ComboBox::from_id_salt(("type", id))
                     .selected_text(if is_cd { "CD-ROM" } else { "HDD" })
@@ -195,8 +196,21 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) {
                         ui.selectable_value(&mut is_cd, false, "HDD");
                         ui.selectable_value(&mut is_cd, true, "CD-ROM");
                     });
+                // Switching to CD-ROM defaults to an empty drive (no media):
+                // clear the auto-generated HDD placeholder path so it doesn't
+                // look like a (missing) disc. Load media via "Insert disc…" in
+                // the SCSI menu, or just type a path here.
+                if is_cd && !was_cd && dev.path == format!("scsi{id}.raw") {
+                    dev.path.clear();
+                }
                 dev.cdrom = is_cd;
                 ui.end_row();
+                if dev.cdrom && dev.path.is_empty() {
+                    ui.label("");
+                    ui.label(RichText::new("empty drive (no media) — insert a disc via the SCSI menu")
+                        .weak().small());
+                    ui.end_row();
+                }
 
                 ui.label("Overlay (COW writes → .overlay)");
                 ui.checkbox(&mut dev.overlay, "");
@@ -222,7 +236,7 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) {
                 for (i, disc) in dev.discs.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         path_row(ui, ("disc", id, i), disc, Pick::OpenFile, DISK_FILTERS);
-                        if ui.button("✕").clicked() { drop_idx = Some(i); }
+                        if ui.button("×").clicked() { drop_idx = Some(i); }
                     });
                 }
                 if let Some(i) = drop_idx { dev.discs.remove(i); }
@@ -267,7 +281,7 @@ fn show_network(ui: &mut Ui, cfg: &mut MachineConfig) {
                     ui.selectable_value(&mut pf.bind, ForwardBind::Localhost, "localhost");
                     ui.selectable_value(&mut pf.bind, ForwardBind::Any, "any");
                 });
-            if ui.button("✕").clicked() { drop = Some(i); }
+            if ui.button("×").clicked() { drop = Some(i); }
         });
     }
     if let Some(i) = drop { cfg.port_forward.remove(i); }

@@ -171,7 +171,43 @@ pub struct VinoConfig {
     pub camera_index: u32,
 }
 
+/// (De)serialize the `scsi` map through string keys. TOML (and the `toml`
+/// crate's serializer) requires map keys to be strings, but the map is keyed
+/// by `u8`, so `toml::to_string` would fail with "map key was not a string".
+/// JSON is unaffected (it already stringifies map keys); this just makes the
+/// representation explicit and symmetric so iris.toml export round-trips.
+mod scsi_keys {
+    use super::ScsiDeviceConfig;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::{BTreeMap, HashMap};
+
+    pub fn serialize<S: Serializer>(
+        map: &HashMap<u8, ScsiDeviceConfig>,
+        ser: S,
+    ) -> Result<S::Ok, S::Error> {
+        // BTreeMap → stable, ID-sorted output.
+        map.iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect::<BTreeMap<String, &ScsiDeviceConfig>>()
+            .serialize(ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        de: D,
+    ) -> Result<HashMap<u8, ScsiDeviceConfig>, D::Error> {
+        HashMap::<String, ScsiDeviceConfig>::deserialize(de)?
+            .into_iter()
+            .map(|(k, v)| k.parse::<u8>().map(|id| (id, v)).map_err(serde::de::Error::custom))
+            .collect()
+    }
+}
+
 /// Top-level machine configuration.
+///
+/// Field order matters for TOML export: the `toml` serializer requires every
+/// scalar/inline-value field to be emitted before any table or array-of-table
+/// field, so all scalars are declared first and the table-valued fields
+/// (`scsi`, `nfs`, `port_forward`, `vino`) come last.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineConfig {
     /// Path to the PROM ROM image.
@@ -190,21 +226,9 @@ pub struct MachineConfig {
     #[serde(default = "default_banks")]
     pub banks: [u32; 4],
 
-    /// SCSI devices keyed by ID 1–7. Missing IDs are not attached.
-    #[serde(default = "default_scsi")]
-    pub scsi: std::collections::HashMap<u8, ScsiDeviceConfig>,
-
     /// Window scale factor (1 = native, 2 = 2× for HiDPI/4K). CLI --2x overrides this.
     #[serde(default = "default_scale")]
     pub scale: u32,
-
-    /// NFS share configuration. If present, unfsd is started and NFS is available inside the VM.
-    #[serde(default)]
-    pub nfs: Option<NfsConfig>,
-
-    /// Port forwarding rules (host port → guest port).
-    #[serde(default)]
-    pub port_forward: Vec<PortForwardConfig>,
 
     /// Run without graphics (no window, no REX3). Use no_audio to also disable HAL2.
     /// Useful for headless/server/CI environments.
@@ -216,13 +240,13 @@ pub struct MachineConfig {
     pub no_audio: bool,
 
     /// If Some(port), start the GDB RSP stub on that TCP port.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gdb_port: Option<u16>,
 
     /// NAT subnet in CIDR notation (e.g. "192.168.5.0/24").
     /// The gateway gets host .1 and the guest (IRIX) gets host .2.
     /// Defaults to "192.168.0.0/24" if not set.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nat_subnet: Option<String>,
 
     /// CI mode: opens a control socket for automation, applies speed-favoring
@@ -242,8 +266,22 @@ pub struct MachineConfig {
     /// Optional file path that will receive every byte emitted on ttyd1
     /// (the IRIX serial console) in `--ci` mode. Append-only. Useful for
     /// keeping a continuously-updated transcript of the install or test run.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_log: Option<String>,
+
+    // --- table / array-of-table fields: must be emitted after all scalars ---
+
+    /// SCSI devices keyed by ID 1–7. Missing IDs are not attached.
+    #[serde(default = "default_scsi", with = "scsi_keys")]
+    pub scsi: std::collections::HashMap<u8, ScsiDeviceConfig>,
+
+    /// NFS share configuration. If present, unfsd is started and NFS is available inside the VM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nfs: Option<NfsConfig>,
+
+    /// Port forwarding rules (host port → guest port).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_forward: Vec<PortForwardConfig>,
 
     /// VINO video-in configuration (IndyCam emulation source).
     #[serde(default)]
@@ -618,4 +656,24 @@ pub fn parse_nat_subnet(cidr: &str) -> Result<(std::net::Ipv4Addr, std::net::Ipv
     let gateway_ip = std::net::Ipv4Addr::from(network + 1);
     let client_ip  = std::net::Ipv4Addr::from(network + 2);
     Ok((gateway_ip, client_ip, netmask))
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    #[test]
+    fn toml_export_roundtrips() {
+        let mut cfg = MachineConfig::default();
+        cfg.scsi.insert(4, ScsiDeviceConfig {
+            path: "/abs/cd.chd".into(), discs: vec![], cdrom: true,
+            overlay: false, scratch: false, size_mb: None,
+        });
+        let s = toml::to_string_pretty(&cfg).expect("serialize");
+        let back: MachineConfig = toml::from_str(&s).expect("deserialize");
+        assert_eq!(back.scsi.len(), cfg.scsi.len());
+        assert_eq!(back.scsi[&1].path, cfg.scsi[&1].path);
+        assert_eq!(back.scsi[&4].cdrom, true);
+        println!("--- exported toml ---\n{s}");
+    }
 }

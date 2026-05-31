@@ -7,7 +7,6 @@ use std::path::Path;
 pub enum ScsiAction {
     None,
     AttachHdd { id: u8, path: String },
-    AttachCdrom { id: u8, path: String },
     AttachEmptyCdrom { id: u8 },
     InsertDisc { id: u8, path: String },
     Eject { id: u8 },
@@ -33,13 +32,10 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
                         }
                         ui.close_menu();
                     }
-                    if ui.button("Attach CD-ROM…").clicked() {
-                        if let Some(p) = pick_iso("Attach CD-ROM") {
-                            action = ScsiAction::AttachCdrom { id, path: p };
-                        }
-                        ui.close_menu();
-                    }
-                    if ui.button("Attach empty CD-ROM drive").clicked() {
+                    // Attaching a CD-ROM gives an empty drive by default; the
+                    // user loads media afterwards via "Insert disc…". Mirrors
+                    // real hardware and avoids an upfront file prompt.
+                    if ui.button("Attach CD-ROM drive (empty)").clicked() {
                         action = ScsiAction::AttachEmptyCdrom { id };
                         ui.close_menu();
                     }
@@ -160,12 +156,6 @@ pub fn apply(cfg: &mut MachineConfig, action: ScsiAction) -> Option<String> {
                 path, discs: vec![], cdrom: false, overlay: false, scratch: false, size_mb: None,
             });
             Some(format!("scsi{id}: HDD attached"))
-        }
-        ScsiAction::AttachCdrom { id, path } => {
-            cfg.scsi.insert(id, ScsiDeviceConfig {
-                path, discs: vec![], cdrom: true, overlay: false, scratch: false, size_mb: None,
-            });
-            Some(format!("scsi{id}: CD-ROM attached"))
         }
         ScsiAction::AttachEmptyCdrom { id } => {
             cfg.scsi.insert(id, ScsiDeviceConfig {
