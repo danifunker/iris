@@ -185,16 +185,16 @@ fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u32,
 // ─── Downscale + format conversion ───────────────────────────────────────────
 
 /// One-pass area-averaging downscale that also converts the input byte order
-/// from YUYV-as-delivered-by-nokhwa to canonical UYVY (U Y0 V Y1).
+/// from YUYV (as delivered by nokhwa) to canonical UYVY (U Y0 V Y1).
 ///
-/// Note: nokhwa's macOS backend (AVFoundation via the `nokhwa` crate's
-/// `YuyvFormat`) delivers the chroma pair with Cr (V) at byte 1 and Cb
-/// (U) at byte 3 rather than the textbook YUYV order (Cb at 1, Cr at 3).
-/// Reading them straight through to a yuv_to_rgb that expects canonical
-/// U/V positions produced the washed-out turquoise/red cast we saw in
-/// the first end-to-end camera capture inside IRIX. Swapping at this
-/// layer keeps the rest of the pipeline (UYVY contract, vino's render,
-/// `yuv_to_rgb`) using canonical channel identities.
+/// nokhwa's macOS backend delivers standard YUYV: Y0 Cb Y1 Cr — Cb (U) at byte
+/// 1, Cr (V) at byte 3. We just reorder to UYVY; the chroma is read straight.
+/// (A previous version swapped U/V here to "fix" a red/turquoise cast. That
+/// cast was actually VINO's RGBA output emitting A,R,G,B instead of A,B,G,R;
+/// the two swaps cancelled, so the camera looked right while the test pattern
+/// was red/blue-swapped. With the output order fixed in `render_and_pump`, the
+/// chroma must be read straight here or the camera comes out red<->blue
+/// swapped — verified live: a red shirt rendered blue until this was undone.)
 ///
 /// Iterates over destination pixel pairs (since YUYV / UYVY are 2-pixel
 /// units) and averages every source byte that maps into the destination
@@ -223,9 +223,9 @@ fn downscale_yuyv_to_uyvy(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec
                     let i = row + (sx as usize) * 2;
                     if i + 3 >= src.len() { break; }
                     y0_s += src[i    ] as u32; // Y0
-                    v_s  += src[i + 1] as u32; // V (Cr) — nokhwa puts Cr here
+                    u_s  += src[i + 1] as u32; // Cb (U) — standard YUYV
                     y1_s += src[i + 2] as u32; // Y1
-                    u_s  += src[i + 3] as u32; // U (Cb) — nokhwa puts Cb here
+                    v_s  += src[i + 3] as u32; // Cr (V) — standard YUYV
                     n += 1;
                     sx += 2;
                 }
@@ -287,23 +287,22 @@ mod tests {
 
     #[test]
     fn downscale_byte_swap_is_correct_for_1to1_2x1() {
-        // nokhwa's macOS YUYV delivers chroma in YVYU order at the byte
-        // level (Cr at byte 1, Cb at byte 3). The downscale function
-        // re-orders to canonical UYVY (U Y0 V Y1).
-        // Input bytes (nokhwa YUYV-on-macOS): Y0=0xA0 V=0x80 Y1=0xA1 U=0x40
-        let src = vec![0xA0, 0x80, 0xA1, 0x40];
+        // nokhwa delivers standard YUYV: Y0 Cb Y1 Cr (Cb/U at byte 1, Cr/V at
+        // byte 3). The downscale function re-orders to canonical UYVY (U Y0 V Y1).
+        // Input bytes (standard YUYV): Y0=0xA0 Cb=0x40 Y1=0xA1 Cr=0x80
+        let src = vec![0xA0, 0x40, 0xA1, 0x80];
         let dst = downscale_yuyv_to_uyvy(&src, 2, 1, 2, 1);
-        // Output UYVY: U Y0 V Y1
+        // Output UYVY: U(=Cb) Y0 V(=Cr) Y1
         assert_eq!(dst, vec![0x40, 0xA0, 0x80, 0xA1]);
     }
 
     #[test]
     fn downscale_averages_4x1_to_2x1() {
-        // Two nokhwa-YUYV pairs at 4×1 → one canonical-UYVY pair at 2×1,
-        // averaged. Input byte order per pair: Y0 V Y1 U (Cr at 1, Cb at 3).
+        // Two standard-YUYV pairs at 4×1 → one canonical-UYVY pair at 2×1,
+        // averaged. Input byte order per pair: Y0 Cb Y1 Cr (Cb at 1, Cr at 3).
         let src = vec![
-            0x10, 0x80, 0x20, 0x40,   // pair 0: Y0=0x10 V=0x80 Y1=0x20 U=0x40
-            0x30, 0xA0, 0x40, 0x60,   // pair 1: Y0=0x30 V=0xA0 Y1=0x40 U=0x60
+            0x10, 0x40, 0x20, 0x80,   // pair 0: Y0=0x10 Cb=0x40 Y1=0x20 Cr=0x80
+            0x30, 0x60, 0x40, 0xA0,   // pair 1: Y0=0x30 Cb=0x60 Y1=0x40 Cr=0xA0
         ];
         let dst = downscale_yuyv_to_uyvy(&src, 4, 1, 2, 1);
         // Expected output pair has averaged channels (canonical UYVY):
