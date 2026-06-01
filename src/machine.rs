@@ -1054,8 +1054,9 @@ impl Machine {
                     }
                 }
 
-                // Provenance validation (disk + features = hard error, nvram =
-                // warn). IRIS_SNAPSHOT_SKIP_CHECK=1 downgrades errors to warnings.
+                // Provenance validation: build features + disk presence/size = hard
+                // error; disk path and nvram = warn. IRIS_SNAPSHOT_SKIP_CHECK=1
+                // downgrades the hard errors to warnings.
                 let skip_check = std::env::var("IRIS_SNAPSHOT_SKIP_CHECK")
                     .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
                 let mut fatal: Vec<String> = Vec::new();
@@ -1071,16 +1072,21 @@ impl Machine {
                             m.features.join(","), cur_features.join(",")
                         ));
                     }
-                    // Every recorded disk must be present with matching path+size.
+                    // Every recorded disk must still be configured at the same SCSI
+                    // id with the same size. The host *path* is only where the file
+                    // happens to live (it moves when disks are relocated, e.g. into a
+                    // dist/ dir), so a path-only difference is a warning, not fatal —
+                    // a disk's identity for restore is its id + size, not its path.
                     for d in &m.disks {
                         match self.disks.iter().find(|c| c.id == d.id) {
                             None => fatal.push(format!(
                                 "snapshot disk SCSI {} ('{}') is not configured in this run", d.id, d.path)),
-                            Some(cur) if cur.path != d.path => fatal.push(format!(
-                                "SCSI {} path differs: snapshot '{}' vs current '{}'", d.id, d.path, cur.path)),
                             Some(cur) if cur.size_bytes != d.size_bytes => fatal.push(format!(
                                 "SCSI {} ('{}') size differs: snapshot {} bytes vs current {} bytes",
                                 d.id, d.path, d.size_bytes, cur.size_bytes)),
+                            Some(cur) if cur.path != d.path => eprintln!(
+                                "load_snapshot: SCSI {} path differs: snapshot '{}' vs current '{}' (same size — continuing)",
+                                d.id, d.path, cur.path),
                             Some(_) => {}
                         }
                     }
