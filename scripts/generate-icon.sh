@@ -47,23 +47,40 @@ mkdir -p "$ASSETS_DIR"
 
 echo "Converting $ORIGINAL to multiple formats..."
 
+# Transparent margin baked into every rendered size. macOS lays app icons out
+# on a grid where the artwork fills ~80% of the canvas (≈10% margin per side);
+# a full-bleed icon renders edge-to-edge and looks oversized next to others in
+# the Dock. CONTENT_PCT is the artwork's share of each side.
+CONTENT_PCT=80
+
+# render <size> <output> — scale the artwork to CONTENT_PCT% of <size> and
+# center it on a fully transparent <size>x<size> canvas (RGBA).
+render() {
+    local size=$1 out=$2
+    local inner=$(( size * CONTENT_PCT / 100 ))
+    $MAGICK_CMD "$ORIGINAL" -background none -alpha on \
+        -resize ${inner}x${inner} -gravity center -extent ${size}x${size} \
+        PNG32:"$out"
+}
+
 # Generate PNG icons at various sizes (preserving transparency)
 SIZES=(16 32 48 64 128 256 512 1024)
 for size in "${SIZES[@]}"; do
     echo "Creating ${size}x${size} PNG..."
-    $MAGICK_CMD "$ORIGINAL" -background none -alpha on -resize ${size}x${size} -extent ${size}x${size} PNG32:"$ASSETS_DIR/icon-${size}.png"
+    render "$size" "$ASSETS_DIR/icon-${size}.png"
 done
 
-# Generate Windows ICO file (multi-size with transparency)
+# Generate Windows ICO file (multi-size with transparency), reusing the
+# already-rendered, margin-padded PNGs.
 echo "Creating Windows ICO file..."
-$MAGICK_CMD "$ORIGINAL" \
-    \( -clone 0 -background none -resize 16x16 -extent 16x16 \) \
-    \( -clone 0 -background none -resize 32x32 -extent 32x32 \) \
-    \( -clone 0 -background none -resize 48x48 -extent 48x48 \) \
-    \( -clone 0 -background none -resize 64x64 -extent 64x64 \) \
-    \( -clone 0 -background none -resize 128x128 -extent 128x128 \) \
-    \( -clone 0 -background none -resize 256x256 -extent 256x256 \) \
-    -delete 0 -colors 256 "$ASSETS_DIR/icon.ico"
+$MAGICK_CMD \
+    "$ASSETS_DIR/icon-16.png" \
+    "$ASSETS_DIR/icon-32.png" \
+    "$ASSETS_DIR/icon-48.png" \
+    "$ASSETS_DIR/icon-64.png" \
+    "$ASSETS_DIR/icon-128.png" \
+    "$ASSETS_DIR/icon-256.png" \
+    -colors 256 "$ASSETS_DIR/icon.ico"
 
 # Generate macOS ICNS file (requires additional tools on macOS)
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -73,17 +90,17 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     ICONSET="$ASSETS_DIR/icon.iconset"
     mkdir -p "$ICONSET"
 
-    # Generate all required sizes for ICNS (with transparency)
-    $MAGICK_CMD "$ORIGINAL" -background none -resize 16x16 -extent 16x16 "$ICONSET/icon_16x16.png"
-    $MAGICK_CMD "$ORIGINAL" -background none -resize 32x32 -extent 32x32 "$ICONSET/icon_16x16@2x.png"
-    $MAGICK_CMD "$ORIGINAL" -background none -resize 32x32 -extent 32x32 "$ICONSET/icon_32x32.png"
-    $MAGICK_CMD "$ORIGINAL" -background none -resize 64x64 -extent 64x64 "$ICONSET/icon_32x32@2x.png"
-    $MAGICK_CMD "$ORIGINAL" -background none -resize 128x128 -extent 128x128 "$ICONSET/icon_128x128.png"
-    $MAGICK_CMD "$ORIGINAL" -background none -resize 256x256 -extent 256x256 "$ICONSET/icon_128x128@2x.png"
-    $MAGICK_CMD "$ORIGINAL" -background none -resize 256x256 -extent 256x256 "$ICONSET/icon_256x256.png"
-    $MAGICK_CMD "$ORIGINAL" -background none -resize 512x512 -extent 512x512 "$ICONSET/icon_256x256@2x.png"
-    $MAGICK_CMD "$ORIGINAL" -background none -resize 512x512 -extent 512x512 "$ICONSET/icon_512x512.png"
-    $MAGICK_CMD "$ORIGINAL" -background none -resize 1024x1024 -extent 1024x1024 "$ICONSET/icon_512x512@2x.png"
+    # Generate all required sizes for ICNS (with transparency + margin)
+    render 16   "$ICONSET/icon_16x16.png"
+    render 32   "$ICONSET/icon_16x16@2x.png"
+    render 32   "$ICONSET/icon_32x32.png"
+    render 64   "$ICONSET/icon_32x32@2x.png"
+    render 128  "$ICONSET/icon_128x128.png"
+    render 256  "$ICONSET/icon_128x128@2x.png"
+    render 256  "$ICONSET/icon_256x256.png"
+    render 512  "$ICONSET/icon_256x256@2x.png"
+    render 512  "$ICONSET/icon_512x512.png"
+    render 1024 "$ICONSET/icon_512x512@2x.png"
 
     # Convert to ICNS
     iconutil -c icns "$ICONSET"
