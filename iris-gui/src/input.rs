@@ -98,7 +98,7 @@ pub fn pump(ctx: &egui::Context, fb_rect: Rect, ps2: &Ps2Controller, state: &mut
         state.last_mods = ctx.input(|i| i.modifiers);
         state.last_buttons = 0;
         ctx.send_viewport_cmd(ViewportCommand::CursorVisible(false));
-        ctx.send_viewport_cmd(ViewportCommand::CursorGrab(CursorGrab::Locked));
+        ctx.send_viewport_cmd(ViewportCommand::CursorGrab(grab_mode()));
         return;
     }
 
@@ -127,6 +127,34 @@ pub fn pump(ctx: &egui::Context, fb_rect: Rect, ps2: &Ps2Controller, state: &mut
     if buttons != state.last_buttons || mdx != 0 || mdy != 0 {
         send_mouse_packet(ps2, buttons, mdx, -mdy); // PS/2 Y axis is up-positive
         state.last_buttons = buttons;
+    }
+}
+
+/// Pick the cursor-grab mode winit actually supports on this platform/session.
+///
+/// winit's two grab modes are not portable: `Locked` (lock the cursor in place
+/// and deliver relative motion) is supported on macOS and Wayland but **not
+/// X11**, while `Confined` (keep the cursor inside the window) is supported on
+/// X11 and Windows but **not macOS**. egui-winit does no fallback — it just
+/// logs the error — so a blanket `Locked` silently fails on X11, leaving the
+/// cursor un-grabbed: it drifts off-window, loses focus, and capture drops.
+///
+/// We rely on raw `DeviceEvent::MouseMotion` deltas (which arrive regardless of
+/// grab mode), so `Confined` is sufficient on X11 — it just stops the cursor
+/// escaping the window. Detect Wayland via `WAYLAND_DISPLAY`; otherwise assume
+/// X11 on Linux. macOS/Windows keep `Locked`.
+fn grab_mode() -> CursorGrab {
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            CursorGrab::Locked
+        } else {
+            CursorGrab::Confined
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        CursorGrab::Locked
     }
 }
 
