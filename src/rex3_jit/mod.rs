@@ -116,8 +116,14 @@ impl RexJit {
                                         cache.len()
                                     };
                                     store_clone.queued.write().unwrap().remove(&(dm0, dm1));
-                                    eprintln!("REX JIT: compiled dm0={dm0:#010x} dm1={dm1:#010x} \
-                                        ({code_bytes}B, total: {count})");
+                                    // Per-shader success is informational, not an error.
+                                    // Route it through the gated dev log (enable with
+                                    // IRIS_DEBUG_LOG=rex3 or the monitor `log rex3` command)
+                                    // instead of spamming stderr on every unique draw mode.
+                                    crate::dlog!(
+                                        crate::devlog::LogModule::Rex3,
+                                        "REX JIT: compiled dm0={dm0:#010x} dm1={dm1:#010x} ({code_bytes}B, total: {count})"
+                                    );
                                 }
                                 None => {
                                     // Compilation failed or not JIT-able; mark as permanently
