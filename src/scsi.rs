@@ -323,7 +323,7 @@ impl ScsiDevice {
         let f = OpenOptions::new().read(true).open(&path)
             .map_err(|e| format!("could not open {}: {}", path, e))?;
         let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-        self.backend = DiskBackend::Direct(f);
+        self.backend = Some(DiskBackend::Direct(f));
         self.size = size;
         // phys/logical block sizes persist across disc changes (controller
         // settings), exactly as in eject_next.
