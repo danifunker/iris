@@ -43,7 +43,7 @@ pub struct GuiSettings {
 /// keyboard zoom, and the load-time clamp so a stale persisted value can never
 /// put the UI into a state the slider can't represent (which egui would then
 /// silently re-clamp to its own bound).
-pub const UI_SCALE_MIN: f32 = 0.75;
+pub const UI_SCALE_MIN: f32 = 1.0;
 pub const UI_SCALE_MAX: f32 = 3.0;
 pub const UI_SCALE_DEFAULT: f32 = 1.25;
 
