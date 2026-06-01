@@ -43,7 +43,7 @@ pub struct GuiSettings {
 /// keyboard zoom, and the load-time clamp so a stale persisted value can never
 /// put the UI into a state the slider can't represent (which egui would then
 /// silently re-clamp to its own bound).
-pub const UI_SCALE_MIN: f32 = 0.5;
+pub const UI_SCALE_MIN: f32 = 0.75;
 pub const UI_SCALE_MAX: f32 = 3.0;
 pub const UI_SCALE_DEFAULT: f32 = 1.25;
 
@@ -58,13 +58,16 @@ impl GuiSettings {
         let Some(path) = Self::config_path() else { return Self::default(); };
         let Ok(text) = std::fs::read_to_string(&path) else { return Self::default(); };
         let mut s: Self = serde_json::from_str(&text).unwrap_or_default();
-        // Clamp a stale/out-of-range persisted scale (e.g. a value below the
-        // slider's old minimum) into the supported range. A non-finite value
-        // (NaN from a corrupt file) falls back to the default.
-        if !s.ui_scale.is_finite() {
-            s.ui_scale = UI_SCALE_DEFAULT;
-        }
-        s.ui_scale = s.ui_scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
+        // Sanitize a stale/out-of-range persisted scale. A value below the
+        // minimum is junk left by an older build whose keyboard zoom floored
+        // at 0.5 (the UI can no longer produce sub-minimum values), so reset
+        // it to the default rather than honoring it — likewise for a
+        // non-finite value from a corrupt file. Only the high end is clamped.
+        s.ui_scale = if !s.ui_scale.is_finite() || s.ui_scale < UI_SCALE_MIN {
+            UI_SCALE_DEFAULT
+        } else {
+            s.ui_scale.min(UI_SCALE_MAX)
+        };
         s
     }
 

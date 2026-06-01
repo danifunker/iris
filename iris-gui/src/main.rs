@@ -939,7 +939,11 @@ impl eframe::App for App {
             MissingChoice::None => {}
             MissingChoice::Cancel => { self.missing_modal = None; }
             MissingChoice::EditDisks => {
+                // Switching the tab alone is invisible if the config editor
+                // side panel is collapsed (its default state) — open it too,
+                // or the button appears to do nothing.
                 self.tab = config_ui::Tab::Disks;
+                self.show_config_editor = true;
                 self.missing_modal = None;
             }
             MissingChoice::Detach => {
