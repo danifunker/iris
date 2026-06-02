@@ -712,6 +712,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 
         // Build unified cache hierarchy. Cache geometry is fixed at compile time;
         // IC_SIZE/IC_LINE/DC_SIZE/DC_LINE/L2_SIZE/L2_LINE are consts from mips_cache_v2.
+        #[cfg_attr(not(feature = "gdc"), allow(unused_mut))]
         let mut cache = C::from(sysad.clone());
         #[cfg(feature = "gdc")]
         cache.set_decode_fn(decode_into::<T, C>);
@@ -5035,7 +5036,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         register_lock_fn("cpu::executor", move || ex.is_locked());
     }
 
-    fn try_lock_executor(&self) -> Result<parking_lot::MutexGuard<MipsExecutor<T, C>>, String> {
+    fn try_lock_executor(&self) -> Result<parking_lot::MutexGuard<'_, MipsExecutor<T, C>>, String> {
         self.executor.try_lock().ok_or_else(|| "CPU thread holds the executor lock; try 'cpu stop' first".to_string())
     }
 

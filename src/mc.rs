@@ -498,7 +498,7 @@ impl MemoryController {
                 // Each "line" is line_zoom repetitions of line_width bytes, then stride advance.
                 if word_aligned && fill && to_host && !xlate {
                     dlog_dev!(LogModule::Mc, "MC: DMA using FILL FAST PATH (stride={})", stride);
-                    'fill_outer: while line_count > 0 {
+                    while line_count > 0 {
                         line_count -= 1;
                         let line_start = mem_vaddr;
                         let mut zc = zoom_count;

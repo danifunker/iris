@@ -826,7 +826,7 @@ impl Vino {
         let mut accum: u64 = 0;
         let mut bytes_in: u32 = 0;
         let mut stopped = false;
-        let mut line_bytes: u32 = 0;
+        let mut line_bytes: u32;
 
         let mut y = y0;
         while y < y1 && !stopped {

@@ -12,6 +12,7 @@ default-run = "iris"
 debug_cache = []
 developer = []
 developer_ip7 = []  # CP0 Compare/timer calibration stats and debug prints
+developerx = []     # Extended developer logging: breaks on IBE/DBE/ADEL/ADES/TLB errors
 # Synthetic deterministic clock for CP0 Compare calibration: dt_ns derived from
 # (instructions executed) * 10ns instead of host Instant::now(). Required for
 # the snapshot determinism validator (Phase 3.3). Default OFF preserves the

@@ -316,12 +316,12 @@ impl Target for IrisTarget {
     type Error = &'static str;
 
     #[inline(always)]
-    fn base_ops(&mut self) -> BaseOps<Self::Arch, Self::Error> {
+    fn base_ops(&mut self) -> BaseOps<'_, Self::Arch, Self::Error> {
         BaseOps::SingleThread(self)
     }
 
     #[inline(always)]
-    fn support_breakpoints(&mut self) -> Option<BreakpointsOps<Self>> {
+    fn support_breakpoints(&mut self) -> Option<BreakpointsOps<'_, Self>> {
         Some(self)
     }
 
