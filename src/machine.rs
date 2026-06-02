@@ -603,8 +603,6 @@ impl Machine {
 
     pub fn stop(&mut self) {
         self.cpu.stop();
-        #[cfg(feature = "gdc")]
-        self.cpu.save_decode_cache();
         if let Some(rex3) = &self._phys.rex3 { rex3.stop(); }
         self.hpc3.stop();
         self.mc.stop();

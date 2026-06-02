@@ -451,20 +451,6 @@ pub trait MipsCache: Send + Sync {
         Ok(())
     }
 
-    /// Set the monomorphized decode function. Must be called once before any fetch.
-    #[cfg(feature = "gdc")]
-    fn set_decode_fn(&self, _f: fn(&mut DecodedInstr)) {}
-
-    /// Return a stable pointer to a fully decoded DecodedInstr for `raw`.
-    /// Allocates from slab if not yet seen, decodes using the stored decode_fn.
-    /// Always returns a non-null pointer for R4000Cache; null for PassthroughCache.
-    #[cfg(feature = "gdc")]
-    #[inline(always)]
-    fn decode_cache_get(&self, _raw: u32) -> *const DecodedInstr { std::ptr::null() }
-
-    /// Return all raw instruction words currently in the decode cache.
-    #[cfg(feature = "gdc")]
-    fn decode_cache_keys(&self) -> Vec<u32> { Vec::new() }
 }
 
 // =============================================================================
@@ -479,8 +465,6 @@ pub struct PassthroughCache {
     lladdr: UnsafeCell<u32>,
     /// Scratch slot for fetch() — no actual caching, just a place to decode into.
     fetch_scratch: UnsafeCell<DecodedInstr>,
-    #[cfg(feature = "gdc")]
-    decode_fn: fn(&mut DecodedInstr),
 }
 
 // Safety: Single-threaded access only (CPU thread)
@@ -494,8 +478,6 @@ impl PassthroughCache {
             llbit: UnsafeCell::new(false),
             lladdr: UnsafeCell::new(0),
             fetch_scratch: UnsafeCell::new(DecodedInstr::default()),
-            #[cfg(feature = "gdc")]
-            decode_fn: |_| {},
         }
     }
 }
@@ -507,26 +489,12 @@ impl From<Arc<dyn BusDevice>> for PassthroughCache {
 }
 
 impl MipsCache for PassthroughCache {
-    #[cfg(feature = "gdc")]
-    fn set_decode_fn(&self, f: fn(&mut DecodedInstr)) {
-        let self_mut = self as *const Self as *mut Self;
-        unsafe { (*self_mut).decode_fn = f; }
-    }
-
     fn fetch(&self, _virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
         let r = self.downstream.read32(phys_addr as u32);
         if r.is_ok() {
             let slot = unsafe { &mut *self.fetch_scratch.get() };
-            #[cfg(not(feature = "gdc"))]
-            {
-                if slot.raw != r.data { slot.decoded = false; }
-                slot.raw = r.data;
-            }
-            #[cfg(feature = "gdc")]
-            if slot.raw != r.data || slot.handler == 0 {
-                slot.raw = r.data;
-                (self.decode_fn)(slot);
-            }
+            if slot.raw != r.data { slot.decoded = false; }
+            slot.raw = r.data;
             FetchInstrResult::hit(slot as *const DecodedInstr)
         } else {
             // BUS_BUSY == EXEC_RETRY (compile-time asserted in traits.rs); pass status through.
@@ -594,71 +562,11 @@ impl MipsCache for PassthroughCache {
         unsafe { *self.lladdr.get() = addr; }
     }
 
-    /// Under gdc, the uncached fetch path uses decode_cache_get rather than the scratch slot.
-    /// PassthroughCache has no slab, so decode into the scratch slot and return it.
-    /// The caller may only use the returned pointer until the next decode_cache_get call.
-    #[cfg(feature = "gdc")]
-    fn decode_cache_get(&self, raw: u32) -> *const DecodedInstr {
-        let slot = unsafe { &mut *self.fetch_scratch.get() };
-        if slot.raw != raw || slot.handler == 0 {
-            slot.raw = raw;
-            (self.decode_fn)(slot);
-        }
-        slot as *const DecodedInstr
-    }
 }
 
 // =============================================================================
 // Cache Structure - Used for L1-I, L1-D, and L2
 // =============================================================================
-
-/// Slab allocator for DecodedInstr (gdc feature only). Allocates fixed-size pages so that
-/// pointers into previously-allocated pages remain stable forever (no reallocation).
-/// Only grows, never frees individual entries — entries live as long as the slab.
-#[cfg(feature = "gdc")]
-pub(crate) struct DecodedInstrSlab {
-    pages: UnsafeCell<Vec<Box<[DecodedInstr; Self::PAGE]>>>,
-    next:  UnsafeCell<usize>,
-}
-
-#[cfg(feature = "gdc")]
-unsafe impl Send for DecodedInstrSlab {}
-#[cfg(feature = "gdc")]
-unsafe impl Sync for DecodedInstrSlab {}
-
-#[cfg(feature = "gdc")]
-impl DecodedInstrSlab {
-    const PAGE: usize = 65536; // 65536 × sizeof(DecodedInstr) ≈ 1.5 MB per page
-
-    pub fn new() -> Self {
-        Self {
-            pages: UnsafeCell::new(Vec::new()),
-            next:  UnsafeCell::new(0),
-        }
-    }
-
-    /// Allocate one slot, returning a stable raw pointer to it (valid for slab lifetime).
-    #[inline(always)]
-    pub fn alloc(&self) -> *mut DecodedInstr {
-        let pages = unsafe { &mut *self.pages.get() };
-        let next  = unsafe { &mut *self.next.get() };
-        let page_idx = *next / Self::PAGE;
-        let slot_idx = *next % Self::PAGE;
-        if page_idx >= pages.len() {
-            // SAFETY: DecodedInstr is valid at all-zero; handler==0 means "not decoded".
-            let page: Box<[DecodedInstr; Self::PAGE]> =
-                unsafe { Box::new_zeroed().assume_init() };
-            pages.push(page);
-        }
-        let ptr = &mut pages[page_idx][slot_idx] as *mut DecodedInstr;
-        *next += 1;
-        ptr
-    }
-
-    pub fn len(&self) -> usize {
-        unsafe { *self.next.get() }
-    }
-}
 
 /// Wrapper around UnsafeCell<Vec<T>> that is Send+Sync
 struct CacheVec<T>(UnsafeCell<Vec<T>>);
@@ -704,12 +612,7 @@ struct Cache<TAG, const SIZE: usize, const LINE: usize, const WAYS: usize, const
     /// Heap-allocated data array — entire cache contents as u64 chunks (all ways).
     data:   UnsafeCell<Box<[u64; DATA]>>,
     /// L2 decoded-instruction slots (SIZE/4 entries). Empty Vec for L1-I and L1-D.
-    /// Under `gdc`: pointer slots (*const DecodedInstr); null = not yet resolved.
-    /// Under non-gdc: inline DecodedInstr with decoded: bool flag.
-    #[cfg(not(feature = "gdc"))]
     instrs: CacheVec<DecodedInstr>,
-    #[cfg(feature = "gdc")]
-    instrs: CacheVec<*const DecodedInstr>,
     /// Signals the decode thread to stop (kept for Drop compatibility).
     stop:   Arc<AtomicBool>,
 }
@@ -740,17 +643,12 @@ impl<TAG: Default + Copy, const SIZE: usize, const LINE: usize, const WAYS: usiz
     fn new() -> Self {
         // Allocate L2 decoded-instruction slots for L2 caches only.
         // R5K always gets an empty vec (L1I fills its own ic_instrs from l2.data at fill time).
-        // Under gdc: pointer slots (null = not yet resolved).
-        // Under non-gdc: inline DecodedInstr with decoded: bool flag.
-        #[cfg(not(feature = "gdc"))]
         let instrs: Vec<DecodedInstr> = {
             #[cfg(not(feature = "r5k"))]
             { if KIND == CacheKind::L2 as u8 { (0..SIZE / 4).map(|_| DecodedInstr::default()).collect() } else { Vec::new() } }
             #[cfg(feature = "r5k")]
             { Vec::new() }
         };
-        #[cfg(feature = "gdc")]
-        let instrs: Vec<*const DecodedInstr> = Vec::new(); // gdc: fetch() bypasses l2.instrs entirely
         Self {
             tags:   UnsafeCell::new(vec![TAG::default(); TAGS].into_boxed_slice()),
             // SAFETY: u64 is valid at all-zero bit patterns. Box::new_zeroed avoids
@@ -915,38 +813,16 @@ pub struct R4000Cache {
     /// L1-I fetch counter — incremented on every fetch attempt (hit or miss).
     pub l1i_fetch_count: Arc<AtomicU64>,
 
-    /// Slab owning all DecodedInstr allocations. Pointers into this slab are stable forever.
-    #[cfg(feature = "gdc")]
-    slab: DecodedInstrSlab,
-
-    /// Intrusive hash table: 128K slots indexed by `raw.wrapping_mul(0x9e3779b9) >> 15`.
-    /// Each slot is the head of a slab chain linked via DecodedInstr::next.
-    /// 128K × 8B = 1 MB. Heap-boxed to avoid large stack temporaries during construction.
-    #[cfg(feature = "gdc")]
-    decode_table: UnsafeCell<Box<[*const DecodedInstr; 131072]>>,
-
-    /// Monomorphized decode function, set once at cache construction via set_decode_fn().
-    #[cfg(feature = "gdc")]
-    decode_fn: fn(&mut DecodedInstr),
-
     // Triton only: L2 enable bit (mirrors CONFIG_SE bit 12). When false, L1 fills go
     // directly to memory and L1D writebacks bypass L2.
     #[cfg(feature = "r5ksc_triton")]
     l2_enabled: bool,
 
     // R5K: L1I owns its own decoded-instruction slots (L2 non-inclusive).
-    // R4K + gdc: same structure; avoids per-fetch hash lookup by caching slab pointers at fill time.
     // Indexed as: ic_instrs[way * IC_NUM_SETS * INSTRS_PER_LINE + set_idx * INSTRS_PER_LINE + word]
-    // R4K has 1 way; total: IC_NUM_SETS sets × (IC_LINE/4) instrs/line.
     // R5K has 2 ways; total: 2 × IC_NUM_SETS sets × (IC_LINE/4) instrs/line.
-    // Under gdc: pointer slots (*const DecodedInstr).
-    // Under non-gdc (R5K only): inline DecodedInstr with decoded: bool flag.
-    #[cfg(all(not(feature = "r5k"), feature = "gdc"))]
-    ic_instrs: CacheVec<*const DecodedInstr>,
-    #[cfg(all(feature = "r5k", not(feature = "gdc")))]
+    #[cfg(feature = "r5k")]
     ic_instrs: CacheVec<DecodedInstr>,
-    #[cfg(all(feature = "r5k", feature = "gdc"))]
-    ic_instrs: CacheVec<*const DecodedInstr>,
 
     // R5K only: LRU bit per set for L1I and L1D, packed as a bitmap.
     // Bit N = 0: way0 is LRU (fill way0 next); bit N = 1: way1 is LRU.
@@ -1030,29 +906,13 @@ impl R4000Cache {
             lladdr: UnsafeCell::new(0),
             l1i_hit_count: Arc::new(AtomicU64::new(0)),
             l1i_fetch_count: Arc::new(AtomicU64::new(0)),
-            #[cfg(feature = "gdc")]
-            slab: DecodedInstrSlab::new(),
-            #[cfg(feature = "gdc")]
-            // SAFETY: null pointer is all-zeros; new_zeroed avoids a 1MB stack temporary.
-            decode_table: UnsafeCell::new(unsafe { Box::new_zeroed().assume_init() }),
-            #[cfg(feature = "gdc")]
-            decode_fn: |_| {}, // overwritten by set_decode_fn() before first use
             #[cfg(feature = "r5ksc_triton")]
             l2_enabled: false, // starts disabled; PROM enables via CONFIG_SE
-            // R4K + gdc: 1-way ic_instrs (IC_NUM_SETS × IC_LINE/4 pointers, null = not filled).
-            #[cfg(all(not(feature = "r5k"), feature = "gdc"))]
-            ic_instrs: CacheVec::new(
-                vec![std::ptr::null::<DecodedInstr>(); IC_NUM_SETS * (IC_LINE / 4)]
-            ),
             // R5K: 2-way ic_instrs (2 × IC_NUM_SETS × IC_LINE/4 words).
-            #[cfg(all(feature = "r5k", not(feature = "gdc")))]
+            #[cfg(feature = "r5k")]
             ic_instrs: CacheVec::new(
                 (0..IC_WAYS * IC_NUM_SETS * (IC_LINE / 4))
                     .map(|_| DecodedInstr::default()).collect()
-            ),
-            #[cfg(all(feature = "r5k", feature = "gdc"))]
-            ic_instrs: CacheVec::new(
-                vec![std::ptr::null::<DecodedInstr>(); IC_WAYS * IC_NUM_SETS * (IC_LINE / 4)]
             ),
             #[cfg(feature = "r5k")]
             ic_lru: UnsafeCell::new(vec![0u64; IC_NUM_SETS.div_ceil(64)].into_boxed_slice()),
@@ -1502,10 +1362,9 @@ impl R4000Cache {
             }
         }
 
-        // R4K non-gdc: sync l2.instrs for the updated region so fetch() sees fresh instruction words.
-        // R4K gdc: no l2.instrs — fetch() reads raw from l2.data directly, nothing to sync.
+        // R4K: sync l2.instrs for the updated region so fetch() sees fresh instruction words.
         // R5K: l2.instrs is empty; ic_instrs will be re-filled from l2.data on next L1I miss.
-        #[cfg(all(not(feature = "r5k"), not(feature = "gdc")))]
+        #[cfg(not(feature = "r5k"))]
         {
             let l2_instrs = self.l2.instrs.get_mut();
             let instrs_start = (l2_idx << L2Cache::INSTR_SHIFT) + offset_in_l2_line * 2;
@@ -1638,11 +1497,10 @@ impl R4000Cache {
         let start_chunk = l2_idx << L2Cache::CHUNKS_PER_LINE_SHIFT;
 
         // INVARIANT: l2.data is always accessed as u64 chunks (never as u32 words).
-        // R4K non-gdc: l2.instrs[n] mirrors the n-th instruction word; fetch() indexes it directly.
-        // R4K gdc: no l2.instrs — fetch() reads raw from l2.data and calls decode_cache_get.
+        // R4K: l2.instrs[n] mirrors the n-th instruction word; fetch() indexes it directly.
         // R5K: l2.instrs is empty — fill_l1i_line reads raw words from l2.data instead.
         // Do not add data_as_words() accessors on L2 or fetch indexing will silently break.
-        #[cfg(all(not(feature = "r5k"), not(feature = "gdc")))]
+        #[cfg(not(feature = "r5k"))]
         let instrs_start = l2_idx << L2Cache::INSTR_SHIFT;
         for i in 0..L2Cache::CHUNKS_PER_LINE {
             let fetch_addr = line_base + ((i as u64) << 3);
@@ -1650,7 +1508,7 @@ impl R4000Cache {
             if !r.is_ok() { return false; }
             let val = r.data;
             l2_data[start_chunk + i] = val;
-            #[cfg(all(not(feature = "r5k"), not(feature = "gdc")))]
+            #[cfg(not(feature = "r5k"))]
             {
                 let l2_instrs = self.l2.instrs.get_mut();
                 let r0 = (val >> 32) as u32;
@@ -1737,36 +1595,8 @@ impl R4000Cache {
             crate::dlog!(LogModule::L1i, "fill virt={:#x} phys={:#x} eidx={}", index_addr, phys_addr, ic_eidx);
         }
 
-        // R4K + gdc: populate ic_instrs (1-way) at fill time — same as R5K gdc path.
-        // Avoids a per-fetch hash lookup: slab pointer is cached in ic_instrs after first fill.
-        #[cfg(all(not(feature = "r5k"), feature = "gdc"))]
-        {
-            let ic_slot_base = ic_eidx << ICache::INSTR_SHIFT;
-            let ic_instrs = self.ic_instrs.get_mut();
-            if self.l2_active() {
-                let l2_sub_offset = ((phys_addr as usize) & (L2Cache::LINE_MASK & !ICache::LINE_MASK)) >> 3;
-                let l2_chunk_base = (self.l2.get_index(phys_addr) << L2Cache::CHUNKS_PER_LINE_SHIFT)
-                    + l2_sub_offset;
-                let l2_data = self.l2.data();
-                for i in 0..ICache::INSTRS_PER_LINE / 2 {
-                    let chunk = l2_data[l2_chunk_base + i];
-                    ic_instrs[ic_slot_base + i * 2]     = self.decode_cache_get((chunk >> 32) as u32);
-                    ic_instrs[ic_slot_base + i * 2 + 1] = self.decode_cache_get(chunk as u32);
-                }
-            } else {
-                let line_base = phys_addr & !(ICache::LINE_MASK as u64);
-                for i in 0..ICache::INSTRS_PER_LINE {
-                    let word_addr = (line_base + (i as u64) * 4) as u32;
-                    let r = self.downstream.read32(word_addr);
-                    ic_instrs[ic_slot_base + i] = self.decode_cache_get(if r.is_ok() { r.data } else { 0 });
-                }
-            }
-        }
-
         // R5K: populate ic_instrs for this way's slot.
         // Source is l2.data when L2 is active, or memory directly when L2 is disabled.
-        // Under gdc: store slab pointer (decode happens once globally per raw word).
-        // Under non-gdc: store raw + clear decoded flag (lazy decode on first fetch).
         #[cfg(feature = "r5k")]
         {
             let ic_slot_base = ic_eidx << ICache::INSTR_SHIFT;
@@ -1780,20 +1610,12 @@ impl R4000Cache {
                     let chunk = l2_data[l2_chunk_base + i];
                     let w0 = (chunk >> 32) as u32;
                     let w1 = chunk as u32;
-                    #[cfg(not(feature = "gdc"))]
-                    {
-                        let d0 = &mut ic_instrs[ic_slot_base + i * 2];
-                        if d0.raw != w0 { d0.decoded = false; }
-                        d0.raw = w0;
-                        let d1 = &mut ic_instrs[ic_slot_base + i * 2 + 1];
-                        if d1.raw != w1 { d1.decoded = false; }
-                        d1.raw = w1;
-                    }
-                    #[cfg(feature = "gdc")]
-                    {
-                        ic_instrs[ic_slot_base + i * 2]     = self.decode_cache_get(w0);
-                        ic_instrs[ic_slot_base + i * 2 + 1] = self.decode_cache_get(w1);
-                    }
+                    let d0 = &mut ic_instrs[ic_slot_base + i * 2];
+                    if d0.raw != w0 { d0.decoded = false; }
+                    d0.raw = w0;
+                    let d1 = &mut ic_instrs[ic_slot_base + i * 2 + 1];
+                    if d1.raw != w1 { d1.decoded = false; }
+                    d1.raw = w1;
                 }
             } else {
                 // L2 disabled: read directly from memory.
@@ -1802,14 +1624,9 @@ impl R4000Cache {
                     let word_addr = (line_base + (i as u64) * 4) as u32;
                     let r = self.downstream.read32(word_addr);
                     let w = if r.is_ok() { r.data } else { 0 };
-                    #[cfg(not(feature = "gdc"))]
-                    {
-                        let d = &mut ic_instrs[ic_slot_base + i];
-                        if d.raw != w { d.decoded = false; }
-                        d.raw = w;
-                    }
-                    #[cfg(feature = "gdc")]
-                    { ic_instrs[ic_slot_base + i] = self.decode_cache_get(w); }
+                    let d = &mut ic_instrs[ic_slot_base + i];
+                    if d.raw != w { d.decoded = false; }
+                    d.raw = w;
                 }
             }
             // Flip LRU: just-filled way becomes MRU.
@@ -1832,14 +1649,7 @@ impl R4000Cache {
                 print!("  ic_instrs:");
                 for i in 0..ICache::INSTRS_PER_LINE {
                     if i % 4 == 0 { print!("\n    "); }
-                    #[cfg(not(feature = "gdc"))]
                     print!("{:08x} ", ic_instrs[slot_base + i].raw);
-                    #[cfg(feature = "gdc")]
-                    {
-                        let ptr = ic_instrs[slot_base + i];
-                        if ptr.is_null() { print!("???????? "); }
-                        else { print!("{:08x} ", unsafe { (*ptr).raw }); }
-                    }
                 }
                 println!();
             }
@@ -2073,19 +1883,9 @@ impl MipsCache for R4000Cache {
             self.l1i_hit_count.fetch_add(1, Ordering::Relaxed);
         }
 
-        #[cfg(not(feature = "gdc"))]
         {
             let l2_slot_idx = ((phys_addr as usize) & (L2_CACHE_SIZE - 1)) >> 2;
             let slot = &self.l2.instrs.get()[l2_slot_idx] as *const DecodedInstr;
-            FetchInstrResult::hit(slot)
-        }
-        #[cfg(feature = "gdc")]
-        {
-            // ic_instrs was populated at fill_l1i_line time — pointer is always valid here.
-            // L1I is virtually indexed: set index and word-within-line both come from virt_addr.
-            let instr_idx = (virt_addr as usize & (IC_SIZE - 1)) >> 2;
-            let slot = self.ic_instrs.get()[instr_idx];
-            debug_assert!(!slot.is_null(), "ic_instrs[{}] null at fetch — fill_l1i_line must populate all slots", instr_idx);
             FetchInstrResult::hit(slot)
         }
     }
@@ -2132,15 +1932,8 @@ impl MipsCache for R4000Cache {
 
         let instr_idx = (ic_eidx << ICache::INSTR_SHIFT)
             | ((virt_addr as usize >> 2) & ICache::INSTR_MASK);
-        #[cfg(not(feature = "gdc"))]
         {
             let slot = &self.ic_instrs.get()[instr_idx] as *const DecodedInstr;
-            FetchInstrResult::hit(slot)
-        }
-        #[cfg(feature = "gdc")]
-        {
-            let slot = self.ic_instrs.get()[instr_idx];
-            debug_assert!(!slot.is_null(), "ic_instrs[{}] null at fetch — fill_l1i_line must populate all slots", instr_idx);
             FetchInstrResult::hit(slot)
         }
     }
@@ -2696,14 +2489,7 @@ impl MipsCache for R4000Cache {
                     for i in 0..instrs_per_ic_line {
                         if i % 4 == 0 { s.push_str("\n    "); }
                         if slot_base + i < ic_instrs.len() {
-                            #[cfg(not(feature = "gdc"))]
                             s.push_str(&format!("{:08x} ", ic_instrs[slot_base + i].raw));
-                            #[cfg(feature = "gdc")]
-                            {
-                                let ptr = ic_instrs[slot_base + i];
-                                if ptr.is_null() { s.push_str("???????? "); }
-                                else { s.push_str(&format!("{:08x} ", unsafe { (*ptr).raw })); }
-                            }
                         }
                     }
                     s
@@ -2719,7 +2505,6 @@ impl MipsCache for R4000Cache {
                         let l2_slot_idx = l2_slot_base + i;
                         let chunk = l2_data[l2_slot_idx >> 1];
                         let from_data = if l2_slot_idx & 1 == 0 { (chunk >> 32) as u32 } else { chunk as u32 };
-                        #[cfg(not(feature = "gdc"))]
                         {
                             let ic_instrs = self.l2.instrs.get();
                             if l2_slot_idx < ic_instrs.len() {
@@ -2731,8 +2516,6 @@ impl MipsCache for R4000Cache {
                                 }
                             }
                         }
-                        #[cfg(feature = "gdc")]
-                        s.push_str(&format!("{:08x} ", from_data));
                     }
                     s
                 };
@@ -2816,17 +2599,10 @@ impl MipsCache for R4000Cache {
         self.dc.data_mut().fill(0);
         self.l2.tags_mut().fill(L2Tag::default());
         self.l2.data_mut().fill(0);
-        #[cfg(all(not(feature = "r5k"), not(feature = "gdc")))]
+        #[cfg(not(feature = "r5k"))]
         for s in self.l2.instrs.get_mut().iter_mut() { s.decoded = false; s.raw = 0; }
-        #[cfg(all(not(feature = "r5k"), feature = "gdc"))]
-        for s in self.ic_instrs.get_mut().iter_mut() { *s = std::ptr::null(); }
         #[cfg(feature = "r5k")]
-        for s in self.ic_instrs.get_mut().iter_mut() {
-            #[cfg(not(feature = "gdc"))]
-            { s.decoded = false; s.raw = 0; }
-            #[cfg(feature = "gdc")]
-            { *s = std::ptr::null(); }
-        }
+        for s in self.ic_instrs.get_mut().iter_mut() { s.decoded = false; s.raw = 0; }
         #[cfg(feature = "r5k")]
         unsafe {
             (*self.ic_lru.get()).fill(0u64);
@@ -2846,49 +2622,6 @@ impl MipsCache for R4000Cache {
         R4000Cache::load_cache_state(self, v)
     }
 
-    #[cfg(feature = "gdc")]
-    fn set_decode_fn(&self, f: fn(&mut DecodedInstr)) {
-        // SAFETY: single-threaded, called once before any fetch.
-        let self_mut = self as *const Self as *mut Self;
-        unsafe { (*self_mut).decode_fn = f; }
-    }
-
-    #[cfg(feature = "gdc")]
-    #[inline(always)]
-    fn decode_cache_get(&self, raw: u32) -> *const DecodedInstr {
-        let idx = (raw.wrapping_mul(0x9e3779b9) >> 15) as usize;
-        let table = unsafe { (*self.decode_table.get()).as_mut_ptr() };
-        let mut cur = unsafe { *table.add(idx) };
-        while !cur.is_null() {
-            if unsafe { (*cur).raw } == raw { return cur; }
-            cur = unsafe { (*cur).next };
-        }
-        // Not found — allocate, decode, prepend to chain.
-        let ptr = self.slab.alloc();
-        unsafe {
-            (*ptr).raw = raw;
-            (self.decode_fn)(&mut *ptr);
-            (*ptr).next = *table.add(idx);
-            *table.add(idx) = ptr;
-        }
-        ptr
-    }
-
-    #[cfg(feature = "gdc")]
-    fn decode_cache_keys(&self) -> Vec<u32> {
-        let table = unsafe { &**self.decode_table.get() };
-        let mut keys = Vec::new();
-        for &head in table.iter() {
-            let mut cur = head;
-            while !cur.is_null() {
-                unsafe {
-                    keys.push((*cur).raw);
-                    cur = (*cur).next;
-                }
-            }
-        }
-        keys
-    }
 }
 
 // ---- Drop: stop and join decode thread ----
@@ -2908,17 +2641,10 @@ impl Resettable for R4000Cache {
         self.dc.data_mut().fill(0);
         self.l2.tags_mut().fill(L2Tag::default());
         self.l2.data_mut().fill(0);
-        #[cfg(all(not(feature = "r5k"), not(feature = "gdc")))]
+        #[cfg(not(feature = "r5k"))]
         for s in self.l2.instrs.get_mut().iter_mut() { s.decoded = false; s.raw = 0; }
-        #[cfg(all(not(feature = "r5k"), feature = "gdc"))]
-        for s in self.ic_instrs.get_mut().iter_mut() { *s = std::ptr::null(); }
         #[cfg(feature = "r5k")]
-        for s in self.ic_instrs.get_mut().iter_mut() {
-            #[cfg(not(feature = "gdc"))]
-            { s.decoded = false; s.raw = 0; }
-            #[cfg(feature = "gdc")]
-            { *s = std::ptr::null(); }
-        }
+        for s in self.ic_instrs.get_mut().iter_mut() { s.decoded = false; s.raw = 0; }
         #[cfg(feature = "r5k")]
         unsafe {
             (*self.ic_lru.get()).fill(0u64);
@@ -3003,10 +2729,9 @@ impl R4000Cache {
         let dl = l2_data.len().min(L2_SIZE / 8);
         self.l2.data_mut()[..dl].copy_from_slice(&l2_data[..dl]);
 
-        // R4K non-gdc: rebuild l2.instrs from restored l2.data; fetch() indexes it directly.
-        // R4K gdc: no l2.instrs — fetch() reads from l2.data on every access, nothing to rebuild.
+        // R4K: rebuild l2.instrs from restored l2.data; fetch() indexes it directly.
         // R5K: l2.instrs is empty; ic_instrs will be repopulated on next L1I miss.
-        #[cfg(all(not(feature = "r5k"), not(feature = "gdc")))]
+        #[cfg(not(feature = "r5k"))]
         {
             let l2_data_slice = self.l2.data();
             let l2_instrs = self.l2.instrs.get_mut();
@@ -3022,10 +2747,6 @@ impl R4000Cache {
                 }
             }
         }
-
-        // R4K + gdc: null ic_instrs; will be repopulated by fill_l1i_line on next L1I miss.
-        #[cfg(all(not(feature = "r5k"), feature = "gdc"))]
-        for s in self.ic_instrs.get_mut().iter_mut() { *s = std::ptr::null(); }
 
         // R5K: restore LRU bits; ic_instrs will be repopulated on first fetch miss.
         #[cfg(feature = "r5k")]

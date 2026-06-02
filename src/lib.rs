@@ -75,8 +75,6 @@ pub mod camera;
 pub mod saa7191;
 pub mod video_source;
 pub mod vino;
-#[cfg(feature = "gdc")]
-pub mod decode_cache_profile;
 #[cfg(feature = "jit")]
 pub mod jit;
 #[cfg(feature = "rex-jit")]
