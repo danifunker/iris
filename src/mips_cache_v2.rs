@@ -1054,8 +1054,6 @@ impl R4000Cache {
     }
 
     /// Extract virtual index bits [14:12] for L2 PIdx field
-    #[inline]
-    /// Read LRU bit for `set` from a packed u64 bitmap.
     #[cfg(feature = "r5k")]
     #[inline(always)]
     unsafe fn lru_get(bm: *const Box<[u64]>, set: usize) -> bool {
