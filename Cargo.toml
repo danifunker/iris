@@ -57,10 +57,12 @@ rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelif
 # Off by default — enable with `cargo build --features chd`.
 chd = ["dep:libchdman-rs"]
 # Live host camera capture as the VINO video source (phase 3 of IndyCam
-# emulation).  Uses nokhwa with AVFoundation on macOS.  Off by default —
-# enable with `cargo build --features camera`.  First run on macOS will
-# trigger the system camera permission dialog.
-camera = ["dep:nokhwa"]
+# emulation).  Platform backends:
+#   macOS   — nokhwa AVFoundation (dep:nokhwa)
+#   Linux   — v4l crate directly (dep:v4l); requires libv4l-dev at build time
+#   Windows — nokhwa MediaFoundation (dep:nokhwa)
+# Off by default — enable with `cargo build --features camera`.
+camera = ["dep:nokhwa", "dep:v4l"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -93,7 +95,16 @@ cranelift-module     = { version = "0.116", optional = true }
 cranelift-native     = { version = "0.116", optional = true }
 target-lexicon       = { version = "0.13",  optional = true }
 libchdman-rs = { version = "0.287.0-l7", features = ["prebuilt"], optional = true }
-nokhwa       = { version = "0.10", features = ["input-avfoundation"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nokhwa = { version = "0.10", features = ["input-avfoundation"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nokhwa = { version = "0.10", optional = true }
+v4l    = { version = "0.14", features = ["v4l2-sys"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nokhwa = { version = "0.10", features = ["input-msmf"], optional = true }
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"

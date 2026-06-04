@@ -1396,6 +1396,12 @@ impl Device for Vino {
 
                 writeln!(writer, "VINO Status  (debug {})", if log { "on" } else { "off" })
                     .map_err(|e| e.to_string())?;
+
+                let src_status = self.source.lock()
+                    .as_ref()
+                    .map(|s| s.status())
+                    .unwrap_or_else(|| "no source installed".to_string());
+                writeln!(writer, "  source: {}", src_status).map_err(|e| e.to_string())?;
                 writeln!(writer, "  REV_ID      = {:#010x}  (chip_id={:#x} rev={})",
                     st.rev_id, (st.rev_id >> 4) & 0xF, st.rev_id & 0xF)
                     .map_err(|e| e.to_string())?;

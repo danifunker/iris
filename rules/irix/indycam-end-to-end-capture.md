@@ -2,12 +2,12 @@
 
 **Keywords:** vino, indycam, vidtomem, vlinfo, capture, camera, end-to-end, campaign
 **Category:** vino, irix
-**Status:** Working as of commits `d1808b9` through `e72ba22` on IRIX 5.3 for
-Indy with `iris --features chd,camera,lightning`. `vidtomem -f /tmp/cap -v 0`
-inside the guest now produces a 640×480 RGB SGI-format frame from the host
-camera (when `[vino] source = "camera"` in `iris.toml`) or from the
-test-pattern source (when `source = "test_pattern"`). One known visual
-artifact — see "Open issues" below.
+**Status:** Working on both IRIX 5.3 and 6.5 (PR #28, commit `751a566`).
+`vidtomem -f /tmp/cap -v 0` produces a 640×480 RGB frame. Still-image capture
+in the media capture GUI app also works. Movie/continuous capture does not yet
+work (multi-buffer DMA ring not fully supported). Linux V4L2 camera backend
+(`camera_v4l.rs`) confirmed working end-to-end on Linux with Huddly GO.
+One known visual artifact — see "Open issues" below.
 
 ## The path that finally works
 

@@ -58,6 +58,8 @@ pub struct Field {
 pub trait VideoSource: Send + Sync {
     fn standard(&self) -> VideoStandard;
     fn next_field(&self) -> Field;
+    /// One-line status string for the monitor `vino status` command.
+    fn status(&self) -> String { "no status available".to_string() }
 }
 
 // ─── Black source: emits solid black fields at the standard's field rate ─────
