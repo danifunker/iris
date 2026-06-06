@@ -291,6 +291,7 @@ impl TracebackBuffer {
     }
 }
 
+#[cfg(feature = "idle-pause")]
 /// Per-PC sampling counters: total times this PC was the about-to-execute PC,
 /// and how many of those had CPU interrupts enabled (IE=1, EXL=ERL=0).
 #[derive(Clone, Copy, Default)]
@@ -309,6 +310,7 @@ struct IdleSample {
 ///   cpu stop; idleprof on; cont    # let the guest sit at an idle prompt
 ///   cpu stop; idleprof report      # dump the hottest PCs + IE%
 ///
+#[cfg(feature = "idle-pause")]
 /// The idle loop shows up as a small cluster of contiguous PCs that together
 /// dominate the samples with ie% == 100.
 #[derive(Default)]
@@ -322,6 +324,7 @@ struct IdleProfiler {
     hist: std::collections::HashMap<u64, IdleSample>,
 }
 
+#[cfg(feature = "idle-pause")]
 impl IdleProfiler {
     #[inline(always)]
     fn sample(&mut self, pc: u64, ie: bool) {
@@ -600,17 +603,13 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     #[cfg(feature = "developer")]
     pending_memory_writes: Vec<MemoryWrite>,
     traceback: TracebackBuffer,
-    /// PC-sampling histogram for locating spin/idle loops. Inert unless armed.
+    #[cfg(feature = "idle-pause")]
     idle_profiler: IdleProfiler,
-    /// Lock-free arm flag for the idle profiler. Held as an Arc so the CPU
-    /// wrapper can toggle it WITHOUT taking the executor lock (i.e. without
-    /// pausing/resuming the CPU, which corrupts a live IRIX kernel). Read every
-    /// step via `idle_profile_on_ptr` to keep the disabled path branch-only.
+    #[cfg(feature = "idle-pause")]
     pub idle_profile_on: Arc<AtomicBool>,
-    /// Lock-free reset request. Set when arming; the CPU thread clears the
-    /// histogram on its next step and unsets this. Avoids needing the lock to
-    /// reset stale samples.
+    #[cfg(feature = "idle-pause")]
     pub idle_profile_reset: Arc<AtomicBool>,
+    #[cfg(feature = "idle-pause")]
     idle_profile_on_ptr: *const AtomicBool,
     pub symbols: Arc<Mutex<SymbolTable>>,
     pub breakpoints: Vec<Breakpoint>,
@@ -785,9 +784,13 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             #[cfg(feature = "developer")]
             pending_memory_writes: Vec::new(),
             traceback: TracebackBuffer::new(),
+            #[cfg(feature = "idle-pause")]
             idle_profiler: IdleProfiler::default(),
+            #[cfg(feature = "idle-pause")]
             idle_profile_on: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "idle-pause")]
             idle_profile_reset: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "idle-pause")]
             idle_profile_on_ptr: std::ptr::null(),
             symbols: Arc::new(Mutex::new(SymbolTable::new())),
             breakpoints: vec![Breakpoint {
@@ -830,7 +833,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         self.cycles_ptr     = Arc::as_ptr(&self.core.cycles);
         self.interrupts_ptr = Arc::as_ptr(&self.core.interrupts);
         self.fasttick_ptr   = Arc::as_ptr(&self.core.fasttick_count);
-        self.idle_profile_on_ptr = Arc::as_ptr(&self.idle_profile_on);
+        #[cfg(feature = "idle-pause")]
+        { self.idle_profile_on_ptr = Arc::as_ptr(&self.idle_profile_on); }
     }
 
     /// Install the CP0 Status change callback pointing at this executor.
@@ -973,6 +977,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // Spin/idle-loop PC sampler. Armed lock-free via the shared atomic, so
         // the CPU is never paused/resumed to enable it (resuming corrupts a
         // live kernel). Inert (one relaxed load + branch) when disarmed.
+        #[cfg(feature = "idle-pause")]
         if unsafe { &*self.idle_profile_on_ptr }.load(Ordering::Relaxed) {
             if self.idle_profile_reset.load(Ordering::Relaxed) {
                 self.idle_profiler.reset();
@@ -4756,10 +4761,9 @@ pub struct MipsCpu<T: Tlb, C: MipsCache> {
     debug: Arc<AtomicBool>,
     exception_mask: Arc<AtomicU32>,
     trace_file: Arc<Mutex<Option<std::io::BufWriter<std::fs::File>>>>,
-    /// Shared with the executor: lock-free idle-profiler arm + reset flags.
-    /// Toggling these does NOT require the executor lock, so the CPU is never
-    /// paused/resumed to arm the profiler (resuming corrupts a live kernel).
+    #[cfg(feature = "idle-pause")]
     idle_profile_on: Arc<AtomicBool>,
+    #[cfg(feature = "idle-pause")]
     idle_profile_reset: Arc<AtomicBool>,
 }
 
@@ -4768,7 +4772,9 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         let cycles = executor.core.cycles.clone();
         let interrupts = executor.core.interrupts.clone();
         let fasttick_count = executor.core.fasttick_count.clone();
+        #[cfg(feature = "idle-pause")]
         let idle_profile_on = executor.idle_profile_on.clone();
+        #[cfg(feature = "idle-pause")]
         let idle_profile_reset = executor.idle_profile_reset.clone();
 
         let executor_arc = Arc::new(Mutex::new(executor));
@@ -4784,7 +4790,9 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
             debug: Arc::new(AtomicBool::new(false)),
             exception_mask: Arc::new(AtomicU32::new(0)),
             trace_file: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "idle-pause")]
             idle_profile_on,
+            #[cfg(feature = "idle-pause")]
             idle_profile_reset,
         }
     }
@@ -4792,12 +4800,14 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
     /// Arm the idle-loop PC sampler without taking the executor lock (so the
     /// running CPU is never paused/resumed). Requests a histogram reset which
     /// the CPU thread performs on its next step.
+    #[cfg(feature = "idle-pause")]
     pub fn idle_profile_arm(&self) {
         self.idle_profile_reset.store(true, Ordering::SeqCst);
         self.idle_profile_on.store(true, Ordering::SeqCst);
     }
 
     /// Disarm the sampler (lock-free).
+    #[cfg(feature = "idle-pause")]
     pub fn idle_profile_disarm(&self) {
         self.idle_profile_on.store(false, Ordering::SeqCst);
     }
@@ -6281,13 +6291,11 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 }
                 Ok(())
             }
+            #[cfg(feature = "idle-pause")]
             "idleprof" => {
                 let sub = actual_args.first().copied().unwrap_or("report");
                 match sub {
                     "on" => {
-                        // Lock-free: arms without pausing the CPU. Let the guest
-                        // idle, then `cpu stop` and `idleprof report`. No resume
-                        // needed (resuming a live kernel corrupts it).
                         self.idle_profile_arm();
                         writeln!(writer, "idleprof: armed (lock-free, histogram reset). Let the guest idle, then `stop; idleprof report`.").unwrap();
                     }
@@ -6314,6 +6322,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// Dump the hottest sampled PCs and flag a likely idle-loop region: the
     /// smallest contiguous PC window (<=256 bytes) of always-interrupts-enabled
     /// samples that together account for the bulk of execution.
+    #[cfg(feature = "idle-pause")]
     pub fn idle_profile_report(&mut self, top: usize, writer: &mut dyn Write) {
         let total = self.idle_profiler.total;
         if total == 0 {

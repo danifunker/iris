@@ -1044,9 +1044,11 @@ pub struct Rex3 {
     /// True while the REX3-Processor thread is parked on an empty gfifo. The
     /// producer (`gfifo_push`) checks this and unparks the consumer so a fresh
     /// command is picked up immediately instead of after the park timeout.
+    #[cfg(feature = "idle-pause")]
     processor_parked: AtomicBool,
     /// Handle to the REX3-Processor thread, set once when it starts, used by
     /// `gfifo_push` to unpark it. OnceLock gives lock-free reads on the hot path.
+    #[cfg(feature = "idle-pause")]
     processor_unparker: std::sync::OnceLock<thread::Thread>,
     /// Set by the gfifo consumer whenever it processes activity that may have
     /// changed the framebuffer. The refresh thread renders only when this (or a
@@ -1206,7 +1208,9 @@ impl Rex3 {
             gfxbusy: Arc::new(AtomicBool::new(false)),
             processor_thread: Mutex::new(None),
             refresh_thread: Mutex::new(None),
+            #[cfg(feature = "idle-pause")]
             processor_parked: AtomicBool::new(false),
+            #[cfg(feature = "idle-pause")]
             processor_unparker: std::sync::OnceLock::new(),
             fb_dirty: AtomicBool::new(true),
             screen,
@@ -2918,6 +2922,7 @@ impl Rex3 {
         // Wake the consumer if it parked on an empty fifo (idle desktop). Cheap
         // on the hot path: a relaxed-ish load that is false whenever the
         // processor is actively draining.
+        #[cfg(feature = "idle-pause")]
         if self.processor_parked.load(Ordering::Acquire) {
             if let Some(t) = self.processor_unparker.get() {
                 t.unpark();
@@ -3024,6 +3029,7 @@ impl Rex3 {
 
     fn register_processor(&self) {
         // Publish our thread handle so gfifo_push can unpark us when we park.
+        #[cfg(feature = "idle-pause")]
         let _ = self.processor_unparker.set(thread::current());
         let backoff = crossbeam_utils::Backoff::new();
         let mut is_busy = false;
@@ -3094,6 +3100,7 @@ impl Rex3 {
                 // yield_now() and actually park. An idle IRIX desktop leaves this
                 // fifo empty indefinitely, so without parking this thread pins a
                 // CPU at ~100%.
+                #[cfg(feature = "idle-pause")]
                 if backoff.is_completed() {
                     // Set parked BEFORE the final emptiness re-check so a racing
                     // gfifo_push either (a) is seen by the peek below, or (b) sees
@@ -3107,9 +3114,9 @@ impl Rex3 {
                     }
                     self.processor_parked.store(false, Ordering::Release);
                     backoff.reset();
-                } else {
-                    backoff.snooze();
-                }
+                } else { backoff.snooze(); }
+                #[cfg(not(feature = "idle-pause"))]
+                backoff.snooze();
             }
         }
     }
