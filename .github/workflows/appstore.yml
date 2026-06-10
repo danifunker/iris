@@ -47,15 +47,149 @@ env:
   BUNDLE_ID: io.github.danifunker.iris
 
 jobs:
+  # ── Preflight: validate secrets/certs BEFORE the ~15 min of builds ───────────
+  # Imports both distribution certs into a throwaway keychain and proves each
+  # one is a usable *identity* (cert + private key), checks the provisioning
+  # profile parses, and checks the App Store Connect API key — failing in ~1 min
+  # instead of after the arm64/x64 builds if a secret is wrong.
+
+  preflight:
+    name: Preflight (validate App Store secrets)
+    runs-on: macos-latest
+    steps:
+      - name: Verify certificates, provisioning profile, and API key
+        env:
+          APP_STORE_APP_CERT: ${{ secrets.APP_STORE_APP_CERT }}
+          APP_STORE_APP_CERT_PWD: ${{ secrets.APP_STORE_APP_CERT_PWD }}
+          APP_STORE_INSTALLER_CERT: ${{ secrets.APP_STORE_INSTALLER_CERT }}
+          APP_STORE_INSTALLER_CERT_PWD: ${{ secrets.APP_STORE_INSTALLER_CERT_PWD }}
+          APP_STORE_PROVISIONING_PROFILE: ${{ secrets.APP_STORE_PROVISIONING_PROFILE }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          fail=0
+          K="$RUNNER_TEMP/preflight.keychain-db"
+          KP=$(openssl rand -base64 24)
+          security create-keychain -p "$KP" "$K"
+          security set-keychain-settings -lut 3600 "$K"
+          security unlock-keychain -p "$KP" "$K"
+
+          # Decode + import a base64 .p12. rc: 0/1 imported, 2 empty, 3 bad base64.
+          import_p12() {
+            local b64="$1" pwd="$2"
+            [ -z "$b64" ] && return 2
+            local f="$RUNNER_TEMP/pf_$RANDOM.p12"
+            echo "$b64" | base64 --decode > "$f" 2>/dev/null || { rm -f "$f"; return 3; }
+            [ -s "$f" ] || { rm -f "$f"; return 3; }
+            security import "$f" -P "$pwd" -A -t cert -f pkcs12 -k "$K" >/dev/null 2>&1
+            local rc=$?; rm -f "$f"; return $rc
+          }
+
+          import_p12 "$APP_STORE_APP_CERT" "$APP_STORE_APP_CERT_PWD"
+          case $? in 2) echo "::error::APP_STORE_APP_CERT is empty"; fail=1;; 3) echo "::error::APP_STORE_APP_CERT is not valid base64"; fail=1;; esac
+
+          import_p12 "$APP_STORE_INSTALLER_CERT" "$APP_STORE_INSTALLER_CERT_PWD"
+          case $? in 2) echo "::error::APP_STORE_INSTALLER_CERT is empty"; fail=1;; 3) echo "::error::APP_STORE_INSTALLER_CERT is not valid base64"; fail=1;; esac
+
+          security set-key-partition-list -S apple-tool:,apple: -k "$KP" "$K" >/dev/null 2>&1 || true
+
+          echo "── Identities (certificate + private key) in keychain ──"
+          security find-identity "$K" || true
+          echo "────────────────────────────────────────────────────────"
+
+          # Distinguish "usable identity" vs "cert without key" vs "absent".
+          check_identity() {  # $1 pattern  $2 human name  $3 secret name
+            if security find-identity "$K" | grep -q "$1"; then
+              echo "✅ $2: usable identity (certificate + private key present)."
+            elif security find-certificate -a -c "$1" "$K" >/dev/null 2>&1; then
+              echo "::error::$2: the certificate is present but has NO private key. $3 must be the *identity* exported from Keychain Access — expand the certificate's disclosure triangle, select the cert WITH the private key under it, and Export as .p12. A plain .cer has no key."
+              fail=1
+            else
+              echo "::error::$2: certificate not found in the keychain at all — wrong .p12 in $3, wrong ${3}_PWD, or bad base64."
+              fail=1
+            fi
+          }
+          check_identity "3rd Party Mac Developer Application" "Application (app signing)" "APP_STORE_APP_CERT"
+          check_identity "3rd Party Mac Developer Installer"   "Installer (productbuild)"  "APP_STORE_INSTALLER_CERT"
+
+          # SHA-1 of the cert we sign the .app with — must appear in the profile.
+          APP_SHA=$(security find-identity "$K" | grep "3rd Party Mac Developer Application" | head -1 | awk '{print $2}')
+          security delete-keychain "$K" >/dev/null 2>&1 || true
+
+          PP="$RUNNER_TEMP/pf.provisionprofile"
+          echo "$APP_STORE_PROVISIONING_PROFILE" | base64 --decode > "$PP" 2>/dev/null || true
+          if [ ! -s "$PP" ]; then
+            echo "::error::APP_STORE_PROVISIONING_PROFILE is empty or not valid base64."
+            fail=1
+          else
+            sz=$(wc -c < "$PP" | tr -d ' ')
+            echo "Provisioning profile: ${sz} bytes; first bytes: $(xxd -l 8 -p "$PP" 2>/dev/null)"
+            # The build only base64-decodes + embeds the profile (no parsing), so
+            # accept it if it decodes to a real provisioning profile. Prefer the
+            # signed-CMS decode; fall back to grepping the embedded plist (the
+            # profile's plist is plaintext inside the CMS envelope).
+            if PLIST=$(security cms -D -i "$PP" 2>/dev/null) && [ -n "$PLIST" ]; then
+              NAME=$(printf '%s' "$PLIST" | plutil -extract Name raw - 2>/dev/null || echo "?")
+              echo "✅ Provisioning profile parses (Name: ${NAME})."
+              # The .app's executable must be signed with a cert that is embedded
+              # in the profile (App Store rejects a mismatch). Compare SHA-1s.
+              printf '%s' "$PLIST" > "$RUNNER_TEMP/pp.plist"
+              PROF_SHAS=$(python3 -c "import plistlib,hashlib,sys; d=plistlib.load(open(sys.argv[1],'rb')); print(chr(10).join(hashlib.sha1(bytes(c)).hexdigest().upper() for c in d.get('DeveloperCertificates',[])))" "$RUNNER_TEMP/pp.plist")
+              echo "Profile certificate SHA-1(s): $(echo "$PROF_SHAS" | tr '\n' ' ')"
+              if [ -n "$APP_SHA" ] && echo "$PROF_SHAS" | grep -qi "$APP_SHA"; then
+                echo "✅ Signing certificate ($APP_SHA) is present in the provisioning profile."
+              else
+                echo "::error::The provisioning profile does NOT contain your app-signing certificate (3rd Party Mac Developer Application, ${APP_SHA}). The profile references a different cert (likely 'Apple Distribution'). Regenerate the Mac App Store profile at developer.apple.com selecting the '3rd Party Mac Developer Application' certificate, then re-encode it into APP_STORE_PROVISIONING_PROFILE."
+                fail=1
+              fi
+              rm -f "$RUNNER_TEMP/pp.plist"
+            elif grep -qa "ProvisionedDevices\|AppIDName\|TeamIdentifier\|com.apple.application-identifier" "$PP"; then
+              echo "✅ Provisioning profile decodes and contains profile markers."
+            else
+              echo "::error::APP_STORE_PROVISIONING_PROFILE decoded to ${sz} bytes but is not a provisioning profile (no profile markers). Likely the wrong file, a base64-of-base64, or a .mobileprovision saved as text. Download the Mac App Store provisioning profile (.provisionprofile) for App ID ${BUNDLE_ID} from developer.apple.com and re-encode it with: base64 -i profile.provisionprofile | pbcopy"
+              fail=1
+            fi
+          fi
+          rm -f "$PP"
+
+          [ -n "$APP_STORE_CONNECT_KEY_ID" ]    && echo "✅ APP_STORE_CONNECT_KEY_ID set"    || { echo "::error::APP_STORE_CONNECT_KEY_ID is empty"; fail=1; }
+          [ -n "$APP_STORE_CONNECT_ISSUER_ID" ] && echo "✅ APP_STORE_CONNECT_ISSUER_ID set" || { echo "::error::APP_STORE_CONNECT_ISSUER_ID is empty"; fail=1; }
+          if echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode 2>/dev/null | grep -q "PRIVATE KEY"; then
+            echo "✅ APP_STORE_CONNECT_PRIVATE_KEY is a .p8 private key"
+            # Smoke-test the API key end to end — altool finds the key as
+            # AuthKey_<KEYID>.p8 under ~/.appstoreconnect/private_keys (there is
+            # no --apiPrivateKeyPath flag). --list-providers authenticates via
+            # JWT without needing a .pkg, so a bad key/issuer fails here in ~1 min.
+            if [ -n "$APP_STORE_CONNECT_KEY_ID" ] && [ -n "$APP_STORE_CONNECT_ISSUER_ID" ]; then
+              mkdir -p "$HOME/.appstoreconnect/private_keys"
+              KEYF="$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+              echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode > "$KEYF"
+              if xcrun altool --list-providers --apiKey "$APP_STORE_CONNECT_KEY_ID" --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID" >/dev/null 2>&1; then
+                echo "✅ App Store Connect API key authenticates."
+              else
+                echo "::error::App Store Connect API key failed to authenticate. Verify APP_STORE_CONNECT_KEY_ID + APP_STORE_CONNECT_ISSUER_ID match the .p8 in APP_STORE_CONNECT_PRIVATE_KEY (Users and Access → Integrations → App Store Connect API)."
+                fail=1
+              fi
+              rm -f "$KEYF"
+            fi
+          else echo "::error::APP_STORE_CONNECT_PRIVATE_KEY is not a base64-encoded .p8 private key."; fail=1; fi
+
+          if [ "$fail" != "0" ]; then
+            echo ""; echo "Preflight FAILED — fix the secrets above; the builds were skipped to save time."; exit 1
+          fi
+          echo ""; echo "Preflight passed ✅ — certs, provisioning profile, and API key all look good."
+
   # ── Build arm64 ─────────────────────────────────────────────────────────────
 
   build-arm64:
     name: Build arm64
+    needs: preflight
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.build_branch || github.ref_name }}
+          ref: ${{ github.event.inputs.build_branch || vars.BUILD_BRANCH || 'build-pipeline-danifunker' }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -71,13 +205,13 @@ jobs:
             target
           key: macos-aarch64-appstore-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build iris-gui (lightning + CHD)
+      - name: Build iris-gui (lightning + CHD, App Store)
         run: |
           cargo build --release --target aarch64-apple-darwin -p iris-gui \
-            --features iris/lightning
+            --features iris/lightning,appstore
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: iris-gui-arm64
           path: target/aarch64-apple-darwin/release/iris-gui
@@ -86,11 +220,12 @@ jobs:
 
   build-x64:
     name: Build x64
+    needs: preflight
     runs-on: macos-26-intel
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.build_branch || github.ref_name }}
+          ref: ${{ github.event.inputs.build_branch || vars.BUILD_BRANCH || 'build-pipeline-danifunker' }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -106,13 +241,13 @@ jobs:
             target
           key: macos-x86_64-appstore-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build iris-gui (lightning + CHD)
+      - name: Build iris-gui (lightning + CHD, App Store)
         run: |
           cargo build --release --target x86_64-apple-darwin -p iris-gui \
-            --features iris/lightning
+            --features iris/lightning,appstore
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: iris-gui-x64
           path: target/x86_64-apple-darwin/release/iris-gui
@@ -128,16 +263,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.build_branch || github.ref_name }}
+          ref: ${{ github.event.inputs.build_branch || vars.BUILD_BRANCH || 'build-pipeline-danifunker' }}
 
       - name: Generate version
         id: version
         run: |
           VERSION=$(date -u +"%Y-%m-%d-%H-%M")
+          # App Store requires numeric integers separated by dots (e.g. 20250609.0200)
+          BUNDLE_VERSION=$(echo "$VERSION" | sed 's/\([0-9]*\)-\([0-9]*\)-\([0-9]*\)-\([0-9]*\)-\([0-9]*\)/\1\2\3.\4\5/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "bundle_version=$BUNDLE_VERSION" >> $GITHUB_OUTPUT
 
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: bins
 
@@ -180,12 +318,30 @@ jobs:
         id: identities
         run: |
           KEYCHAIN=$RUNNER_TEMP/appstore.keychain-db
+          # List every identity (cert+key pair) that imported. Both the App and
+          # Installer distribution identities must appear here.
+          echo "Identities in keychain:"
+          security find-identity "$KEYCHAIN" || true
+
           APP_ID=$(security find-identity -v -p codesigning "$KEYCHAIN" \
             | grep "3rd Party Mac Developer Application" | head -1 \
             | sed 's/.*"\(.*\)".*/\1/')
-          INSTALLER_ID=$(security find-identity -v "$KEYCHAIN" \
+          # The installer (Mac Installer Distribution) cert isn't valid for the
+          # codesigning policy, so use the unfiltered list. It only shows up if
+          # the .p12 contained the certificate AND its private key.
+          INSTALLER_ID=$(security find-identity "$KEYCHAIN" \
             | grep "3rd Party Mac Developer Installer" | head -1 \
             | sed 's/.*"\(.*\)".*/\1/')
+
+          if [ -z "$APP_ID" ]; then
+            echo "::error::No '3rd Party Mac Developer Application' identity in the keychain. APP_STORE_APP_CERT must be a base64 .p12 containing that certificate and its private key."
+            exit 1
+          fi
+          if [ -z "$INSTALLER_ID" ]; then
+            echo "::error::No '3rd Party Mac Developer Installer' identity in the keychain. APP_STORE_INSTALLER_CERT must be a base64 .p12 that contains the Mac Installer Distribution certificate AND its private key — export the *identity* from Keychain Access (the row with a disclosure triangle hiding a private key), not just the certificate. Also confirm APP_STORE_INSTALLER_CERT_PWD matches the export password."
+            exit 1
+          fi
+
           echo "app_identity=$APP_ID" >> $GITHUB_OUTPUT
           echo "installer_identity=$INSTALLER_ID" >> $GITHUB_OUTPUT
           echo "App identity:       $APP_ID"
@@ -195,6 +351,7 @@ jobs:
         env:
           APP_STORE_PROVISIONING_PROFILE: ${{ secrets.APP_STORE_PROVISIONING_PROFILE }}
           VER: ${{ steps.version.outputs.version }}
+          BUNDLE_VER: ${{ steps.version.outputs.bundle_version }}
         run: |
           BUNDLE="IRIS.app"
           mkdir -p "${BUNDLE}/Contents/MacOS" "${BUNDLE}/Contents/Resources"
@@ -215,14 +372,22 @@ jobs:
             <key>CFBundleName</key><string>IRIS</string>
             <key>CFBundleDisplayName</key><string>IRIS</string>
             <key>CFBundleIdentifier</key><string>${{ env.BUNDLE_ID }}</string>
-            <key>CFBundleVersion</key><string>${VER}</string>
-            <key>CFBundleShortVersionString</key><string>${VER}</string>
+            <key>CFBundleVersion</key><string>${BUNDLE_VER}</string>
+            <key>CFBundleShortVersionString</key><string>${BUNDLE_VER}</string>
             <key>CFBundleExecutable</key><string>iris-gui</string>
             <key>CFBundleIconFile</key><string>AppIcon.icns</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>NSHighResolutionCapable</key><true/>
             <key>LSMinimumSystemVersion</key><string>10.13</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
             <key>NSCameraUsageDescription</key><string>Provides the IndyCam video input for SGI Indy emulation (VINO device).</string>
+            <!-- Export compliance: the shipping app uses no non-exempt
+                 encryption. Its own network path is plaintext (src/registry.rs
+                 is explicitly no-TLS); the only TLS-capable crates (rustls/ring)
+                 are BUILD-time deps of libchdman-rs's downloader and are not in
+                 the runtime binary. Setting this false suppresses the per-build
+                 export-compliance question in App Store Connect. -->
+            <key>ITSAppUsesNonExemptEncryption</key><false/>
           </dict>
           </plist>
           PLIST
@@ -255,14 +420,17 @@ jobs:
           APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
           APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
         run: |
-          echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode > /tmp/asc_key.p8
+          # altool locates the key by convention: AuthKey_<KEYID>.p8 under
+          # ~/.appstoreconnect/private_keys (it has no --apiPrivateKeyPath flag).
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          KEYF="$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+          echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode > "$KEYF"
           xcrun altool --validate-app \
             --type osx \
             --file "IRIS-appstore-${VER}.pkg" \
             --apiKey    "$APP_STORE_CONNECT_KEY_ID" \
-            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID" \
-            --apiPrivateKeyPath /tmp/asc_key.p8
-          rm /tmp/asc_key.p8
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+          rm -f "$KEYF"
 
       - name: Submit to App Store Connect
         if: ${{ github.event.inputs.validate_only != 'true' }}
@@ -272,18 +440,19 @@ jobs:
           APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
           APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
         run: |
-          echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode > /tmp/asc_key.p8
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          KEYF="$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+          echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode > "$KEYF"
           xcrun altool --upload-app \
             --type osx \
             --file "IRIS-appstore-${VER}.pkg" \
             --apiKey    "$APP_STORE_CONNECT_KEY_ID" \
-            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID" \
-            --apiPrivateKeyPath /tmp/asc_key.p8
-          rm /tmp/asc_key.p8
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+          rm -f "$KEYF"
           echo "Submitted. Check App Store Connect for processing status."
 
       - name: Upload .pkg as artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: IRIS-appstore-${{ steps.version.outputs.version }}
           path: IRIS-appstore-${{ steps.version.outputs.version }}.pkg
