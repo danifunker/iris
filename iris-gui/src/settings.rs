@@ -37,6 +37,14 @@ pub struct GuiSettings {
     /// of the new machine-store world.
     #[serde(default)]
     pub last_config: Option<PathBuf>,
+
+    /// macOS App Sandbox security-scoped bookmarks, keyed by the absolute file
+    /// path they re-grant access to (disk image, PROM, ISO, NFS dir, …). Minted
+    /// at save time and resolved at startup so user-selected files reopen across
+    /// launches under the Mac App Store sandbox. Empty / unused everywhere else.
+    /// See [`crate::macos_sandbox`].
+    #[serde(default)]
+    pub bookmarks: BTreeMap<String, Vec<u8>>,
 }
 
 /// Allowed UI-scale range, shared by the View-menu slider, the Ctrl +/-/0
@@ -71,7 +79,17 @@ impl GuiSettings {
         s
     }
 
-    pub fn save(&self) -> Result<(), String> {
+    pub fn save(&mut self) -> Result<(), String> {
+        // Refresh macOS security-scoped bookmarks for every machine's reachable
+        // files so they reopen under the App Sandbox next launch. No-op off the
+        // Mac App Store build.
+        let paths: Vec<String> = self
+            .machines
+            .values()
+            .flat_map(crate::macos_sandbox::config_paths)
+            .collect();
+        crate::macos_sandbox::harvest(paths.iter().map(String::as_str), &mut self.bookmarks);
+
         let path = Self::config_path().ok_or("no config dir")?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;

@@ -3,6 +3,13 @@ name = "iris-gui"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Mac App Store distribution build. Activates sandbox-only behaviour: macOS
+# security-scoped bookmarks (see src/macos_sandbox.rs) and hiding developer-only
+# affordances. Unused outside the App Store build but kept here so the gated
+# code compiles cleanly everywhere.
+appstore = []
+
 [dependencies]
 # Group A (additive) features are always on for iris-gui so the user can
 # enable them at runtime via the config UI: chd (.chd disk paths), camera
@@ -24,6 +31,16 @@ toml = "0.8"
 dirs = "5"
 log = "0.4"
 env_logger = "0.10"
+
+# macOS App Sandbox: NSURL security-scoped bookmarks let the App Store build
+# reopen user-selected disk images / PROMs / ISOs across launches. These crates
+# are already in the build graph (eframe/winit/rfd pull them in); we enable a
+# few extra type features and use them only under `feature = "appstore"`.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSURL", "NSData", "NSError", "NSString", "NSArray",
+] }
 
 [[bin]]
 name = "iris-gui"

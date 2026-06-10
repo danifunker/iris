@@ -1,0 +1,189 @@
+//! macOS App Sandbox security-scoped bookmarks (Mac App Store build).
+//!
+//! Under the App Sandbox the app may only touch files the user explicitly hands
+//! it through an NSOpenPanel/NSSavePanel. That grant lasts only for the current
+//! launch: the absolute paths we persist in `gui.json` (disk images, PROM, ISOs,
+//! an NFS export directory, …) are *not* reachable on the next launch.
+//!
+//! The fix is the standard one: at save time we mint a **security-scoped
+//! bookmark** for every file we can currently reach ([`harvest`]) and stash the
+//! bytes in [`GuiSettings`](crate::settings::GuiSettings). On the next launch we
+//! resolve each bookmark and call `startAccessingSecurityScopedResource`
+//! ([`restore`]) before any machine can start.
+//!
+//! We deliberately never call `stopAccessingSecurityScopedResource`: the
+//! emulator needs the backing files for the whole session, so access is held
+//! until the process exits. The number of held resources equals the number of
+//! attached files (a handful), so the kernel-resource cost is negligible.
+//!
+//! Everything here is a no-op off macOS and off the `appstore` feature — the
+//! regular notarized builds are not sandboxed and open paths directly.
+
+use iris::config::MachineConfig;
+use std::collections::BTreeMap;
+use std::path::Path;
+
+/// Absolute, currently-existing file paths in `cfg` that are worth bookmarking.
+///
+/// Relative/default paths (`prom.bin`, `scsi1.raw`, `nvram.bin`) resolve inside
+/// the sandbox container, which is always accessible, so they're skipped — only
+/// user-chosen absolute paths outside the container need a bookmark.
+pub fn config_paths(cfg: &MachineConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut add = |p: &str| {
+        let path = Path::new(p);
+        if path.is_absolute() && path.exists() {
+            out.push(p.to_string());
+        }
+    };
+    add(&cfg.prom);
+    add(&cfg.nvram);
+    if let Some(s) = &cfg.serial_log {
+        add(s);
+    }
+    for dev in cfg.scsi.values() {
+        add(&dev.path);
+        for disc in &dev.discs {
+            add(disc);
+        }
+    }
+    if let Some(nfs) = &cfg.nfs {
+        add(&nfs.shared_dir);
+        add(&nfs.unfsd);
+    }
+    out
+}
+
+/// (Re)create a security-scoped bookmark for every reachable `path` and merge it
+/// into `bookmarks`. Paths we can't reach right now (typed by hand, nonexistent,
+/// or never user-selected) are left untouched — an existing bookmark is never
+/// dropped, so an inactive machine's images survive a save that can't see them.
+pub fn harvest<'a>(paths: impl IntoIterator<Item = &'a str>, bookmarks: &mut BTreeMap<String, Vec<u8>>) {
+    for path in paths {
+        if let Some(bytes) = imp::make_bookmark(path) {
+            bookmarks.insert(path.to_string(), bytes);
+        }
+    }
+}
+
+/// Resolve every stored bookmark and begin accessing it for the process
+/// lifetime. Call once at startup, after loading settings and before a machine
+/// can start. Stale/failed bookmarks are logged and skipped.
+pub fn restore(bookmarks: &BTreeMap<String, Vec<u8>>) {
+    for (path, bytes) in bookmarks {
+        let _ = imp::start_access(path, bytes);
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "appstore"))]
+mod imp {
+    use objc2_foundation::{
+        NSData, NSString, NSURL, NSURLBookmarkCreationOptions, NSURLBookmarkResolutionOptions,
+    };
+
+    /// Mint a security-scoped bookmark for `path`, or `None` if we don't
+    /// currently have access to it (so the caller keeps any prior bookmark).
+    pub fn make_bookmark(path: &str) -> Option<Vec<u8>> {
+        let ns_path = NSString::from_str(path);
+        let url = NSURL::fileURLWithPath(&ns_path);
+        match url.bookmarkDataWithOptions_includingResourceValuesForKeys_relativeToURL_error(
+            NSURLBookmarkCreationOptions::WithSecurityScope,
+            None,
+            None,
+        ) {
+            Ok(data) => Some(data.to_vec()),
+            Err(_) => None,
+        }
+    }
+
+    /// Resolve `bytes` back to a URL and start accessing it. Returns whether
+    /// access was granted. We never stop accessing — the file is needed for the
+    /// whole session (see module docs).
+    pub fn start_access(path: &str, bytes: &[u8]) -> bool {
+        let data = NSData::with_bytes(bytes);
+        // SAFETY: `data` is a valid NSData; null is an allowed `is_stale` out-ptr.
+        let url = unsafe {
+            NSURL::URLByResolvingBookmarkData_options_relativeToURL_bookmarkDataIsStale_error(
+                &data,
+                NSURLBookmarkResolutionOptions::WithSecurityScope,
+                None,
+                std::ptr::null_mut(),
+            )
+        };
+        match url {
+            // SAFETY: `url` came from resolving a security-scoped bookmark.
+            Ok(url) => unsafe { url.startAccessingSecurityScopedResource() },
+            Err(_) => {
+                log::warn!("sandbox: could not resolve security-scoped bookmark for {path}");
+                false
+            }
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "macos", feature = "appstore")))]
+mod imp {
+    pub fn make_bookmark(_path: &str) -> Option<Vec<u8>> {
+        None
+    }
+    pub fn start_access(_path: &str, _bytes: &[u8]) -> bool {
+        false
+    }
+}
+
+// Runtime verification of the Objective-C bookmark interop. Security-scoped
+// bookmarks are created/resolved fine *outside* the sandbox too (they just act
+// as ordinary bookmarks), so this exercises the real NSURL round-trip without
+// needing a signed/sandboxed build. The sandbox-only behaviour (access denied
+// without a bookmark) still has to be verified on a signed App Store build.
+#[cfg(all(test, target_os = "macos", feature = "appstore"))]
+mod tests {
+    use super::*;
+
+    fn temp_file(suffix: &str) -> String {
+        let p = std::env::temp_dir().join(format!(
+            "iris_sbtest_{}_{}{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            suffix
+        ));
+        std::fs::write(&p, b"\0\0\0\0").unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn bookmark_roundtrip() {
+        let path = temp_file(".bin");
+        let bytes = imp::make_bookmark(&path).expect("bookmark an accessible file");
+        assert!(!bytes.is_empty(), "bookmark bytes should be non-empty");
+        assert!(imp::start_access(&path, &bytes), "resolving a fresh bookmark should grant access");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn make_bookmark_missing_file_is_none() {
+        assert!(imp::make_bookmark("/nonexistent/iris/does/not/exist.raw").is_none());
+    }
+
+    #[test]
+    fn config_paths_harvest_restore() {
+        let path = temp_file(".raw");
+        let mut cfg = MachineConfig::default();
+        cfg.scsi.get_mut(&1).unwrap().path = path.clone();
+        cfg.prom = "prom.bin".into(); // relative → skipped
+
+        let paths = config_paths(&cfg);
+        assert!(paths.contains(&path), "absolute scsi image should be collected");
+        assert!(!paths.iter().any(|p| p == "prom.bin"), "relative paths should be skipped");
+
+        let mut bm = BTreeMap::new();
+        harvest(paths.iter().map(String::as_str), &mut bm);
+        assert!(bm.contains_key(&path), "accessible image should be bookmarked");
+
+        restore(&bm); // must not panic
+        let _ = std::fs::remove_file(&path);
+    }
+}

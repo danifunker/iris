@@ -5,6 +5,7 @@ mod dialogs;
 mod framebuffer;
 mod handle;
 mod input;
+mod macos_sandbox;
 mod safe_stop;
 mod scsi_menu;
 mod settings;
@@ -50,6 +51,9 @@ fn main() -> eframe::Result<()> {
     // the single-instance lock for ourselves.
     single_instance::acquire();
     let prefs = GuiSettings::load();
+    // Re-acquire macOS sandbox access to previously user-selected files (disk
+    // images, PROM, ISOs, …) before any machine can open them. No-op elsewhere.
+    macos_sandbox::restore(&prefs.bookmarks);
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("iris — SGI Indy emulator")
         // app_id sets the X11 WM_CLASS / Wayland app_id so the compositor can
