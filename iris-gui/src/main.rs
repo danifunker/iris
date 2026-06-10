@@ -537,7 +537,18 @@ impl App {
                 ui.label(RichText::new("IRIS — SGI Indy (MIPS R4400) Emulator").strong());
                 ui.label(format!("Version {}", env!("APP_VERSION")));
                 ui.separator();
-                ui.hyperlink_to("techomancer/iris on GitHub", "https://github.com/techomancer/iris");
+                ui.label(RichText::new("Authors").strong());
+                ui.label("Original: techomancer");
+                ui.label("iris-gui fork: Dani Sarfati (danifunker)");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Upstream:");
+                    ui.hyperlink_to("techomancer/iris", "https://github.com/techomancer/iris");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("This fork:");
+                    ui.hyperlink_to("danifunker/iris", "https://github.com/danifunker/iris");
+                });
                 ui.separator();
                 ui.label(RichText::new("Build features:").strong());
                 use iris::build_features as bf;
@@ -579,8 +590,15 @@ impl App {
             if self.show_config_editor {
                 if ui.button("Network").clicked()  { self.tab = Tab::Network; }
                 if ui.button("Video-In").clicked() { self.tab = Tab::VideoIn; }
-                if ui.button("Debug").clicked()    { self.tab = Tab::Debug; }
-                if ui.button("CI").clicked()       { self.tab = Tab::Ci; }
+                // Debug/JIT is compiled out of lightning builds; CI is hidden
+                // in App Store builds — keep the quick-buttons in step with
+                // Tab::visible() so they never jump to a hidden tab.
+                if !iris::build_features::LIGHTNING && ui.button("Debug").clicked() {
+                    self.tab = Tab::Debug;
+                }
+                if !cfg!(feature = "appstore") && ui.button("CI").clicked() {
+                    self.tab = Tab::Ci;
+                }
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -682,7 +700,7 @@ impl App {
 
     fn central_tabs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            for &t in Tab::ALL {
+            for t in Tab::visible() {
                 ui.selectable_value(&mut self.tab, t, t.label());
             }
         });

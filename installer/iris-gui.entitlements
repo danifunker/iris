@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- App identity — must match the embedded provisioning profile
+         (<TeamID>.<bundle id>). Without these the signature lacks an
+         application-identifier and the build can't be used with TestFlight. -->
+    <key>com.apple.application-identifier</key>
+    <string>Q4F2GZ34R5.io.github.danifunker.iris</string>
+    <key>com.apple.developer.team-identifier</key>
+    <string>Q4F2GZ34R5</string>
+
+    <!-- Required for Mac App Store -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+
+    <!-- Cranelift JIT compilation (lightning build).
+         Must also be enabled in the App ID on developer.apple.com. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+
+    <!-- IndyCam / VINO emulation -->
+    <key>com.apple.security.device.camera</key>
+    <true/>
+
+    <!-- Disk image files (.raw, .img, .chd) selected by the user -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+
+    <!-- Persist access to user-selected disk images / PROMs / ISOs across
+         launches via app-scoped security-scoped bookmarks (see
+         iris-gui/src/macos_sandbox.rs). Required for the bookmark create/resolve
+         to succeed under the sandbox; without it they fail silently. -->
+    <key>com.apple.security.files.bookmarks.app-scope</key>
+    <true/>
+
+    <!-- Ethernet emulation (SEEQ 8003) -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+</dict>
+</plist>

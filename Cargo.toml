@@ -124,7 +124,6 @@ debug = true
 lto = "fat"
 codegen-units = 1
 
-
 # Profiling profile: release optimizations + full debug info for flamegraph/perf.
 # Usage: cargo build --profile profiling && perf record ./target/profiling/iris
 #        cargo flamegraph --profile profiling
@@ -132,6 +131,7 @@ codegen-units = 1
 inherits = "release"
 debug = 2
 strip = false
+force-frame-pointers = true
 
 [[bin]]
 name = "iris"

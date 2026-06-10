@@ -20,10 +20,24 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: &'static [Tab] = &[
-        Tab::General, Tab::Disks, Tab::Network, Tab::Memory,
-        Tab::Display, Tab::VideoIn, Tab::Debug, Tab::Ci,
-    ];
+    /// Tabs to show for the active build. The Debug/JIT tab is hidden in
+    /// lightning builds (the JIT debug paths it drives are compiled out), and
+    /// the CI/Automation tab is hidden in App Store builds (the iris-ci socket
+    /// is a developer automation feature, not something a sandboxed end user
+    /// can use). Both fall back to the full set for ordinary builds.
+    pub fn visible() -> Vec<Tab> {
+        let mut tabs = vec![
+            Tab::General, Tab::Disks, Tab::Network, Tab::Memory,
+            Tab::Display, Tab::VideoIn,
+        ];
+        if !build_features::LIGHTNING {
+            tabs.push(Tab::Debug);
+        }
+        if !cfg!(feature = "appstore") {
+            tabs.push(Tab::Ci);
+        }
+        tabs
+    }
     pub fn label(self) -> &'static str {
         match self {
             Tab::General => "General",

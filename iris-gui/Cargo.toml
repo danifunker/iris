@@ -2,12 +2,40 @@
 name = "iris-gui"
 version = "0.1.0"
 edition = "2021"
+description = "SGI Indy (MIPS R4400) emulator"
+license = "BSD-3-Clause"
+
+[package.metadata.deb]
+maintainer = "Dani Sarfati <dani@funkervogt.com>"
+copyright = "2025 Dani Sarfati"
+license-file = "../LICENSE"
+extended-description = "IRIS emulates an SGI Indy workstation (MIPS R4400) and boots IRIX 6.5 and 5.3 to a usable system with shell, networking, and X11."
+depends = "$auto"
+section = "games"
+priority = "optional"
+# Asset source paths are resolved relative to this package dir (iris-gui/),
+# NOT the workspace root — so they must not carry an `iris-gui/` prefix or it
+# doubles to iris-gui/iris-gui/... The `target/...` binary path is special-cased
+# by cargo-deb (rewritten to target/<triple>/release with --target).
+assets = [
+  ["target/release/iris-gui", "usr/bin/iris-gui", "755"],
+  ["assets/icons/icon-256.png", "usr/share/icons/hicolor/256x256/apps/iris-gui.png", "644"],
+  ["assets/icons/icon-128.png", "usr/share/icons/hicolor/128x128/apps/iris-gui.png", "644"],
+  ["assets/icons/icon-64.png", "usr/share/icons/hicolor/64x64/apps/iris-gui.png", "644"],
+  ["iris-gui.desktop", "usr/share/applications/iris-gui.desktop", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/iris-gui", dest = "/usr/bin/iris-gui", mode = "755" },
+  { source = "assets/icons/icon-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/iris-gui.png", mode = "644" },
+  { source = "iris-gui.desktop", dest = "/usr/share/applications/iris-gui.desktop", mode = "644" },
+]
 
 [features]
-# Mac App Store distribution build. Activates sandbox-only behaviour: macOS
-# security-scoped bookmarks (see src/macos_sandbox.rs) and hiding developer-only
-# affordances. Unused outside the App Store build but kept here so the gated
-# code compiles cleanly everywhere.
+# Mac App Store distribution build. Hides the CI/Automation config tab (the
+# iris-ci socket is a developer automation feature unusable in the sandbox)
+# and any other developer-only affordances. Set by .github/workflows/appstore.yml.
 appstore = []
 
 [dependencies]
