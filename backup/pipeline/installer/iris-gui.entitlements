@@ -27,6 +27,13 @@
     <key>com.apple.security.files.user-selected.read-write</key>
     <true/>
 
+    <!-- Persist access to user-selected disk images / PROMs / ISOs across
+         launches via app-scoped security-scoped bookmarks (see
+         iris-gui/src/macos_sandbox.rs). Required for the bookmark create/resolve
+         to succeed under the sandbox; without it they fail silently. -->
+    <key>com.apple.security.files.bookmarks.app-scope</key>
+    <true/>
+
     <!-- Ethernet emulation (SEEQ 8003) -->
     <key>com.apple.security.network.client</key>
     <true/>

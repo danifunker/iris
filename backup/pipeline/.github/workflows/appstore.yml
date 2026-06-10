@@ -56,7 +56,23 @@ jobs:
   preflight:
     name: Preflight (validate App Store secrets)
     runs-on: macos-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      bundle_version: ${{ steps.version.outputs.bundle_version }}
     steps:
+      # Stamp the version here, in the first job, so the arm64/x64 build jobs can
+      # bake it into the binary (RELEASE_VERSION → APP_VERSION, shown in About)
+      # AND the packaging job writes the *same* value into Info.plist's
+      # CFBundleVersion. Generating it in the later package job left the builds
+      # with no RELEASE_VERSION, so About fell back to CARGO_PKG_VERSION (0.1.0).
+      - name: Generate version
+        id: version
+        run: |
+          VERSION=$(date -u +"%Y-%m-%d-%H-%M")
+          # App Store requires numeric integers separated by dots (e.g. 20250609.0200)
+          BUNDLE_VERSION=$(echo "$VERSION" | sed 's/\([0-9]*\)-\([0-9]*\)-\([0-9]*\)-\([0-9]*\)-\([0-9]*\)/\1\2\3.\4\5/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "bundle_version=$BUNDLE_VERSION" >> $GITHUB_OUTPUT
       - name: Verify certificates, provisioning profile, and API key
         env:
           APP_STORE_APP_CERT: ${{ secrets.APP_STORE_APP_CERT }}
@@ -206,6 +222,10 @@ jobs:
           key: macos-aarch64-appstore-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build iris-gui (lightning + CHD, App Store)
+        env:
+          # Baked into APP_VERSION by iris-gui/build.rs and shown in About.
+          # Must equal the CFBundleVersion the packaging job writes.
+          RELEASE_VERSION: ${{ needs.preflight.outputs.bundle_version }}
         run: |
           cargo build --release --target aarch64-apple-darwin -p iris-gui \
             --features iris/lightning,appstore
@@ -242,6 +262,10 @@ jobs:
           key: macos-x86_64-appstore-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build iris-gui (lightning + CHD, App Store)
+        env:
+          # Baked into APP_VERSION by iris-gui/build.rs and shown in About.
+          # Must equal the CFBundleVersion the packaging job writes.
+          RELEASE_VERSION: ${{ needs.preflight.outputs.bundle_version }}
         run: |
           cargo build --release --target x86_64-apple-darwin -p iris-gui \
             --features iris/lightning,appstore
@@ -256,7 +280,7 @@ jobs:
 
   package-and-submit:
     name: Package and Submit
-    needs: [build-arm64, build-x64]
+    needs: [preflight, build-arm64, build-x64]
     runs-on: macos-latest
     env:
       HAS_CERTS: ${{ secrets.APP_STORE_APP_CERT != '' }}
@@ -265,14 +289,14 @@ jobs:
         with:
           ref: ${{ github.event.inputs.build_branch || vars.BUILD_BRANCH || 'build-pipeline-danifunker' }}
 
+      # Reuse the version stamped by the preflight job so the binary's baked-in
+      # APP_VERSION and the Info.plist CFBundleVersion are identical (re-running
+      # `date` here would drift by the build duration).
       - name: Generate version
         id: version
         run: |
-          VERSION=$(date -u +"%Y-%m-%d-%H-%M")
-          # App Store requires numeric integers separated by dots (e.g. 20250609.0200)
-          BUNDLE_VERSION=$(echo "$VERSION" | sed 's/\([0-9]*\)-\([0-9]*\)-\([0-9]*\)-\([0-9]*\)-\([0-9]*\)/\1\2\3.\4\5/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "bundle_version=$BUNDLE_VERSION" >> $GITHUB_OUTPUT
+          echo "version=${{ needs.preflight.outputs.version }}" >> $GITHUB_OUTPUT
+          echo "bundle_version=${{ needs.preflight.outputs.bundle_version }}" >> $GITHUB_OUTPUT
 
       - name: Download binaries
         uses: actions/download-artifact@v8
@@ -381,6 +405,13 @@ jobs:
             <key>LSMinimumSystemVersion</key><string>10.13</string>
             <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
             <key>NSCameraUsageDescription</key><string>Provides the IndyCam video input for SGI Indy emulation (VINO device).</string>
+            <!-- Export compliance: the shipping app uses no non-exempt
+                 encryption. Its own network path is plaintext (src/registry.rs
+                 is explicitly no-TLS); the only TLS-capable crates (rustls/ring)
+                 are BUILD-time deps of libchdman-rs's downloader and are not in
+                 the runtime binary. Setting this false suppresses the per-build
+                 export-compliance question in App Store Connect. -->
+            <key>ITSAppUsesNonExemptEncryption</key><false/>
           </dict>
           </plist>
           PLIST
