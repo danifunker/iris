@@ -381,13 +381,6 @@ jobs:
             <key>LSMinimumSystemVersion</key><string>10.13</string>
             <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
             <key>NSCameraUsageDescription</key><string>Provides the IndyCam video input for SGI Indy emulation (VINO device).</string>
-            <!-- Export compliance: the shipping app uses no non-exempt
-                 encryption. Its own network path is plaintext (src/registry.rs
-                 is explicitly no-TLS); the only TLS-capable crates (rustls/ring)
-                 are BUILD-time deps of libchdman-rs's downloader and are not in
-                 the runtime binary. Setting this false suppresses the per-build
-                 export-compliance question in App Store Connect. -->
-            <key>ITSAppUsesNonExemptEncryption</key><false/>
           </dict>
           </plist>
           PLIST
