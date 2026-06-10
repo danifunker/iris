@@ -1,0 +1,295 @@
+# Mac App Store build and submission pipeline for IRIS.
+#
+# Manual trigger only — run this when you're ready to submit a new build,
+# not on every commit.
+#
+# Required repository secrets:
+#   APP_STORE_APP_CERT          base64-encoded Mac App Distribution .p12
+#   APP_STORE_APP_CERT_PWD      password for the above
+#   APP_STORE_INSTALLER_CERT    base64-encoded Mac Installer Distribution .p12
+#   APP_STORE_INSTALLER_CERT_PWD
+#   APP_STORE_PROVISIONING_PROFILE  base64-encoded .provisionprofile
+#   APP_STORE_CONNECT_KEY_ID    API key ID from App Store Connect
+#   APP_STORE_CONNECT_ISSUER_ID issuer ID from App Store Connect
+#   APP_STORE_CONNECT_PRIVATE_KEY   base64-encoded .p8 private key
+#
+# One-time setup on developer.apple.com before first run:
+#   1. Create an App ID for io.github.danifunker.iris with these capabilities:
+#      - App Sandbox
+#      - Increased Memory Limit (for JIT — labelled "com.apple.security.cs.allow-jit")
+#      - Camera
+#      - Network (client + server)
+#   2. Create a Mac App Distribution provisioning profile for that App ID
+#   3. Create a Mac App Distribution certificate + Mac Installer Distribution certificate
+#   4. Create an app record in App Store Connect (name: IRIS, bundle ID: io.github.danifunker.iris)
+#   5. Generate an App Store Connect API key (Users and Access → Integrations → App Store Connect API)
+
+name: App Store
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_branch:
+        description: Branch to build from (leave empty for workflow branch)
+        required: false
+        default: ''
+      validate_only:
+        description: Validate package but do not submit to App Store Connect
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BUNDLE_ID: io.github.danifunker.iris
+
+jobs:
+  # ── Build arm64 ─────────────────────────────────────────────────────────────
+
+  build-arm64:
+    name: Build arm64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || github.ref_name }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-aarch64-appstore-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build iris-gui (lightning + CHD)
+        run: |
+          cargo build --release --target aarch64-apple-darwin -p iris-gui \
+            --features iris/lightning
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: iris-gui-arm64
+          path: target/aarch64-apple-darwin/release/iris-gui
+
+  # ── Build x64 ───────────────────────────────────────────────────────────────
+
+  build-x64:
+    name: Build x64
+    runs-on: macos-26-intel
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || github.ref_name }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-x86_64-appstore-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build iris-gui (lightning + CHD)
+        run: |
+          cargo build --release --target x86_64-apple-darwin -p iris-gui \
+            --features iris/lightning
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: iris-gui-x64
+          path: target/x86_64-apple-darwin/release/iris-gui
+
+  # ── Package and submit ───────────────────────────────────────────────────────
+
+  package-and-submit:
+    name: Package and Submit
+    needs: [build-arm64, build-x64]
+    runs-on: macos-latest
+    env:
+      HAS_CERTS: ${{ secrets.APP_STORE_APP_CERT != '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || github.ref_name }}
+
+      - name: Generate version
+        id: version
+        run: |
+          VERSION=$(date -u +"%Y-%m-%d-%H-%M")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: bins
+
+      - name: Create universal binary with lipo
+        run: |
+          chmod +x bins/iris-gui-arm64/iris-gui bins/iris-gui-x64/iris-gui
+          lipo -create -output iris-gui-universal \
+            bins/iris-gui-arm64/iris-gui \
+            bins/iris-gui-x64/iris-gui
+          lipo -info iris-gui-universal
+
+      - name: Import certificates
+        env:
+          APP_STORE_APP_CERT: ${{ secrets.APP_STORE_APP_CERT }}
+          APP_STORE_APP_CERT_PWD: ${{ secrets.APP_STORE_APP_CERT_PWD }}
+          APP_STORE_INSTALLER_CERT: ${{ secrets.APP_STORE_INSTALLER_CERT }}
+          APP_STORE_INSTALLER_CERT_PWD: ${{ secrets.APP_STORE_INSTALLER_CERT_PWD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/appstore.keychain-db
+          KEYCHAIN_PWD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+
+          import_cert() {
+            local b64="$1" pwd="$2"
+            local path=$RUNNER_TEMP/cert_$RANDOM.p12
+            echo "$b64" | base64 --decode > "$path"
+            security import "$path" -P "$pwd" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+            rm "$path"
+          }
+
+          import_cert "$APP_STORE_APP_CERT"       "$APP_STORE_APP_CERT_PWD"
+          import_cert "$APP_STORE_INSTALLER_CERT" "$APP_STORE_INSTALLER_CERT_PWD"
+
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+      - name: Resolve signing identities
+        id: identities
+        run: |
+          KEYCHAIN=$RUNNER_TEMP/appstore.keychain-db
+          APP_ID=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | grep "3rd Party Mac Developer Application" | head -1 \
+            | sed 's/.*"\(.*\)".*/\1/')
+          INSTALLER_ID=$(security find-identity -v "$KEYCHAIN" \
+            | grep "3rd Party Mac Developer Installer" | head -1 \
+            | sed 's/.*"\(.*\)".*/\1/')
+          echo "app_identity=$APP_ID" >> $GITHUB_OUTPUT
+          echo "installer_identity=$INSTALLER_ID" >> $GITHUB_OUTPUT
+          echo "App identity:       $APP_ID"
+          echo "Installer identity: $INSTALLER_ID"
+
+      - name: Embed provisioning profile and build .app bundle
+        env:
+          APP_STORE_PROVISIONING_PROFILE: ${{ secrets.APP_STORE_PROVISIONING_PROFILE }}
+          VER: ${{ steps.version.outputs.version }}
+        run: |
+          BUNDLE="IRIS.app"
+          mkdir -p "${BUNDLE}/Contents/MacOS" "${BUNDLE}/Contents/Resources"
+
+          cp iris-gui-universal "${BUNDLE}/Contents/MacOS/iris-gui"
+          chmod +x "${BUNDLE}/Contents/MacOS/iris-gui"
+          cp "iris-gui/assets/icons/icon.icns" "${BUNDLE}/Contents/Resources/AppIcon.icns"
+
+          # Embed provisioning profile (required for App Store)
+          echo "$APP_STORE_PROVISIONING_PROFILE" | base64 --decode \
+            > "${BUNDLE}/Contents/embedded.provisionprofile"
+
+          cat > "${BUNDLE}/Contents/Info.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>IRIS</string>
+            <key>CFBundleDisplayName</key><string>IRIS</string>
+            <key>CFBundleIdentifier</key><string>${{ env.BUNDLE_ID }}</string>
+            <key>CFBundleVersion</key><string>${VER}</string>
+            <key>CFBundleShortVersionString</key><string>${VER}</string>
+            <key>CFBundleExecutable</key><string>iris-gui</string>
+            <key>CFBundleIconFile</key><string>AppIcon.icns</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>LSMinimumSystemVersion</key><string>10.13</string>
+            <key>NSCameraUsageDescription</key><string>Provides the IndyCam video input for SGI Indy emulation (VINO device).</string>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Sign .app with entitlements
+        env:
+          IDENTITY: ${{ steps.identities.outputs.app_identity }}
+        run: |
+          codesign --force --options runtime \
+            --entitlements installer/iris-gui.entitlements \
+            --sign "$IDENTITY" \
+            IRIS.app
+          codesign --verify --deep --strict IRIS.app
+          echo "Signature verified."
+
+      - name: Package with productbuild
+        env:
+          IDENTITY: ${{ steps.identities.outputs.installer_identity }}
+          VER: ${{ steps.version.outputs.version }}
+        run: |
+          productbuild \
+            --component IRIS.app /Applications \
+            --sign "$IDENTITY" \
+            "IRIS-appstore-${VER}.pkg"
+
+      - name: Validate package
+        env:
+          VER: ${{ steps.version.outputs.version }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode > /tmp/asc_key.p8
+          xcrun altool --validate-app \
+            --type osx \
+            --file "IRIS-appstore-${VER}.pkg" \
+            --apiKey    "$APP_STORE_CONNECT_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID" \
+            --apiPrivateKeyPath /tmp/asc_key.p8
+          rm /tmp/asc_key.p8
+
+      - name: Submit to App Store Connect
+        if: ${{ github.event.inputs.validate_only != 'true' }}
+        env:
+          VER: ${{ steps.version.outputs.version }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode > /tmp/asc_key.p8
+          xcrun altool --upload-app \
+            --type osx \
+            --file "IRIS-appstore-${VER}.pkg" \
+            --apiKey    "$APP_STORE_CONNECT_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID" \
+            --apiPrivateKeyPath /tmp/asc_key.p8
+          rm /tmp/asc_key.p8
+          echo "Submitted. Check App Store Connect for processing status."
+
+      - name: Upload .pkg as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IRIS-appstore-${{ steps.version.outputs.version }}
+          path: IRIS-appstore-${{ steps.version.outputs.version }}.pkg
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/appstore.keychain-db
+          [ -f "$KEYCHAIN_PATH" ] && security delete-keychain "$KEYCHAIN_PATH" || true
