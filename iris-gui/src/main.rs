@@ -54,6 +54,14 @@ fn main() -> eframe::Result<()> {
     // Re-acquire macOS sandbox access to previously user-selected files (disk
     // images, PROM, ISOs, …) before any machine can open them. No-op elsewhere.
     macos_sandbox::restore(&prefs.bookmarks);
+    // Under the App Sandbox a compressed HD CHD's `.diff.chd` sidecar can't be
+    // created next to the parent (its directory isn't writable). Redirect diffs
+    // into our writable data dir (container-redirected under the sandbox). Off
+    // the App Store build the diff stays beside the parent (no sandbox).
+    #[cfg(feature = "appstore")]
+    if let Some(d) = dirs::data_dir() {
+        std::env::set_var("IRIS_CHD_DIFF_DIR", d.join("iris").join("chd-diffs"));
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("iris — SGI Indy emulator")
         // app_id sets the X11 WM_CLASS / Wayland app_id so the compositor can
@@ -123,6 +131,28 @@ struct MissingDisk {
     id: u8,
     path: String,
     cdrom: bool,
+}
+
+/// True if `path` can actually be *read*. The Start preflight uses this instead
+/// of `Path::exists()` because under the macOS App Sandbox a user-selected file
+/// we hold no current grant for (e.g. a disk image picked in a previous session,
+/// before a security-scoped bookmark was minted — see [`macos_sandbox`]) still
+/// `stat()`s as present, so `exists()` would wave it through to `Machine::new`,
+/// which then fails to attach the disk. We probe an actual read (not just an
+/// `open`) because the sandbox can permit `open()` yet deny `read()` once a
+/// grant has lapsed — so opening alone would still slip past the check and only
+/// fail deep in the CHD/image loader. Catching it here routes the disk to the
+/// missing-disk modal, where the user can re-select or detach it.
+fn disk_readable(path: &str) -> bool {
+    use std::io::Read;
+    if path.is_empty() {
+        return false;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut probe = [0u8; 1];
+    matches!(f.read(&mut probe), Ok(n) if n >= 1)
 }
 
 /// Modal shown when one or more SCSI image files are missing on Start.
@@ -257,8 +287,16 @@ impl App {
 
     fn start_emulator(&mut self) {
         // Flush any pending edits before the machine starts so the on-disk
-        // copy matches what we're about to boot.
+        // copy matches what we're about to boot. This also harvests a
+        // security-scoped bookmark for any newly user-selected file.
         if self.cfg_dirty { self.flush_machine(); }
+        // (Re)assert macOS sandbox access to every bookmarked file *before* the
+        // preflight opens them. The startup restore() ran before any bookmark
+        // for a freshly-picked file existed, and the file picker's grant does
+        // not survive a machine stop/restart — so without re-asserting here the
+        // second Start of a session can no longer read the disk image. No-op off
+        // the App Store build. See [`macos_sandbox`].
+        macos_sandbox::restore(&self.prefs.bookmarks);
         if iris::build_features::LIGHTNING && self.cfg.gdb_port.is_some() {
             // GDB stub is a no-op under lightning; silently drop the setting
             // so we don't hand the executor a port it can't honour.
@@ -299,8 +337,8 @@ impl App {
             if dev.cdrom && dev.path.is_empty() && dev.discs.is_empty() {
                 continue;
             }
-            let primary_ok = !dev.path.is_empty() && std::path::Path::new(&dev.path).exists();
-            let any_disc_ok = dev.discs.iter().any(|d| std::path::Path::new(d).exists());
+            let primary_ok = disk_readable(&dev.path);
+            let any_disc_ok = dev.discs.iter().any(|d| disk_readable(d));
             let present = primary_ok || (dev.cdrom && any_disc_ok);
             if !present {
                 out.push(MissingDisk { id, path: dev.path.clone(), cdrom: dev.cdrom });
@@ -937,12 +975,22 @@ impl eframe::App for App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label(RichText::new("The following SCSI image files are missing:").strong());
+                    ui.label(RichText::new("These SCSI image files are missing or can't be read:").strong());
                     for m in &modal.missing {
                         let kind = if m.cdrom { "CD-ROM" } else { "HDD" };
                         ui.label(format!("• scsi{} ({kind}): {}", m.id, m.path));
                     }
                     ui.add_space(8.0);
+                    if cfg!(feature = "appstore") {
+                        // Under the sandbox an existing file may be unreadable
+                        // because the app's access to it lapsed — re-selecting it
+                        // re-grants access and stores a bookmark for next launch.
+                        ui.label(RichText::new(
+                            "If a file exists but still shows here, macOS revoked access \
+                             after a previous session. Open the Disks tab and re-select it \
+                             to restore access.").weak());
+                        ui.add_space(4.0);
+                    }
                     ui.label(RichText::new(
                         "iris would terminate the process if started in this state. \
                          Choose how to proceed:").weak());
@@ -1008,4 +1056,53 @@ fn native_save_dialog(title: &str, filters: &[(&str, &[&str])]) -> Option<PathBu
     let mut d = rfd::FileDialog::new().set_title(title);
     for (name, exts) in filters { d = d.add_filter(*name, exts); }
     d.save_file()
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::disk_readable;
+    use std::io::Write;
+
+    #[test]
+    fn empty_and_missing_paths_are_not_readable() {
+        assert!(!disk_readable(""));
+        assert!(!disk_readable("/no/such/iris/disk/image.chd"));
+    }
+
+    #[test]
+    fn an_existing_readable_file_is_readable() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("iris_readable_{}.raw", std::process::id()));
+        std::fs::File::create(&p).unwrap().write_all(b"\0\0\0\0").unwrap();
+        assert!(disk_readable(&p.to_string_lossy()));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // The case the sandbox actually hits: a file that exists (so Path::exists()
+    // is true) but cannot be opened. Simulated with chmod 000. Skipped when the
+    // test runs as root, where DAC permission checks are bypassed and the open
+    // would still succeed.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_but_present_file_is_not_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc_geteuid() } == 0 {
+            return; // root bypasses 000 perms; the distinction can't be shown
+        }
+        let mut p = std::env::temp_dir();
+        p.push(format!("iris_unreadable_{}.raw", std::process::id()));
+        std::fs::File::create(&p).unwrap().write_all(b"\0\0\0\0").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // exists() says present, but disk_readable() must say no.
+        assert!(p.exists());
+        assert!(!disk_readable(&p.to_string_lossy()));
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[cfg(unix)]
+    extern "C" {
+        #[link_name = "geteuid"]
+        fn libc_geteuid() -> u32;
+    }
 }

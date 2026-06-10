@@ -112,7 +112,19 @@ mod imp {
         };
         match url {
             // SAFETY: `url` came from resolving a security-scoped bookmark.
-            Ok(url) => unsafe { url.startAccessingSecurityScopedResource() },
+            Ok(url) => {
+                let ok = unsafe { url.startAccessingSecurityScopedResource() };
+                if ok {
+                    // The security-scoped access is bound to this NSURL: when the
+                    // URL deallocates the access is released, which is why a
+                    // freshly-resolved bookmark would read briefly and then fail
+                    // deeper in the loader. We intend to hold access for the whole
+                    // process (we never call stopAccessing), so leak the URL to
+                    // keep it — and the access — alive until exit.
+                    std::mem::forget(url);
+                }
+                ok
+            }
             Err(_) => {
                 log::warn!("sandbox: could not resolve security-scoped bookmark for {path}");
                 false

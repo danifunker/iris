@@ -282,12 +282,26 @@ impl Machine {
                 hpc3.add_scsi_device(id as usize, &path, dev.cdrom, discs, dev.overlay)
             };
             if let Err(e) = result {
-                // A configured disk that won't attach is fatal: continuing would
-                // boot with a silently-missing device, and the only symptom is a
-                // confusing PROM "no such device" much later (e.g. a CHD path
-                // when the binary was built without --features chd). Fail loudly
-                // at startup instead.
-                eprintln!("iris: fatal: could not attach {} to SCSI ID {}: {}", path, id, e);
+                // A configured disk that won't attach (a CHD path when built
+                // without --features chd, or a disk the macOS sandbox won't let
+                // us read) can't host this device.
+                //
+                // Standalone CLI fails loudly and exits — booting on with a
+                // silently-missing device only yields a confusing PROM "no such
+                // device" later. But an embedder (the GUI sets
+                // IRIS_NO_EXIT_ON_POWEROFF) must never be torn down by the
+                // library: process::exit kills it outright, and panicking can't
+                // be caught either because release builds use panic="abort"
+                // (unwinding across the libchdman/JIT FFI would be UB). So we
+                // skip just this device and boot without it; the GUI's Start
+                // preflight already warns the user about an unreadable disk, and
+                // they can stop, re-pick or detach it, and start again.
+                let msg = format!("could not attach {path} to SCSI ID {id}: {e}");
+                if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_some() {
+                    eprintln!("iris: warning: {msg}; continuing without SCSI ID {id}");
+                    continue;
+                }
+                eprintln!("iris: fatal: {msg}");
                 std::process::exit(1);
             }
         }
