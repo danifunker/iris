@@ -367,7 +367,13 @@ jobs:
           PLIST
 
             if [ "$IDENTITY" != "-" ]; then
-              codesign --force --options runtime --sign "$IDENTITY" "${bundle}"
+              # --entitlements grants allow-unsigned-executable-memory so the
+              # hardened runtime doesn't kill Cranelift's mmap+mprotect JIT pages
+              # (MIPS + REX3). Permitted for Developer ID/notarization; the App
+              # Store build can't use it and runs interpreter-only instead.
+              codesign --force --options runtime \
+                --entitlements installer/iris-gui-notarized.entitlements \
+                --sign "$IDENTITY" "${bundle}"
             else
               codesign --force --deep --sign - "${bundle}"
             fi
@@ -415,7 +421,12 @@ jobs:
             local archive_name="$3"   # name of the binary inside the archive
 
             if [ "$IDENTITY" != "-" ]; then
-              codesign --force --options runtime --timestamp --sign "$IDENTITY" "$bin_src"
+              # See the GUI bundle signing above: the JIT entitlement keeps the
+              # notarized CLI binaries (built with jit,rex-jit) from being killed
+              # by the hardened runtime on their first JITed REX3 draw.
+              codesign --force --options runtime --timestamp \
+                --entitlements installer/iris-gui-notarized.entitlements \
+                --sign "$IDENTITY" "$bin_src"
             else
               codesign --force --sign - "$bin_src"
             fi

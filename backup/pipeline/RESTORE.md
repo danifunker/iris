@@ -9,6 +9,7 @@ backup/pipeline/.github/workflows/sync-upstream.yml → .github/workflows/sync-u
 backup/pipeline/.github/workflows/appstore.yml      → .github/workflows/appstore.yml
 backup/pipeline/installer/iris-gui.iss               → installer/iris-gui.iss
 backup/pipeline/installer/iris-gui.entitlements      → installer/iris-gui.entitlements
+backup/pipeline/installer/iris-gui-notarized.entitlements → installer/iris-gui-notarized.entitlements
 backup/pipeline/iris-gui/iris-gui.desktop            → iris-gui/iris-gui.desktop
 backup/pipeline/docs/appstore-build.md               → docs/appstore-build.md
 backup/pipeline/docs/handoff-pipeline.md             → docs/handoff-pipeline.md
@@ -27,7 +28,7 @@ cp backup/pipeline/docs/appstore-build.md backup/pipeline/docs/handoff-pipeline.
 
 ```bash
 cp .github/workflows/release.yml .github/workflows/sync-upstream.yml .github/workflows/appstore.yml backup/pipeline/.github/workflows/
-cp installer/iris-gui.iss installer/iris-gui.entitlements backup/pipeline/installer/
+cp installer/iris-gui.iss installer/iris-gui.entitlements installer/iris-gui-notarized.entitlements backup/pipeline/installer/
 cp iris-gui/iris-gui.desktop backup/pipeline/iris-gui/
 cp docs/appstore-build.md docs/handoff-pipeline.md backup/pipeline/docs/
 ```
