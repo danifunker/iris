@@ -62,6 +62,17 @@ fn main() -> eframe::Result<()> {
     if let Some(d) = dirs::data_dir() {
         std::env::set_var("IRIS_CHD_DIFF_DIR", d.join("iris").join("chd-diffs"));
     }
+    // Force the interpreter on the Mac App Store build. Cranelift (MIPS JIT and
+    // the always-on REX3 draw-shader JIT) allocates executable memory with
+    // mmap+mprotect, not MAP_JIT. The App Sandbox only permits MAP_JIT pages
+    // (com.apple.security.cs.allow-jit is the sole code-signing entitlement MAS
+    // allows; allow-unsigned-executable-memory / disable-executable-page-
+    // protection are rejected by App Review), so the first JITed REX3 draw is
+    // killed with SIGKILL/CODESIGNING "Invalid Page" on the REX3-Processor
+    // thread — right after the emulator window opens, before any video. Set
+    // once, before any worker thread (CPU / REX3) can read it.
+    #[cfg(feature = "appstore")]
+    std::env::set_var("IRIS_NO_JIT", "1");
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("iris — SGI Indy emulator")
         // app_id sets the X11 WM_CLASS / Wayland app_id so the compositor can

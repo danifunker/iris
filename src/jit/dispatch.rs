@@ -168,7 +168,10 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
     exec: &mut MipsExecutor<T, C>,
     running: &AtomicBool,
 ) {
-    let jit_enabled = std::env::var("IRIS_JIT").map(|v| v == "1").unwrap_or(false);
+    // IRIS_NO_JIT (sandboxed Mac App Store build) hard-disables the JIT:
+    // Cranelift's non-MAP_JIT executable memory is killed by the App Sandbox.
+    let jit_enabled = std::env::var("IRIS_JIT").map(|v| v == "1").unwrap_or(false)
+        && std::env::var_os("IRIS_NO_JIT").is_none();
 
     if !jit_enabled {
         eprintln!("JIT: interpreter-only mode (set IRIS_JIT=1 to enable compilation)");
