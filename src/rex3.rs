@@ -1228,10 +1228,20 @@ impl Rex3 {
             debug_state: Mutex::new(DebugState::default()),
             diag: AtomicU64::new(0),
             renderer: Mutex::new(None),
+            // IRIS_NO_JIT (set by the sandboxed Mac App Store GUI build) forces
+            // the interpreter: Cranelift's mmap+mprotect executable pages aren't
+            // MAP_JIT, so the App Sandbox kills the process with SIGKILL/
+            // CODESIGNING the first time a compiled draw shader runs. Skip
+            // *constructing* RexJit (not just dispatch) so its warm-up compiler
+            // thread never allocates executable memory in the first place.
             #[cfg(feature = "rex-jit")]
-            rex_jit: Some(std::sync::Arc::new(crate::rex3_jit::RexJit::new())),
+            rex_jit: if std::env::var_os("IRIS_NO_JIT").is_some() {
+                None
+            } else {
+                Some(std::sync::Arc::new(crate::rex3_jit::RexJit::new()))
+            },
             #[cfg(feature = "rex-jit")]
-            jit_enabled: AtomicBool::new(true),
+            jit_enabled: AtomicBool::new(std::env::var_os("IRIS_NO_JIT").is_none()),
             #[cfg(feature = "rex-jit")]
             jit_last: std::cell::Cell::new((0, 0, None)),
             interp_setup_cache: std::cell::Cell::new((u32::MAX, u32::MAX, u32::MAX)),

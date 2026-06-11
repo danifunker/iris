@@ -125,6 +125,24 @@ impl ChdCd {
 }
 
 fn diff_path_for(parent: &Path) -> PathBuf {
+    // A compressed HD CHD can't be written in place, so writes go to an
+    // uncompressed `.diff.chd` sidecar. By default it sits next to the parent.
+    //
+    // That fails under the macOS App Sandbox: the user grants access to the CHD
+    // *file*, but creating a new sibling in its directory needs write access to
+    // the directory, which the sandbox denies. iris-gui's App Store build sets
+    // IRIS_CHD_DIFF_DIR to a writable container path; when present, put the diff
+    // there, named by the parent's stem plus a hash of its full path so two
+    // like-named CHDs in different folders don't collide.
+    if let Some(dir) = std::env::var_os("IRIS_CHD_DIFF_DIR") {
+        let dir = PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir);
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        parent.hash(&mut h);
+        let stem = parent.file_stem().and_then(|s| s.to_str()).unwrap_or("disk");
+        return dir.join(format!("{stem}.{:016x}.diff.chd", h.finish()));
+    }
     let mut s = parent.as_os_str().to_owned();
     s.push(".diff.chd");
     PathBuf::from(s)

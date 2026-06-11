@@ -14,5 +14,6 @@ nvram.bin
 Cargo.lock
 iris.toml
 screenshot_*.png
+IRIS.app/
 *.log
 .DS_Store
