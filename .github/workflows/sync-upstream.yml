@@ -1,0 +1,124 @@
+# Nightly sync from techomancer/iris main → danifunker/iris main.
+#
+# IMPORTANT: This file must live on the default branch (main) for the schedule
+# trigger to fire. The release workflow (release.yml) lives on the build branch.
+#
+# Repo variable required:
+#   BUILD_BRANCH  — branch to trigger the release on (default: build-pipeline-danifunker)
+
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      build_branch:
+        description: Build branch to trigger after sync (overrides BUILD_BRANCH variable)
+        required: false
+        default: ''
+      skip_release:
+        description: Sync only — do not trigger a release
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    name: Sync from techomancer/iris
+    runs-on: ubuntu-latest
+    outputs:
+      had_changes: ${{ steps.rebase.outputs.had_changes }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/techomancer/iris.git || true
+          git fetch upstream main
+
+      - name: Rebase onto upstream/main
+        id: rebase
+        run: |
+          BEFORE=$(git rev-parse HEAD)
+          git rebase upstream/main
+          AFTER=$(git rev-parse HEAD)
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "had_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "had_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Push updated main
+        run: git push origin main --force-with-lease
+
+      - name: Rebase build branch onto updated main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUILD_BRANCH="${{ vars.BUILD_BRANCH || 'build-pipeline-danifunker' }}"
+          git fetch origin "$BUILD_BRANCH"
+          git checkout "$BUILD_BRANCH"
+          if git rebase main; then
+            git push origin "$BUILD_BRANCH" --force-with-lease
+            echo "Rebased $BUILD_BRANCH onto main."
+          else
+            git rebase --abort
+            TITLE="Auto-rebase of ${BUILD_BRANCH} onto main failed"
+            count=$(gh issue list --state open --search "$TITLE" --json number --jq length)
+            if [ "$count" = "0" ]; then
+              gh issue create \
+                --title "$TITLE" \
+                --body "The nightly sync rebased \`main\` but could not automatically rebase \`${BUILD_BRANCH}\` onto it. Manually resolve conflicts:\n\`\`\`\ngit switch ${BUILD_BRANCH}\ngit rebase main\ngit push --force-with-lease\n\`\`\`"
+            fi
+          fi
+
+      - name: Check for new feature flags
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # All known feature flags. When a new flag appears that isn't here,
+          # an issue is filed. After deciding what to do with it, add it to
+          # this list to suppress future issues.
+          KNOWN="chd lightning tlbvmap jit rex-jit camera idle-pause r5k r5ksc r5ksc_triton debug_cache developer developer_ip7 developerx ci_clock tlbstats"
+
+          while IFS= read -r feature; do
+            [ "$feature" = "default" ] && continue
+            if ! printf ' %s ' "$KNOWN" | grep -qF " ${feature} "; then
+              TITLE="New upstream feature flag: \`${feature}\`"
+              count=$(gh issue list --state open --search "$TITLE" --json number --jq length)
+              if [ "$count" = "0" ]; then
+                gh issue create \
+                  --title "$TITLE" \
+                  --body "Upstream added a new \`[features]\` entry \`${feature}\` in \`Cargo.toml\`. Review whether to include it in \`.github/workflows/release.yml\`, then add it to the \`KNOWN\` list in \`.github/workflows/sync-upstream.yml\`."
+              fi
+            fi
+          done < <(awk '/^\[features\]/{f=1;next} /^\[[a-zA-Z]/{f=0} f && /^[a-zA-Z_-]+ *= *\[/{print $1}' Cargo.toml)
+
+  trigger-release:
+    name: Trigger Release
+    needs: sync
+    if: needs.sync.outputs.had_changes == 'true' && github.event.inputs.skip_release != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger release workflow on build branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUILD_BRANCH="${{ github.event.inputs.build_branch || vars.BUILD_BRANCH || 'build-pipeline-danifunker' }}"
+          gh workflow run release.yml \
+            --repo "${{ github.repository }}" \
+            --ref "$BUILD_BRANCH"
