@@ -431,6 +431,8 @@ pub const CONFIG_FB_TYPE: u32 = 1 << 20;
 pub const CLIPMODE_ENSMASK_MASK: u32 = 0x1F;
 pub const CLIPMODE_CIDMATCH_MASK: u32 = 0xF << 9;
 pub const CLIPMODE_CIDMATCH_SHIFT: u32 = 9;
+/// Bits of clipmode that affect JIT shader code generation (ensmask + cidmatch).
+pub const CLIPMODE_JIT_KEY_MASK: u32 = CLIPMODE_ENSMASK_MASK | CLIPMODE_CIDMATCH_MASK;
 
 bitfield! {
     #[derive(Clone, Copy, Default)]
@@ -1084,10 +1086,10 @@ pub struct Rex3 {
     /// Whether the JIT is enabled for dispatch (can be toggled at runtime via `rex jit on/off`).
     #[cfg(feature = "rex-jit")]
     pub jit_enabled: AtomicBool,
-    /// Last-hit JIT shader cache: avoids HashMap lookup when (dm0, dm1) is the same as
-    /// the previous GO.  Only accessed from the GFIFO consumer thread — no sync needed.
+    /// Last-hit JIT shader cache: avoids HashMap lookup when (dm0, dm1, clipmode_key) is
+    /// the same as the previous GO.  Only accessed from the GFIFO consumer thread — no sync needed.
     #[cfg(feature = "rex-jit")]
-    pub jit_last: std::cell::Cell<(u32, u32, Option<unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32)>)>,
+    pub jit_last: std::cell::Cell<(u32, u32, u32, Option<unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32)>)>,
     /// Cached interpreter setup key: (dm0 & DRAWMODE0_INTERP_SETUP_MASK,
     /// dm1_normalized & DRAWMODE1_INTERP_SETUP_MASK, clipmode_cidmatch).
     /// When these match the current GO, planes_setup/host_setup and function-pointer
@@ -1243,7 +1245,7 @@ impl Rex3 {
             #[cfg(feature = "rex-jit")]
             jit_enabled: AtomicBool::new(std::env::var_os("IRIS_NO_JIT").is_none()),
             #[cfg(feature = "rex-jit")]
-            jit_last: std::cell::Cell::new((0, 0, None)),
+            jit_last: std::cell::Cell::new((0, 0, 0, None)),
             interp_setup_cache: std::cell::Cell::new((u32::MAX, u32::MAX, u32::MAX)),
             heartbeat,
             cycles,
@@ -3192,17 +3194,15 @@ impl Rex3 {
                         || opcode == DRAWMODE0_OPCODE_READ)
                     && (adrmode == DRAWMODE0_ADRMODE_BLOCK || adrmode == DRAWMODE0_ADRMODE_SPAN || is_line);
                 if is_jittable {
-                    // Fast path: same (dm0, dm1) as last GO — skip the HashMap lookup.
-                    // Last-hit cache: skip HashMap lookup when (dm0,dm1) unchanged.
-                    // Only cache hits (Some); misses re-lookup every GO so a freshly
-                    // compiled shader is picked up immediately without extra plumbing.
+                    let cm = ctx.clipmode & CLIPMODE_JIT_KEY_MASK;
+                    // Fast path: same (dm0, dm1, cm) as last GO — skip the HashMap lookup.
                     let last = self.jit_last.get();
-                    let entry = if last.0 == dm0 && last.1 == dm1 && last.2.is_some() {
-                        last.2
+                    let entry = if last.0 == dm0 && last.1 == dm1 && last.2 == cm && last.3.is_some() {
+                        last.3
                     } else {
-                        let e = jit.lookup(dm0, dm1);
-                        if let Some(_) = e { self.jit_last.set((dm0, dm1, e)); }
-                        else { jit.request_compile(dm0, dm1); }
+                        let e = jit.lookup(dm0, dm1, cm);
+                        if let Some(_) = e { self.jit_last.set((dm0, dm1, cm, e)); }
+                        else { jit.request_compile(dm0, dm1, cm); }
                         e
                     };
                     if let Some(entry) = entry {
@@ -4140,7 +4140,7 @@ impl Device for Rex3 {
                 Some("on") | Some("off") => {
                     let val = args[1] == "on";
                     self.jit_enabled.store(val, Ordering::Relaxed);
-                    self.jit_last.set((0, 0, None));
+                    self.jit_last.set((0, 0, 0, None));
                     writeln!(writer, "REX JIT dispatch: {}", if val { "enabled" } else { "disabled" }).unwrap();
                 }
                 Some("status") => {
@@ -4156,20 +4156,20 @@ impl Device for Rex3 {
                             total_bytes).unwrap();
                         if !compiled.is_empty() {
                             #[cfg(feature = "developer")]
-                            writeln!(writer, "{:>8}  {:>10}  {:>10}  {:>6}  {:>8}  {}",
-                                "status", "dm0", "dm1", "bytes", "hits", "description").unwrap();
+                            writeln!(writer, "{:>8}  {:>10}  {:>10}  {:>10}  {:>6}  {:>8}  {}",
+                                "status", "dm0", "dm1", "cm", "bytes", "hits", "description").unwrap();
                             #[cfg(not(feature = "developer"))]
-                            writeln!(writer, "{:>8}  {:>10}  {:>10}  {:>6}  {}",
-                                "status", "dm0", "dm1", "bytes", "description").unwrap();
+                            writeln!(writer, "{:>8}  {:>10}  {:>10}  {:>10}  {:>6}  {}",
+                                "status", "dm0", "dm1", "cm", "bytes", "description").unwrap();
                             for s in &shaders {
                                 if s.status == "compiled" || s.status == "disabled" {
                                     #[cfg(feature = "developer")]
-                                    writeln!(writer, "{:>8}  {:#010x}  {:#010x}  {:>6}  {:>8}  {}  |  {}",
-                                        s.status, s.dm0, s.dm1, s.code_bytes, s.hit_count,
+                                    writeln!(writer, "{:>8}  {:#010x}  {:#010x}  {:#010x}  {:>6}  {:>8}  {}  |  {}",
+                                        s.status, s.dm0, s.dm1, s.cm, s.code_bytes, s.hit_count,
                                         decode_dm0(s.dm0), decode_dm1(s.dm1)).unwrap();
                                     #[cfg(not(feature = "developer"))]
-                                    writeln!(writer, "{:>8}  {:#010x}  {:#010x}  {:>6}  {}  |  {}",
-                                        s.status, s.dm0, s.dm1, s.code_bytes,
+                                    writeln!(writer, "{:>8}  {:#010x}  {:#010x}  {:#010x}  {:>6}  {}  |  {}",
+                                        s.status, s.dm0, s.dm1, s.cm, s.code_bytes,
                                         decode_dm0(s.dm0), decode_dm1(s.dm1)).unwrap();
                                 }
                             }
@@ -4184,10 +4184,10 @@ impl Device for Rex3 {
                         if shaders.is_empty() {
                             writeln!(writer, "No shaders compiled yet.").unwrap();
                         } else {
-                            writeln!(writer, "{:>8}  {:>10}  {:>10}  {:>6}  {}", "status", "dm0", "dm1", "bytes", "description").unwrap();
+                            writeln!(writer, "{:>8}  {:>10}  {:>10}  {:>10}  {:>6}  {}", "status", "dm0", "dm1", "cm", "bytes", "description").unwrap();
                             for s in &shaders {
-                                writeln!(writer, "{:>8}  {:#010x}  {:#010x}  {:>6}  {}  |  {}",
-                                    s.status, s.dm0, s.dm1, s.code_bytes,
+                                writeln!(writer, "{:>8}  {:#010x}  {:#010x}  {:#010x}  {:>6}  {}  |  {}",
+                                    s.status, s.dm0, s.dm1, s.cm, s.code_bytes,
                                     decode_dm0(s.dm0), decode_dm1(s.dm1)).unwrap();
                             }
                         }
@@ -4195,21 +4195,24 @@ impl Device for Rex3 {
                 }
                 Some("disable") | Some("enable") => {
                     let enable = args[1] == "enable";
-                    let dm0_s = args.get(2).ok_or("Usage: rex jit <disable|enable> <dm0_hex> <dm1_hex>")?;
-                    let dm1_s = args.get(3).ok_or("Usage: rex jit <disable|enable> <dm0_hex> <dm1_hex>")?;
+                    let dm0_s = args.get(2).ok_or("Usage: rex jit <disable|enable> <dm0_hex> <dm1_hex> [cm_hex]")?;
+                    let dm1_s = args.get(3).ok_or("Usage: rex jit <disable|enable> <dm0_hex> <dm1_hex> [cm_hex]")?;
                     let dm0 = u32::from_str_radix(dm0_s.trim_start_matches("0x"), 16)
                         .map_err(|_| format!("bad dm0: {dm0_s}"))?;
                     let dm1 = u32::from_str_radix(dm1_s.trim_start_matches("0x"), 16)
                         .map_err(|_| format!("bad dm1: {dm1_s}"))?;
+                    let cm = if let Some(cm_s) = args.get(4) {
+                        u32::from_str_radix(cm_s.trim_start_matches("0x"), 16)
+                            .map_err(|_| format!("bad cm: {cm_s}"))?
+                    } else { 0 };
                     if let Some(ref jit) = self.rex_jit {
-                        if enable { jit.enable_shader(dm0, dm1); } else { jit.disable_shader(dm0, dm1); }
-                        // Invalidate last-hit cache so the change takes effect immediately.
-                        self.jit_last.set((0, 0, None));
-                        writeln!(writer, "Shader dm0={dm0:#010x} dm1={dm1:#010x}: {}",
+                        if enable { jit.enable_shader(dm0, dm1, cm); } else { jit.disable_shader(dm0, dm1, cm); }
+                        self.jit_last.set((0, 0, 0, None));
+                        writeln!(writer, "Shader dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x}: {}",
                             if enable { "enabled" } else { "disabled" }).unwrap();
                     }
                 }
-                _ => return Err("Usage: rex jit <on|off|status|list> | rex jit <disable|enable> <dm0_hex> <dm1_hex>".to_string()),
+                _ => return Err("Usage: rex jit <on|off|status|list> | rex jit <disable|enable> <dm0_hex> <dm1_hex> [cm_hex]".to_string()),
             }
             return Ok(());
         }

@@ -2112,13 +2112,20 @@ mod jit_tests {
         let rex_jit = make_rex3_jit();
         rex3init(rex_jit);
         setup(rex_jit);
+        // Drain GFIFO so ctx.clipmode is committed, then read clipmode_key.
+        wait(rex_jit);
+        let cm = {
+            use crate::rex3::CLIPMODE_JIT_KEY_MASK;
+            let ctx = unsafe { &*rex_jit.context.get() };
+            ctx.clipmode & CLIPMODE_JIT_KEY_MASK
+        };
         // First GO: triggers compile + interpreter fallback
         reg_go(rex_jit, REX3_DRAWMODE0, dm0);
         // Wait for JIT compile
         let compiled = if let Some(ref jit) = rex_jit.rex_jit {
-            jit.wait_compiled(dm0, dm1)
+            jit.wait_compiled(dm0, dm1, cm)
         } else { false };
-        assert!(compiled, "JIT compile failed for dm0={dm0:#010x} dm1={dm1:#010x}");
+        assert!(compiled, "JIT compile failed for dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x}");
 
         // Reset fb and re-run via JIT
         clear_region(rex_jit, x0, y0, x1, y1);
@@ -2630,10 +2637,10 @@ mod jit_tests {
         if let Some(ref jit) = rex_jit.rex_jit {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
-                if jit.compiled_pairs().contains(&(dm0, dm1)) { break; }
+                if jit.compiled_pairs().contains(&(dm0, dm1, 0)) { break; }
                 assert!(std::time::Instant::now() < deadline,
                     "JIT compile timed out for dm0={dm0:#010x} dm1={dm1:#010x}");
-                jit.request_compile(dm0, dm1); // retry if channel was full
+                jit.request_compile(dm0, dm1, 0); // retry if channel was full
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
@@ -2727,9 +2734,9 @@ mod jit_tests {
         if let Some(ref jit) = rex_j.rex_jit {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
-                if jit.compiled_pairs().contains(&(dm0, dm1)) { break; }
+                if jit.compiled_pairs().contains(&(dm0, dm1, 0)) { break; }
                 assert!(std::time::Instant::now() < deadline, "JIT compile timeout");
-                jit.request_compile(dm0, dm1);
+                jit.request_compile(dm0, dm1, 0);
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
@@ -2986,7 +2993,7 @@ mod jit_tests {
         write_hostrw32(rex_j, word); // triggers compile request
         wait(rex_j);
         if let Some(ref jit) = rex_j.rex_jit {
-            assert!(jit.wait_compiled(dm0, dm1),
+            assert!(jit.wait_compiled(dm0, dm1, 0),
                 "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
         }
         // Reset and replay via JIT
@@ -3032,7 +3039,7 @@ mod jit_tests {
         write_hostrw32(rex_j, pixels[0]); // trigger compile
         wait(rex_j);
         if let Some(ref jit) = rex_j.rex_jit {
-            assert!(jit.wait_compiled(dm0, dm1),
+            assert!(jit.wait_compiled(dm0, dm1, 0),
                 "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
         }
         clear_region(rex_j, 0, 0, 3, 0);
@@ -3077,7 +3084,7 @@ mod jit_tests {
         write_hostrw64(rex_j, word64);
         wait(rex_j);
         if let Some(ref jit) = rex_j.rex_jit {
-            assert!(jit.wait_compiled(dm0, dm1),
+            assert!(jit.wait_compiled(dm0, dm1, 0),
                 "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
         }
         clear_region(rex_j, 0, 0, 1, 0);
@@ -3137,7 +3144,7 @@ mod jit_tests {
         setup_read(rex_j);
         reg_go(rex_j, REX3_DRAWMODE0, dm0_read); // triggers compile + first batch
         if let Some(ref jit) = rex_j.rex_jit {
-            assert!(jit.wait_compiled(dm0_read, dm1),
+            assert!(jit.wait_compiled(dm0_read, dm1, 0),
                 "JIT compile failed dm0={dm0_read:#010x} dm1={dm1:#010x}");
         }
         // Re-run via JIT
@@ -3207,7 +3214,7 @@ mod jit_tests {
         reg_go(rex_j, REX3_DRAWMODE0, dm0_read);
         read_hostrw32_last(rex_j); // drain
         if let Some(ref jit) = rex_j.rex_jit {
-            assert!(jit.wait_compiled(dm0_read, dm1),
+            assert!(jit.wait_compiled(dm0_read, dm1, 0),
                 "JIT compile failed dm0={dm0_read:#010x} dm1={dm1:#010x}");
         }
         let words_jit = read_words(rex_j);

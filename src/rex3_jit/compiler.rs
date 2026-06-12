@@ -134,9 +134,10 @@ impl ShaderCompiler {
         }
     }
 
-    /// Compile a shader for the given (DrawMode0, DrawMode1) pair.
+    /// Compile a shader for the given (DrawMode0, DrawMode1, clipmode_key) triple.
+    /// `clipmode_key` = `ctx.clipmode & CLIPMODE_JIT_KEY_MASK` (ensmask bits + cidmatch bits).
     /// Returns `(entry_fn, code_bytes)`, or None if this mode is not JIT-able.
-    pub fn compile_shader(&mut self, dm0_val: u32, dm1_val: u32)
+    pub fn compile_shader(&mut self, dm0_val: u32, dm1_val: u32, clipmode_key: u32)
         -> Option<(unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32), u32)>
     {
         let dm0 = Dm0 { val: dm0_val };
@@ -152,10 +153,16 @@ impl ShaderCompiler {
         let is_line = adrmode == DRAWMODE0_ADRMODE_I_LINE
             || adrmode == DRAWMODE0_ADRMODE_F_LINE
             || adrmode == DRAWMODE0_ADRMODE_A_LINE;
-        if opcode != DRAWMODE0_OPCODE_DRAW && !is_scr2scr && !is_hostr { return None; }
-        // Lines don't support host modes.
-        if is_line && (is_hostr || is_hostw) { return None; }
+        if opcode != DRAWMODE0_OPCODE_DRAW && !is_scr2scr && !is_hostr {
+            eprintln!("REX JIT: not jittable (opcode={opcode}) for dm0={dm0_val:#010x}");
+            return None;
+        }
+        if is_line && (is_hostr || is_hostw) {
+            eprintln!("REX JIT: not jittable (line+host) for dm0={dm0_val:#010x}");
+            return None;
+        }
         if !is_line && adrmode != DRAWMODE0_ADRMODE_SPAN && adrmode != DRAWMODE0_ADRMODE_BLOCK {
+            eprintln!("REX JIT: not jittable (adrmode={adrmode:#x}) for dm0={dm0_val:#010x}");
             return None;
         }
 
@@ -166,7 +173,7 @@ impl ShaderCompiler {
                       else                        { dm1_val };
         let dm1 = Dm1 { val: dm1_val };
 
-        let name = format!("rex_shader_{:08x}_{:08x}_{}", dm0_val, dm1_val, self.counter);
+        let name = format!("rex_shader_{:08x}_{:08x}_{:08x}_{}", dm0_val, dm1_val, clipmode_key, self.counter);
         self.counter += 1;
 
         let ptr_type = self.jit_module.target_config().pointer_type();
@@ -191,6 +198,7 @@ impl ShaderCompiler {
                 &mut self.ctx.func,
                 &mut self.builder_ctx,
                 &dm0, &dm1,
+                clipmode_key,
                 ptr_type,
             )
         } else {
@@ -199,6 +207,7 @@ impl ShaderCompiler {
                 &mut self.builder_ctx,
                 &dm0, &dm1,
                 is_scr2scr, is_hostw, is_hostr,
+                clipmode_key,
                 ptr_type,
             )
         };
@@ -206,13 +215,13 @@ impl ShaderCompiler {
         if !result {
             self.ctx.func.clear();
             self.jit_module.clear_context(&mut self.ctx);
-            eprintln!("REX JIT: emit failed for dm0={dm0_val:#010x} dm1={dm1_val:#010x}: {}  {}",
+            eprintln!("REX JIT: emit failed for dm0={dm0_val:#010x} dm1={dm1_val:#010x} cm={clipmode_key:#010x}: {}  {}",
                 crate::rex3::decode_dm0(dm0_val), crate::rex3::decode_dm1(dm1_val));
             return None;
         }
 
         if let Err(e) = self.jit_module.define_function(func_id, &mut self.ctx) {
-            eprintln!("REX JIT: define_function failed for dm0={dm0_val:#010x} dm1={dm1_val:#010x}: {}  {}  -- {e}",
+            eprintln!("REX JIT: define_function failed for dm0={dm0_val:#010x} dm1={dm1_val:#010x} cm={clipmode_key:#010x}: {}  {}  -- {e}",
                 crate::rex3::decode_dm0(dm0_val), crate::rex3::decode_dm1(dm1_val));
             eprintln!("--- Cranelift IR ---\n{}", self.ctx.func.display());
             self.jit_module.clear_context(&mut self.ctx);
@@ -321,23 +330,25 @@ fn emit_calculate_src_address(
 /// Mirrors Rex3::calculate_fb_address.
 /// Emits xymove (unconditional for scr2scr, conditional on xyoffset for draw),
 /// xywin, smask clipping, bounds check.
+/// `ensmask_key`: compile-time ensmask bits — used to skip dead smask checks.
 /// On clip/OOB miss: branches to `skip_block` with `skip_args`.
 /// On hit: falls through to a new `in_bounds` block and returns `(px_ptr, x_bayer, y_bayer)`.
 /// `x_bayer`/`y_bayer` are the window-relative coords (before xywin bias) — used for dither packing.
 fn emit_calculate_fb_address(
-    b:          &mut FunctionBuilder,
-    x_v:        Value,
-    y_v:        Value,
-    pctx:       &PixelCtx,
-    skip_block: ir::Block,
-    skip_args:  &[Value],
-    dm0:        &Dm0,
-    dm1:        &Dm1,
-    is_scr2scr: bool,
-    coord_bias: Value,
-    c0:         Value,
-    c2048:      Value,
-    ptr_type:   ir::Type,
+    b:            &mut FunctionBuilder,
+    x_v:          Value,
+    y_v:          Value,
+    pctx:         &PixelCtx,
+    skip_block:   ir::Block,
+    skip_args:    &[Value],
+    dm0:          &Dm0,
+    dm1:          &Dm1,
+    is_scr2scr:   bool,
+    ensmask_key:  u32,
+    coord_bias:   Value,
+    c0:           Value,
+    c2048:        Value,
+    ptr_type:     ir::Type,
 ) -> (Value, Value, Value) { // (px_ptr, x_bayer, y_bayer)
     // 1. Apply xymove: always in scr2scr (destination offset), conditional on xyoffset in draw.
     //    Mirrors: apply_xymove = is_scr2scr || ctx.drawmode0.xyoffset()
@@ -364,62 +375,56 @@ fn emit_calculate_fb_address(
     let x_abs  = b.ins().iadd(x_curr, xw32);
     let y_abs  = b.ins().iadd(y_curr, yw32);
 
-    // 3. Scissor / smask clipping
+    // 3. Scissor / smask clipping — baked from ensmask_key (compile-time constant).
     let after_clip = b.create_block();
     {
-        let ensmask = b.ins().band_imm(pctx.clipmode_v, 0x1F_i64);
-        // smask0: window-relative
-        let bit0 = b.ins().band_imm(ensmask, 1);
-        let smask0_active = b.ins().icmp_imm(IntCC::NotEqual, bit0, 0);
-        let clip_check0 = b.create_block();
-        let pass0 = b.create_block();
-        b.ins().brif(smask0_active, clip_check0, &[], pass0, &[]);
-        b.switch_to_block(clip_check0); b.seal_block(clip_check0);
-        let sm0x_hi    = b.ins().ushr_imm(pctx.smask0x_v, 16);
-        let sm0x_hi16  = b.ins().ireduce(types::I16, sm0x_hi);
-        let min_x0     = b.ins().sextend(types::I32, sm0x_hi16);
-        let sm0x_lo16  = b.ins().ireduce(types::I16, pctx.smask0x_v);
-        let max_x0     = b.ins().sextend(types::I32, sm0x_lo16);
-        let sm0y_hi    = b.ins().ushr_imm(pctx.smask0y_v, 16);
-        let sm0y_hi16  = b.ins().ireduce(types::I16, sm0y_hi);
-        let min_y0     = b.ins().sextend(types::I32, sm0y_hi16);
-        let sm0y_lo16  = b.ins().ireduce(types::I16, pctx.smask0y_v);
-        let max_y0     = b.ins().sextend(types::I32, sm0y_lo16);
-        let ok0 = and4_range(b, x_curr, y_curr, min_x0, max_x0, min_y0, max_y0);
-        b.ins().brif(ok0, pass0, &[], skip_block, skip_args);
-        b.switch_to_block(pass0); b.seal_block(pass0);
-
-        // smasks 1-4: screen-absolute, OR-combined (any enabled mask that contains the pixel passes)
-        let smask_hi  = b.ins().band_imm(ensmask, 0x1E_i64);
-        let any_smask = b.ins().icmp_imm(IntCC::NotEqual, smask_hi, 0);
-        let smask_check = b.create_block();
-        b.ins().brif(any_smask, smask_check, &[], after_clip, &[]);
-        b.switch_to_block(smask_check); b.seal_block(smask_check);
-        let mut inside_any: Value = b.ins().iconst(types::I8, 0);
-        for (sx, sy, bit_mask) in [
-            (pctx.smask1x_v, pctx.smask1y_v, 2i64),
-            (pctx.smask2x_v, pctx.smask2y_v, 4i64),
-            (pctx.smask3x_v, pctx.smask3y_v, 8i64),
-            (pctx.smask4x_v, pctx.smask4y_v, 16i64),
-        ] {
-            let bit     = b.ins().band_imm(ensmask, bit_mask);
-            let enabled = b.ins().icmp_imm(IntCC::NotEqual, bit, 0);
-            let sx_hi   = b.ins().ushr_imm(sx, 16);
-            let sx_hi16 = b.ins().ireduce(types::I16, sx_hi);
-            let min_x   = b.ins().sextend(types::I32, sx_hi16);
-            let sx_lo16 = b.ins().ireduce(types::I16, sx);
-            let max_x   = b.ins().sextend(types::I32, sx_lo16);
-            let sy_hi   = b.ins().ushr_imm(sy, 16);
-            let sy_hi16 = b.ins().ireduce(types::I16, sy_hi);
-            let min_y   = b.ins().sextend(types::I32, sy_hi16);
-            let sy_lo16 = b.ins().ireduce(types::I16, sy);
-            let max_y   = b.ins().sextend(types::I32, sy_lo16);
-            let in_range = and4_range(b, x_abs, y_abs, min_x, max_x, min_y, max_y);
-            let contrib  = b.ins().band(enabled, in_range);
-            inside_any   = b.ins().bor(inside_any, contrib);
+        // smask0: window-relative clip rect (bit 0 of ensmask)
+        if ensmask_key & 1 != 0 {
+            let sm0x_hi    = b.ins().ushr_imm(pctx.smask0x_v, 16);
+            let sm0x_hi16  = b.ins().ireduce(types::I16, sm0x_hi);
+            let min_x0     = b.ins().sextend(types::I32, sm0x_hi16);
+            let sm0x_lo16  = b.ins().ireduce(types::I16, pctx.smask0x_v);
+            let max_x0     = b.ins().sextend(types::I32, sm0x_lo16);
+            let sm0y_hi    = b.ins().ushr_imm(pctx.smask0y_v, 16);
+            let sm0y_hi16  = b.ins().ireduce(types::I16, sm0y_hi);
+            let min_y0     = b.ins().sextend(types::I32, sm0y_hi16);
+            let sm0y_lo16  = b.ins().ireduce(types::I16, pctx.smask0y_v);
+            let max_y0     = b.ins().sextend(types::I32, sm0y_lo16);
+            let ok0 = and4_range(b, x_curr, y_curr, min_x0, max_x0, min_y0, max_y0);
+            let pass0 = b.create_block();
+            b.ins().brif(ok0, pass0, &[], skip_block, skip_args);
+            b.switch_to_block(pass0); b.seal_block(pass0);
         }
-        let inside = b.ins().icmp_imm(IntCC::NotEqual, inside_any, 0);
-        b.ins().brif(inside, after_clip, &[], skip_block, skip_args);
+
+        // smasks 1-4: screen-absolute, OR-combined (any enabled mask passes the pixel).
+        let active14: &[(Value, Value, u32)] = &[
+            (pctx.smask1x_v, pctx.smask1y_v, 2),
+            (pctx.smask2x_v, pctx.smask2y_v, 4),
+            (pctx.smask3x_v, pctx.smask3y_v, 8),
+            (pctx.smask4x_v, pctx.smask4y_v, 16),
+        ];
+        let enabled14: Vec<_> = active14.iter().filter(|(_, _, bit)| ensmask_key & bit != 0).collect();
+        if !enabled14.is_empty() {
+            let mut inside_any: Value = b.ins().iconst(types::I8, 0);
+            for (sx, sy, _) in &enabled14 {
+                let sx_hi   = b.ins().ushr_imm(*sx, 16);
+                let sx_hi16 = b.ins().ireduce(types::I16, sx_hi);
+                let min_x   = b.ins().sextend(types::I32, sx_hi16);
+                let sx_lo16 = b.ins().ireduce(types::I16, *sx);
+                let max_x   = b.ins().sextend(types::I32, sx_lo16);
+                let sy_hi   = b.ins().ushr_imm(*sy, 16);
+                let sy_hi16 = b.ins().ireduce(types::I16, sy_hi);
+                let min_y   = b.ins().sextend(types::I32, sy_hi16);
+                let sy_lo16 = b.ins().ireduce(types::I16, *sy);
+                let max_y   = b.ins().sextend(types::I32, sy_lo16);
+                let in_range = and4_range(b, x_abs, y_abs, min_x, max_x, min_y, max_y);
+                inside_any   = b.ins().bor(inside_any, in_range);
+            }
+            let inside = b.ins().icmp_imm(IntCC::NotEqual, inside_any, 0);
+            b.ins().brif(inside, after_clip, &[], skip_block, skip_args);
+        } else {
+            b.ins().jump(after_clip, &[]);
+        }
     }
     b.switch_to_block(after_clip); b.seal_block(after_clip);
 
@@ -611,8 +616,11 @@ fn emit_shader(
     is_scr2scr: bool,
     is_hostw: bool,    // DRAW + colorhost/alphahost: read pixels from ctx.hostrw
     is_hostr: bool,    // READ opcode: pack fb pixels into ctx.hostrw
+    clipmode_key: u32,
     ptr_type: ir::Type,
 ) -> bool {
+    let ensmask_key = clipmode_key & 0x1F;
+    let cidmatch    = (clipmode_key >> 9) & 0xF; // 0xF = disabled
     let mut b = FunctionBuilder::new(func, builder_ctx);
     let mem  = MemFlags::trusted();
     let memv = MemFlags::new(); // for potentially-aliased reads after stores
@@ -975,8 +983,29 @@ fn emit_shader(
 
     let (px_ptr, x_bayer, y_bayer) = emit_calculate_fb_address(
         &mut b, x_v, y_v, &pctx, skip_block, clip_skip_args, dm0, dm1, is_scr2scr,
-        coord_bias, c0, c2048, ptr_type,
+        ensmask_key, coord_bias, c0, c2048, ptr_type,
     );
+
+    // CID mask check: skip write if fb_aux[addr] & 0xF != cidmatch.
+    // Only emitted when cidmatch != 0xF (0xF = disabled).
+    // Does not apply to HOSTR (READ) since that reads from fb, not writes to it.
+    if cidmatch != 0xF && !is_hostr {
+        let aux_ptr = {
+            // Re-derive the fb_aux byte offset from px_ptr (which is already byte-offset into fb_rgb).
+            // fb_rgb and fb_aux share the same stride/layout (2048 u32 entries per row),
+            // so the byte offset into fb_aux is the same as into fb_rgb.
+            let fb_rgb_base = pctx.fb_rgb;
+            let byte_off64  = b.ins().isub(px_ptr, fb_rgb_base);
+            b.ins().iadd(pctx.fb_aux, byte_off64)
+        };
+        let aux_raw = b.ins().load(types::I32, memv, aux_ptr, ir::immediates::Offset32::new(0));
+        let aux_lo4 = b.ins().band_imm(aux_raw, 0xF_i64);
+        let cid_matches = b.ins().icmp_imm(IntCC::Equal, aux_lo4, cidmatch as i64);
+        let cid_ok = b.create_block();
+        let cid_skip_args: &[Value] = if is_hostw { &clip_skip_args_buf[..] } else { &[] };
+        b.ins().brif(cid_matches, cid_ok, &[], skip_block, cid_skip_args);
+        b.switch_to_block(cid_ok); b.seal_block(cid_ok);
+    }
 
     // depth_mask used by scr2scr src read and by emit_pixel_write.
     let depth_mask: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
@@ -1384,12 +1413,15 @@ fn emit_shader(
 /// Handles I_LINE, F_LINE, and A_LINE (F_LINE/A_LINE re-use the same Bresenham loop).
 /// Returns false if the mode cannot be compiled.
 fn emit_draw_iline(
-    func:        &mut ir::Function,
-    builder_ctx: &mut FunctionBuilderContext,
-    dm0:         &Dm0,
-    dm1:         &Dm1,
-    ptr_type:    ir::Type,
+    func:         &mut ir::Function,
+    builder_ctx:  &mut FunctionBuilderContext,
+    dm0:          &Dm0,
+    dm1:          &Dm1,
+    clipmode_key: u32,
+    ptr_type:     ir::Type,
 ) -> bool {
+    let ensmask_key = clipmode_key & 0x1F;
+    let cidmatch    = (clipmode_key >> 9) & 0xF;
     // Bresenham octant table (mirrors BRES in draw_iline).
     // Fields: (incrx1, incrx2, incry1, incry2, y_major)
     // Note: MAME applies y as `y -= incry`, so positive incry moves y in negative direction.
@@ -1640,8 +1672,24 @@ fn emit_draw_iline(
     // Lines never use scr2scr or host mode (guarded in compile_shader)
     let (px_ptr, x_bayer, y_bayer) = emit_calculate_fb_address(
         &mut b, x_v, y_v, &pctx, skip_block, &[], dm0, dm1, /*is_scr2scr=*/false,
-        coord_bias, c0, c2048, ptr_type,
+        ensmask_key, coord_bias, c0, c2048, ptr_type,
     );
+
+    // CID mask check for lines (same logic as emit_shader).
+    if cidmatch != 0xF {
+        let aux_ptr = {
+            let fb_rgb_base = pctx.fb_rgb;
+            let byte_off64  = b.ins().isub(px_ptr, fb_rgb_base);
+            b.ins().iadd(pctx.fb_aux, byte_off64)
+        };
+        let aux_raw = b.ins().load(types::I32, memv, aux_ptr, ir::immediates::Offset32::new(0));
+        let aux_lo4 = b.ins().band_imm(aux_raw, 0xF_i64);
+        let cid_matches = b.ins().icmp_imm(IntCC::Equal, aux_lo4, cidmatch as i64);
+        let cid_ok = b.create_block();
+        b.ins().brif(cid_matches, cid_ok, &[], skip_block, &[]);
+        b.switch_to_block(cid_ok); b.seal_block(cid_ok);
+    }
+    let _ = cidmatch; // used above (may be 0xF, in which case guard is skipped)
 
     // Source color (same as emit_shader draw path — no scr2scr for lines)
     let depth_mask: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };

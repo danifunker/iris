@@ -59,11 +59,11 @@ unsafe impl Sync for CompiledShader {}
 
 /// Shared shader store: the RwLock-protected cache of compiled shaders.
 pub struct ShaderStore {
-    pub cache: RwLock<HashMap<(u32, u32), CompiledShader>>,
+    pub cache: RwLock<HashMap<(u32, u32, u32), CompiledShader>>,
     /// Set of keys for which compilation has been requested (to avoid duplicate requests).
-    pub queued: RwLock<HashSet<(u32, u32)>>,
+    pub queued: RwLock<HashSet<(u32, u32, u32)>>,
     /// Set of keys that failed to compile — never retried.
-    pub failed: RwLock<HashSet<(u32, u32)>>,
+    pub failed: RwLock<HashSet<(u32, u32, u32)>>,
 }
 
 impl ShaderStore {
@@ -85,7 +85,7 @@ pub struct RexJit {
 }
 
 enum CompileRequest {
-    Compile(u32, u32),
+    Compile(u32, u32, u32),
     Shutdown,
 }
 
@@ -106,30 +106,37 @@ impl RexJit {
                 let mut compiler = ShaderCompiler::new();
                 for req in rx {
                     match req {
-                        CompileRequest::Compile(dm0, dm1) => {
-                            match compiler.compile_shader(dm0, dm1) {
+                        CompileRequest::Compile(dm0, dm1, cm) => {
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                compiler.compile_shader(dm0, dm1, cm)
+                            }));
+                            let result = match result {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    let msg = if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
+                                              else if let Some(s) = e.downcast_ref::<String>() { s.clone() }
+                                              else { "(unknown panic)".to_string() };
+                                    eprintln!("REX JIT: compile_shader panicked for dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x}: {msg}");
+                                    None
+                                }
+                            };
+                            match result {
                                 Some((entry, code_bytes)) => {
                                     let shader = CompiledShader::new(entry, code_bytes);
                                     let count = {
                                         let mut cache = store_clone.cache.write().unwrap();
-                                        cache.insert((dm0, dm1), shader);
+                                        cache.insert((dm0, dm1, cm), shader);
                                         cache.len()
                                     };
-                                    store_clone.queued.write().unwrap().remove(&(dm0, dm1));
-                                    // Per-shader success is informational, not an error.
-                                    // Route it through the gated dev log (enable with
-                                    // IRIS_DEBUG_LOG=rex3 or the monitor `log rex3` command)
-                                    // instead of spamming stderr on every unique draw mode.
+                                    store_clone.queued.write().unwrap().remove(&(dm0, dm1, cm));
                                     crate::dlog!(
                                         crate::devlog::LogModule::Rex3,
-                                        "REX JIT: compiled dm0={dm0:#010x} dm1={dm1:#010x} ({code_bytes}B, total: {count})"
+                                        "REX JIT: compiled dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x} ({code_bytes}B, total: {count})"
                                     );
                                 }
                                 None => {
-                                    // Compilation failed or not JIT-able; mark as permanently
-                                    // failed so request_compile() never re-queues it.
-                                    store_clone.queued.write().unwrap().remove(&(dm0, dm1));
-                                    store_clone.failed.write().unwrap().insert((dm0, dm1));
+                                    store_clone.queued.write().unwrap().remove(&(dm0, dm1, cm));
+                                    store_clone.failed.write().unwrap().insert((dm0, dm1, cm));
                                 }
                             }
                         }
@@ -146,11 +153,11 @@ impl RexJit {
             _compiler_thread: compiler_thread,
         };
 
-        // Warm-up: queue all profile pairs for pre-compilation.
+        // Warm-up: queue all profile triples for pre-compilation.
         let profile = profile::load_profile();
         let warmup_count = profile.len();
-        for (dm0, dm1) in profile {
-            jit.request_compile(dm0, dm1);
+        for (dm0, dm1, cm) in profile {
+            jit.request_compile(dm0, dm1, cm);
         }
         if warmup_count > 0 {
             eprintln!("REX JIT: started, queued {warmup_count} shader(s) from profile for warm-up");
@@ -161,14 +168,14 @@ impl RexJit {
         jit
     }
 
-    /// Look up a compiled shader for the given draw mode pair.
+    /// Look up a compiled shader for the given (dm0, dm1, clipmode_key) triple.
     /// Returns None if not compiled, not yet available, or manually disabled.
     #[inline]
-    pub fn lookup(&self, dm0: u32, dm1: u32)
+    pub fn lookup(&self, dm0: u32, dm1: u32, cm: u32)
         -> Option<unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32)>
     {
         let cache = self.store.cache.read().unwrap();
-        let shader = cache.get(&(dm0, dm1))?;
+        let shader = cache.get(&(dm0, dm1, cm))?;
         if shader.disabled {
             return None;
         }
@@ -178,35 +185,34 @@ impl RexJit {
     }
 
     /// Disable a specific compiled shader (force interpreter fallback).
-    pub fn disable_shader(&self, dm0: u32, dm1: u32) {
-        if let Some(shader) = self.store.cache.write().unwrap().get_mut(&(dm0, dm1)) {
+    pub fn disable_shader(&self, dm0: u32, dm1: u32, cm: u32) {
+        if let Some(shader) = self.store.cache.write().unwrap().get_mut(&(dm0, dm1, cm)) {
             shader.disabled = true;
         }
     }
 
     /// Re-enable a previously disabled shader.
-    pub fn enable_shader(&self, dm0: u32, dm1: u32) {
-        if let Some(shader) = self.store.cache.write().unwrap().get_mut(&(dm0, dm1)) {
+    pub fn enable_shader(&self, dm0: u32, dm1: u32, cm: u32) {
+        if let Some(shader) = self.store.cache.write().unwrap().get_mut(&(dm0, dm1, cm)) {
             shader.disabled = false;
         }
     }
 
     /// Return info about all known shaders for `rex jit list` / `rex jit status`.
-    /// Fields: (dm0, dm1, status, code_bytes, hit_count)
     /// status: "compiled" | "disabled" | "failed" | "queued"
     pub fn shader_list(&self) -> Vec<ShaderInfo> {
         let cache  = self.store.cache.read().unwrap();
         let failed = self.store.failed.read().unwrap();
         let queued = self.store.queued.read().unwrap();
 
-        let mut all: std::collections::BTreeSet<(u32, u32)> = cache.keys().copied().collect();
+        let mut all: std::collections::BTreeSet<(u32, u32, u32)> = cache.keys().copied().collect();
         all.extend(failed.iter().copied());
         all.extend(queued.iter().copied());
 
-        all.into_iter().map(|(dm0, dm1)| {
-            if let Some(s) = cache.get(&(dm0, dm1)) {
+        all.into_iter().map(|(dm0, dm1, cm)| {
+            if let Some(s) = cache.get(&(dm0, dm1, cm)) {
                 ShaderInfo {
-                    dm0, dm1,
+                    dm0, dm1, cm,
                     status: if s.disabled { "disabled" } else { "compiled" },
                     code_bytes: s.code_bytes,
                     #[cfg(feature = "developer")]
@@ -214,8 +220,8 @@ impl RexJit {
                 }
             } else {
                 ShaderInfo {
-                    dm0, dm1,
-                    status: if failed.contains(&(dm0, dm1)) { "failed" } else { "queued" },
+                    dm0, dm1, cm,
+                    status: if failed.contains(&(dm0, dm1, cm)) { "failed" } else { "queued" },
                     code_bytes: 0,
                     #[cfg(feature = "developer")]
                     hit_count: 0,
@@ -224,56 +230,51 @@ impl RexJit {
         }).collect()
     }
 
-    /// Request background compilation for the given draw mode pair.
+    /// Request background compilation for the given (dm0, dm1, clipmode_key) triple.
     /// No-op if already compiled, permanently failed, or already queued.
-    pub fn request_compile(&self, dm0: u32, dm1: u32) {
-        // Fast path: already compiled or known-bad.
-        if self.store.cache.read().unwrap().contains_key(&(dm0, dm1)) {
+    pub fn request_compile(&self, dm0: u32, dm1: u32, cm: u32) {
+        if self.store.cache.read().unwrap().contains_key(&(dm0, dm1, cm)) {
             return;
         }
-        if self.store.failed.read().unwrap().contains(&(dm0, dm1)) {
+        if self.store.failed.read().unwrap().contains(&(dm0, dm1, cm)) {
             return;
         }
-        // Check-and-set in queued set (write lock, brief).
         {
             let mut queued = self.store.queued.write().unwrap();
-            if !queued.insert((dm0, dm1)) {
-                return; // already queued
+            if !queued.insert((dm0, dm1, cm)) {
+                return;
             }
         }
-        // Non-blocking send: if channel is full, the request is dropped.
-        // The draw thread will retry on the next GO with the same mode.
-        let _ = self.compile_tx.try_send(CompileRequest::Compile(dm0, dm1));
+        let _ = self.compile_tx.try_send(CompileRequest::Compile(dm0, dm1, cm));
     }
 
-    /// Block until a specific (dm0, dm1) shader is compiled (used in tests).
+    /// Block until a specific (dm0, dm1, cm) shader is compiled (used in tests).
     /// Returns true if compiled, false if compilation failed (not in cache after timeout).
     #[cfg(test)]
-    pub fn wait_compiled(&self, dm0: u32, dm1: u32) -> bool {
+    pub fn wait_compiled(&self, dm0: u32, dm1: u32, cm: u32) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            if self.store.cache.read().unwrap().contains_key(&(dm0, dm1)) {
+            if self.store.cache.read().unwrap().contains_key(&(dm0, dm1, cm)) {
                 return true;
             }
-            // If no longer queued and not in cache, compilation failed.
-            if !self.store.queued.read().unwrap().contains(&(dm0, dm1)) {
-                eprintln!("REX JIT: wait_compiled: dm0={dm0:#010x} dm1={dm1:#010x} compile failed");
+            if !self.store.queued.read().unwrap().contains(&(dm0, dm1, cm)) {
+                eprintln!("REX JIT: wait_compiled: dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x} compile failed");
                 return false;
             }
             if std::time::Instant::now() > deadline {
-                eprintln!("REX JIT: wait_compiled: timeout for dm0={dm0:#010x} dm1={dm1:#010x}");
+                eprintln!("REX JIT: wait_compiled: timeout for dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x}");
                 return false;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
-    /// Save the set of compiled draw mode pairs to the profile on disk.
+    /// Save the set of compiled draw mode triples to the profile on disk.
     pub fn save_profile(&self) {
         let cache = self.store.cache.read().unwrap();
-        let pairs: Vec<(u32, u32)> = cache.keys().copied().collect();
+        let triples: Vec<(u32, u32, u32)> = cache.keys().copied().collect();
         drop(cache);
-        if let Err(e) = profile::save_profile(&pairs) {
+        if let Err(e) = profile::save_profile(&triples) {
             eprintln!("REX JIT: failed to save profile: {}", e);
         }
     }
@@ -288,11 +289,11 @@ impl RexJit {
         self.store.queued.read().unwrap().len()
     }
 
-    /// Return a sorted list of all compiled (dm0, dm1) pairs.
-    pub fn compiled_pairs(&self) -> Vec<(u32, u32)> {
-        let mut pairs: Vec<(u32, u32)> = self.store.cache.read().unwrap().keys().copied().collect();
-        pairs.sort();
-        pairs
+    /// Return a sorted list of all compiled (dm0, dm1, cm) triples.
+    pub fn compiled_pairs(&self) -> Vec<(u32, u32, u32)> {
+        let mut triples: Vec<(u32, u32, u32)> = self.store.cache.read().unwrap().keys().copied().collect();
+        triples.sort();
+        triples
     }
 }
 
@@ -300,6 +301,7 @@ impl RexJit {
 pub struct ShaderInfo {
     pub dm0: u32,
     pub dm1: u32,
+    pub cm: u32,
     /// "compiled" | "disabled" | "failed" | "queued"
     pub status: &'static str,
     /// Compiled native code size in bytes (0 for failed/queued).
