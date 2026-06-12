@@ -98,7 +98,7 @@ jobs:
 
       - name: Build iris-gui (standard)
         if: matrix.arch == 'x64'
-        run: cargo build --release --target ${{ matrix.target }} -p iris-gui
+        run: cargo build --release --target ${{ matrix.target }} -p iris-gui --features bundled
 
       - name: Build installer — standard
         if: matrix.arch == 'x64'
@@ -128,7 +128,7 @@ jobs:
 
       - name: Build iris-gui (lightning)
         if: matrix.arch == 'x64'
-        run: cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning
+        run: cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,bundled
 
       - name: Package iris-gui lightning (portable)
         if: matrix.arch == 'x64'
@@ -266,10 +266,10 @@ jobs:
         run: |
           SRC="target/${{ matrix.target }}/release"
 
-          cargo build --release --target ${{ matrix.target }} -p iris-gui
+          cargo build --release --target ${{ matrix.target }} -p iris-gui --features bundled
           cp "${SRC}/iris-gui" "${SRC}/iris-gui-standard"
 
-          cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning
+          cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,bundled
           cp "${SRC}/iris-gui" "${SRC}/iris-gui-lightning"
 
           cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,jit,rex-jit
