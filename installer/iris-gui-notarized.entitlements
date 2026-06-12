@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Developer ID / notarized distribution (the DMG + CLI tarballs from
+         release.yml) — NOT the Mac App Store. These builds are signed with the
+         hardened runtime (codesign --options runtime), which blocks executable
+         memory the kernel can't validate. IRIS's Cranelift JIT (the MIPS JIT and
+         the always-on REX3 draw-shader JIT) allocates code pages with
+         mmap+mprotect, which are exactly that, so without this entitlement the
+         first JITed REX3 draw is killed with SIGKILL/CODESIGNING.
+
+         allow-unsigned-executable-memory permits it and is allowed for
+         Developer ID + notarization. It is REJECTED for the Mac App Store, which
+         is why the App Store build (installer/iris-gui.entitlements, app-sandbox)
+         instead runs interpreter-only via IRIS_NO_JIT (set under the `appstore`
+         feature). See rules/jit/macos-app-sandbox-kills-cranelift-jit-no-map_jit.md.
+
+         No app-sandbox / app-identifier keys here: the notarized DMG is not
+         sandboxed and is not tied to an App Store provisioning profile. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>
