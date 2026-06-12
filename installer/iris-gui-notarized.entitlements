@@ -4,7 +4,7 @@
 <dict>
     <!-- Developer ID / notarized distribution (the DMG + CLI tarballs from
          release.yml) — NOT the Mac App Store. These builds are signed with the
-         hardened runtime (codesign --options runtime), which blocks executable
+         hardened runtime (codesign option `runtime`), which blocks executable
          memory the kernel can't validate. IRIS's Cranelift JIT (the MIPS JIT and
          the always-on REX3 draw-shader JIT) allocates code pages with
          mmap+mprotect, which are exactly that, so without this entitlement the
