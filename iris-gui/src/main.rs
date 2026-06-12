@@ -11,7 +11,7 @@ mod scsi_menu;
 mod settings;
 mod single_instance;
 
-use config_ui::{cfg_to_toml, show_tab, JitEnv, Tab};
+use config_ui::{cfg_to_toml, show_tab, ConfigAction, JitEnv, Tab};
 use dialogs::create_disk::CreateDiskDialog;
 use dialogs::new_machine::{distribute_ram, NewMachineDialog};
 use eframe::egui;
@@ -115,6 +115,8 @@ struct App {
     fullscreen: bool,
     stop_modal: Option<StopModal>,
     missing_modal: Option<MissingDiskModal>,
+    /// Set when the user clicks "Use embedded PROM"; drives a confirmation modal.
+    confirm_embedded_prom: bool,
     new_machine: NewMachineDialog,
     create_disk: CreateDiskDialog,
     /// If true, central panel shows the tabbed config editor; otherwise the
@@ -227,6 +229,7 @@ impl App {
             toast: None,
             stop_modal: None,
             missing_modal: None,
+            confirm_embedded_prom: false,
             new_machine,
             create_disk: CreateDiskDialog::default(),
             show_config_editor: false,
@@ -455,26 +458,32 @@ impl App {
                     }
                     ui.close_menu();
                 }
-                ui.separator();
-                if ui.button("Import iris.toml…").clicked() {
-                    if let Some(path) = native_open_dialog("Import iris.toml", &[("TOML", &["toml"])]) {
-                        let cfg = MachineConfig::load_toml(&path.to_string_lossy());
-                        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("imported");
-                        let name = self.prefs.unique_name(stem);
-                        self.prefs.machines.insert(name.clone(), cfg.clone());
-                        self.prefs.active_machine = Some(name.clone());
-                        self.cfg = cfg;
-                        self.cfg_path = Some(path);
-                        self.flush_machine();
-                        self.toast(format!("imported as '{name}'"));
+                // iris.toml import/export is a source-build affordance for users
+                // who also run the standalone `iris` CLI; the GUI's own gui.json
+                // machine store is the system of record. Hidden in pre-compiled /
+                // App Store builds (the `bundled` feature). See iris-gui Cargo.toml.
+                if !cfg!(feature = "bundled") {
+                    ui.separator();
+                    if ui.button("Import iris.toml…").clicked() {
+                        if let Some(path) = native_open_dialog("Import iris.toml", &[("TOML", &["toml"])]) {
+                            let cfg = MachineConfig::load_toml(&path.to_string_lossy());
+                            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("imported");
+                            let name = self.prefs.unique_name(stem);
+                            self.prefs.machines.insert(name.clone(), cfg.clone());
+                            self.prefs.active_machine = Some(name.clone());
+                            self.cfg = cfg;
+                            self.cfg_path = Some(path);
+                            self.flush_machine();
+                            self.toast(format!("imported as '{name}'"));
+                        }
+                        ui.close_menu();
                     }
-                    ui.close_menu();
-                }
-                if ui.button("Export current to iris.toml…").clicked() {
-                    if let Some(path) = native_save_dialog("Export iris.toml", &[("TOML", &["toml"])]) {
-                        self.save_config(path);
+                    if ui.button("Export current to iris.toml…").clicked() {
+                        if let Some(path) = native_save_dialog("Export iris.toml", &[("TOML", &["toml"])]) {
+                            self.save_config(path);
+                        }
+                        ui.close_menu();
                     }
-                    ui.close_menu();
                 }
                 ui.separator();
                 if ui.button("Quit").clicked() {
@@ -754,7 +763,10 @@ impl App {
             }
         });
         ui.separator();
-        show_tab(ui, self.tab, &mut self.cfg, &mut self.jit);
+        match show_tab(ui, self.tab, &mut self.cfg, &mut self.jit) {
+            ConfigAction::RequestEmbeddedProm => self.confirm_embedded_prom = true,
+            ConfigAction::None => {}
+        }
     }
 
     fn welcome_panel(&mut self, ui: &mut egui::Ui) {
@@ -975,6 +987,32 @@ impl eframe::App for App {
                     self.emu.send(Cmd::Stop);
                 }
             }
+        }
+
+        // Confirm switching from a custom PROM back to the built-in image.
+        if self.confirm_embedded_prom {
+            let prom = self.cfg.prom.clone();
+            let mut close = false;
+            let mut do_clear = false;
+            egui::Window::new("Use embedded PROM?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(RichText::new("Replace the selected PROM with IRIS's built-in PROM?").strong());
+                    ui.label(RichText::new(&prom).weak());
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() { close = true; }
+                        if ui.button("Use embedded PROM").clicked() { do_clear = true; close = true; }
+                    });
+                });
+            if do_clear {
+                self.cfg.prom.clear();
+                self.mark_dirty();
+                self.toast("using embedded PROM");
+            }
+            if close { self.confirm_embedded_prom = false; }
         }
 
         // Missing-disk modal.

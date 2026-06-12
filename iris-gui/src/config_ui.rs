@@ -83,24 +83,57 @@ impl JitEnv {
     }
 }
 
-pub fn show_tab(ui: &mut Ui, tab: Tab, cfg: &mut MachineConfig, jit: &mut JitEnv) {
-    ScrollArea::vertical().show(ui, |ui| match tab {
-        Tab::General => show_general(ui, cfg),
-        Tab::Disks   => show_disks(ui, cfg),
-        Tab::Network => show_network(ui, cfg),
-        Tab::Memory  => show_memory(ui, cfg),
-        Tab::Display => show_display(ui, cfg),
-        Tab::VideoIn => show_vino(ui, cfg),
-        Tab::Debug   => show_debug(ui, cfg, jit),
-        Tab::Ci      => show_ci(ui, cfg),
-    });
+/// Action a config tab asks the app to perform that needs app-level state
+/// (e.g. a confirmation modal) the immediate-mode tab UI doesn't own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfigAction {
+    #[default]
+    None,
+    /// User clicked "Use embedded PROM"; the app should confirm with the user
+    /// and, if accepted, clear `cfg.prom` (an empty path falls back to the
+    /// built-in PROM in `iris::prom::Prom::from_file_or_embedded`).
+    RequestEmbeddedProm,
 }
 
-fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) {
+pub fn show_tab(ui: &mut Ui, tab: Tab, cfg: &mut MachineConfig, jit: &mut JitEnv) -> ConfigAction {
+    ScrollArea::vertical().show(ui, |ui| match tab {
+        Tab::General => show_general(ui, cfg),
+        Tab::Disks   => { show_disks(ui, cfg); ConfigAction::None }
+        Tab::Network => { show_network(ui, cfg); ConfigAction::None }
+        Tab::Memory  => { show_memory(ui, cfg); ConfigAction::None }
+        Tab::Display => { show_display(ui, cfg); ConfigAction::None }
+        Tab::VideoIn => { show_vino(ui, cfg); ConfigAction::None }
+        Tab::Debug   => { show_debug(ui, cfg, jit); ConfigAction::None }
+        Tab::Ci      => { show_ci(ui, cfg); ConfigAction::None }
+    }).inner
+}
+
+fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
+    let mut action = ConfigAction::None;
     ui.heading("General");
     Grid::new("general_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("PROM image");
         path_row(ui, "prom", &mut cfg.prom, Pick::OpenFile, PROM_FILTERS);
+        ui.end_row();
+
+        // Leaving the PROM path empty boots the built-in PROM. Expose that as
+        // an explicit button so reverting from a (possibly missing) custom PROM
+        // is discoverable instead of "delete the text by hand". Disabled when
+        // already empty, so the confirm prompt only ever appears when a custom
+        // PROM is selected.
+        ui.label("");
+        ui.horizontal(|ui| {
+            let custom = !cfg.prom.is_empty();
+            if ui.add_enabled(custom, egui::Button::new("Use embedded PROM"))
+                .on_hover_text("Boot IRIS's built-in PROM instead of a file")
+                .clicked()
+            {
+                action = ConfigAction::RequestEmbeddedProm;
+            }
+            if !custom {
+                ui.label(RichText::new("(using built-in PROM)").weak());
+            }
+        });
         ui.end_row();
 
         ui.label("NVRAM file");
@@ -111,6 +144,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) {
         path_row_opt(ui, "serial_log", &mut cfg.serial_log, Pick::SaveFile, ANY_FILTERS);
         ui.end_row();
     });
+    action
 }
 
 fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig) {
