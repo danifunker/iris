@@ -64,6 +64,38 @@ jobs:
             echo "had_changes=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Vendor fork-only build files onto main
+        run: |
+          BUILD_BRANCH="${{ vars.BUILD_BRANCH || 'build-pipeline-danifunker' }}"
+          git fetch origin "$BUILD_BRANCH"
+          # The Release workflow runs on main and reads some files that are not
+          # upstream (e.g. LICENSE-GPL3.txt, installer/iris-gui-notarized.entitlements),
+          # so the upstream mirror cannot supply them. Re-stock main with exactly
+          # those: everything the build branch has that upstream/main lacks, minus
+          # the fork-management paths that are intentionally build-branch-only.
+          # This is self-adjusting — a new fork-only build input is picked up
+          # automatically; a file that lands upstream drops out (the mirror then
+          # provides it). To keep a fork-only file OFF main, add it to the grep -vE.
+          mapfile -t FILES < <(
+            comm -23 \
+              <(git ls-tree -r "origin/$BUILD_BRANCH" --name-only | sort) \
+              <(git ls-tree -r upstream/main          --name-only | sort) \
+            | grep -vE '^(\.github/|backup/|docs/|CLAUDE\.md$)'
+          )
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "No fork-only build files to vendor."
+          else
+            printf 'Vendoring onto main:\n'; printf '  %s\n' "${FILES[@]}"
+            git checkout "origin/$BUILD_BRANCH" -- "${FILES[@]}"
+            if git diff --cached --quiet; then
+              echo "Vendored files already current on main."
+            else
+              git commit \
+                -m "main: vendor fork-only build files for release packaging" \
+                -m "Auto-maintained by sync-upstream.yml: files release.yml reads (it runs on main) that are not upstream, so the nightly mirror does not carry them. Re-synced from ${BUILD_BRANCH} every night."
+            fi
+          fi
+
       - name: Push updated main
         run: git push origin main --force-with-lease
 
