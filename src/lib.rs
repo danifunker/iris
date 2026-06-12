@@ -53,6 +53,8 @@ pub mod hal2;
 pub mod ps2;
 pub mod ui;
 pub mod rex3;
+pub mod compositor;
+pub mod debug_overlay;
 pub mod vc2;
 pub mod xmap9;
 pub mod cmap;

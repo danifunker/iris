@@ -16,18 +16,24 @@ use crate::disp::Rex3Screen;
 use std::io::Write;
 
 pub trait Renderer: Send {
-    /// Upload and draw the main emulator framebuffer (exactly `width × height` pixels,
-    /// row stride 2048 in the buffer).
-    fn render(&mut self, buffer: &[u32], width: usize, height: usize);
-    /// Upload and alpha-blend the debug overlay on top of the main framebuffer.
-    /// The overlay buffer covers `width × height` pixels, row stride 2048.
-    /// Transparent pixels (alpha=0) leave the main framebuffer visible.
-    fn render_overlay(&mut self, _buffer: &[u32], _width: usize, _height: usize, _overlay_extra_rows: usize) {}
-    /// Upload and draw the status bar texture at the bottom of the window.
-    /// Buffer is `width × STATUS_BAR_HEIGHT` pixels, row stride 2048.
-    fn render_statusbar(&mut self, _buffer: &[u32], _width: usize) {}
+    /// Composite and present one display frame.
+    ///
+    /// The renderer owns its compositor, debug overlay, and status bar texture.
+    /// It drives the full pipeline: compose → overlay → status bar → swap.
+    fn present(
+        &mut self,
+        screen:   &mut crate::disp::Rex3Screen,
+        overlay:  &mut crate::debug_overlay::DebugOverlay,
+        status:   &mut crate::disp::StatusBar,
+        sbtex:    &mut crate::disp::StatusBarTexture,
+        stats:    &crate::disp::BarStats,
+    );
+
     fn resize(&mut self, _width: usize, _height: usize) {}
     fn stop(&mut self) {}
+    /// Return a snapshot of the last composited frame for screenshots.
+    /// Returns None if the compositor doesn't support CPU readback (e.g. pure GL path).
+    fn screenshot_pixels(&self) -> Option<Vec<u32>> { None }
 }
 
 pub const REX3_SIZE: u32 = 0x2000; // 8KB
@@ -1150,33 +1156,7 @@ impl Rex3 {
         let fb_rgb = (0..(2048 * 1024)).map(|_| next_rand()).collect::<Vec<u32>>().into_boxed_slice();
         let fb_aux = (0..(2048 * 1024)).map(|_| next_rand()).collect::<Vec<u32>>().into_boxed_slice();
         
-        let screen = Arc::new(Mutex::new(Rex3Screen {
-            width: 2048,
-            height: 1024,
-            fb_rgb: vec![0; 2048 * 1024],
-            fb_aux: vec![0; 2048 * 1024],
-            did: vec![0; 2048 * 1024],
-            rgba: vec![0; 2048 * 1024],
-            overlay_rgba: vec![0; 2048 * 1024],
-            statusbar_rgba: vec![0; 2048 * crate::disp::STATUS_BAR_HEIGHT],
-            vc2_ram: vec![0; 32768],
-            vc2_regs: [0; 32],
-            cmap: [0; 8192],
-            ramdac_palette: [0; 256],
-            xmap_mode: [0; 32],
-            xmap_config: 0,
-            xmap_cursor_cmap: 0,
-            xmap_popup_cmap: 0,
-            topscan: 0,
-            cursor_x_adjust: 0,
-            show_cmap: false,
-            show_disp_debug: false,
-            seen_modes: [(0, 0, 0); 32],
-            seen_modes_count: 0,
-            show_draw_debug: false,
-            draw_snapshot: Vec::new(),
-            debug_font: crate::vga_font::VGA_8X16.to_vec(),
-        }));
+        let screen = Arc::new(Mutex::new(crate::disp::Rex3Screen::new()));
 
         Self {
             config,
@@ -3432,7 +3412,9 @@ impl Rex3 {
 
     fn refresh_loop(&self) {
         let frame_duration = std::time::Duration::from_micros(16667); // ~60Hz
-        let mut status_bar = crate::disp::StatusBar::new();
+        let mut status_bar  = crate::disp::StatusBar::new();
+        let mut overlay     = crate::debug_overlay::DebugOverlay::new();
+        let mut sbtex       = crate::disp::StatusBarTexture::new();
         // Idle-skip bookkeeping (see the should_render gate below).
         let mut last_topscan: usize = usize::MAX;
         let mut frames_since_render: u32 = u32::MAX;
@@ -3528,47 +3510,42 @@ impl Rex3 {
                 self.diag.fetch_or(Self::DIAG_LOCK_SCREEN, Ordering::Relaxed);
                 let mut screen = self.screen.lock();
                 screen.topscan = topscan;
-                screen.show_cmap = self.show_cmap.load(Ordering::Relaxed);
-                screen.show_disp_debug = self.show_disp_debug.load(Ordering::Relaxed);
+
+                // Push debug state into overlay
+                overlay.show_cmap       = self.show_cmap.load(Ordering::Relaxed);
+                overlay.show_disp_debug = self.show_disp_debug.load(Ordering::Relaxed);
                 let dd = self.draw_debug.load(Ordering::Relaxed);
-                screen.show_draw_debug = dd;
+                overlay.show_draw_debug = dd;
                 if dd {
                     let ring = self.draw_ring.lock();
-                    screen.draw_snapshot.clear();
-                    screen.draw_snapshot.extend(ring.iter_newest_first().copied());
+                    overlay.draw_snapshot.clear();
+                    overlay.draw_snapshot.extend(ring.iter_newest_first().copied());
                 }
+                overlay.reset_frame();
+
                 self.diag.fetch_or(Self::DIAG_LOCK_RENDERER, Ordering::Relaxed);
                 let mut renderer = self.renderer.lock();
 
-                (*screen).refresh(
+                let resized = screen.refresh(
                     &**fb_rgb,
                     &**fb_aux,
                     &self.vc2,
                     &self.xmap0,
                     &self.cmap0,
                     &self.bt445,
-                    &mut *renderer,
                     &self.diag,
                 );
-
-                // Screenshot: snapshot rgba into a new Vec and save in a background thread.
-                if self.screenshot_pending.swap(false, Ordering::Relaxed) {
-                    let n = self.screenshot_counter.fetch_add(1, Ordering::Relaxed);
-                    let path = format!("screenshot_{:04}.png", n);
-                    let width = screen.width;
-                    let height = screen.height;
-                    let pixels = screen.rgba.clone();
-                    thread::spawn(move || {
-                        match crate::disp::save_screenshot(&path, &pixels, width, height) {
-                            Ok(()) => println!("iris: screenshot saved to {}", path),
-                            Err(e) => println!("iris: screenshot failed: {}", e),
-                        }
-                    });
+                if resized {
+                    if let Some(ref mut r) = *renderer {
+                        r.resize(screen.width, screen.height);
+                    }
                 }
 
-                // Pixel data is now copied into screen.rgba — assert VBLANK here so
-                // the CPU gets the maximum window (GL upload + sleep) to react before
-                // the next refresh() reads the framebuffer again.
+                // Screenshot: grab pixels from the compositor before presenting.
+                let take_screenshot = self.screenshot_pending.swap(false, Ordering::Relaxed);
+
+                // Assert VBLANK: device state is now copied into screen caches, so
+                // the CPU gets the maximum window to react before the next refresh.
                 self.config.status.fetch_or(STATUS_VRINT, Ordering::Relaxed);
                 {
                     self.diag.fetch_or(Self::DIAG_LOCK_VC2, Ordering::Relaxed);
@@ -3584,30 +3561,29 @@ impl Rex3 {
                     if let Some(cb) = cb { cb(true); }
                 }
 
-                let height = screen.height;
-                let width  = screen.width;
+                // Present: compositor → overlay → status bar → swap
+                if screen.width > 0 && screen.height > 0 {
+                    if let Some(ref mut r) = *renderer {
+                        self.diag.fetch_or(Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
+                        r.present(&mut *screen, &mut overlay, &mut status_bar, &mut sbtex, &bar_stats);
+                        self.diag.fetch_and(!Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
+                    }
 
-                // Render main framebuffer (exact display size, no overlays)
-                if let Some(ref mut r) = *renderer {
-                    self.diag.fetch_or(Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
-                    r.render(&screen.rgba, width, height);
-                    self.diag.fetch_and(!Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
+                    if take_screenshot {
+                        let width  = screen.width;
+                        let height = screen.height;
+                        let pixels = screen.rgba.clone();
+                        let n      = self.screenshot_counter.fetch_add(1, Ordering::Relaxed);
+                        let path   = format!("screenshot_{:04}.png", n);
+                        thread::spawn(move || {
+                            match crate::disp::save_screenshot(&path, &pixels, width, height) {
+                                Ok(()) => println!("iris: screenshot saved to {}", path),
+                                Err(e) => println!("iris: screenshot failed: {}", e),
+                            }
+                        });
+                    }
                 }
 
-                // Build debug overlay and composite it on top
-                screen.render_overlay();
-                if let Some(ref mut r) = *renderer {
-                    self.diag.fetch_or(Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
-                    r.render_overlay(&screen.overlay_rgba, width, height, 0);
-                    self.diag.fetch_and(!Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
-                }
-                // Build and render status bar as a separate texture at the bottom
-                screen.render_status_bar(&mut status_bar, &bar_stats);
-                if let Some(ref mut r) = *renderer {
-                    self.diag.fetch_or(Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
-                    r.render_statusbar(&screen.statusbar_rgba, width);
-                    self.diag.fetch_and(!Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
-                }
                 self.diag.fetch_and(!(Self::DIAG_LOCK_SCREEN | Self::DIAG_LOCK_RENDERER), Ordering::Relaxed);
             } else {
                 // Nothing visible changed — skip the full refresh + GL upload and
@@ -4233,7 +4209,7 @@ impl Device for Rex3 {
             writeln!(writer, "=== Display ===").unwrap();
             writeln!(writer, "  resolution: {}x{}", screen.width, screen.height).unwrap();
             writeln!(writer, "  topscan: {:03x}  (fb row {} maps to display row 0)", screen.topscan, (screen.topscan + 1) & 0x3FF).unwrap();
-            writeln!(writer, "  show_disp_debug: {}", screen.show_disp_debug).unwrap();
+            writeln!(writer, "  show_disp_debug: {}", self.show_disp_debug.load(Ordering::Relaxed)).unwrap();
             return Ok(());
         }
 

@@ -2,12 +2,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use winit::{
-    event::{ElementState, Event, KeyEvent, WindowEvent, MouseButton}, event_loop::{ControlFlow, EventLoop}, keyboard::{KeyCode, PhysicalKey}, window::{Window, WindowBuilder}
+    event::{ElementState, Event, KeyEvent, WindowEvent, MouseButton},
+    event_loop::{ControlFlow, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
+    window::{Window, WindowBuilder},
 };
 use glow::HasContext;
 use crate::ps2::Ps2Controller;
 use crate::rex3::{Rex3, Renderer};
-use crate::disp::STATUS_BAR_HEIGHT;
+use crate::disp::{Rex3Screen, StatusBar, StatusBarTexture, BarStats, STATUS_BAR_HEIGHT};
+use crate::compositor::{Compositor, SwCompositor};
+use crate::debug_overlay::DebugOverlay;
 use crate::hptimer::{TimerManager, TimerReturn};
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextAttributesBuilder, PossiblyCurrentContext};
@@ -26,34 +31,29 @@ struct GlState {
     gl: glow::Context,
     context: PossiblyCurrentContext,
     surface: Surface<WindowSurface>,
-    // Main emulator framebuffer texture (2048 × 1024, opaque)
-    main_tex: glow::Texture,
-    // Debug overlay texture (2048 × 1024, alpha-blended over main)
-    overlay_tex: glow::Texture,
-    // Status bar texture (2048 × STATUS_BAR_HEIGHT, opaque)
-    statusbar_tex: glow::Texture,
-    // Single program used for all three passes (texelFetch y-flip via uniform)
+    // Shader program: one program for all draw passes (texelFetch + y-flip)
     program: glow::Program,
     viewport_info_loc: Option<glow::UniformLocation>,
-    scale_factor_loc: Option<glow::UniformLocation>,
-    // Shared VAO + two VBOs: one for the emulator quad, one for the statusbar quad
-    vao: glow::VertexArray,
-    main_vbo: glow::Buffer,    // quad covering top `height` px of window
-    status_vbo: glow::Buffer,  // quad covering bottom STATUS_BAR_HEIGHT px of window
+    scale_factor_loc:  Option<glow::UniformLocation>,
+    // Shared VAO + two VBOs: emulator quad and status-bar quad
+    vao:        glow::VertexArray,
+    main_vbo:   glow::Buffer,
+    status_vbo: glow::Buffer,
 }
 
 struct GlRenderer {
-    window: Arc<Window>,
-    gl_config: glutin::config::Config,
+    window:      Arc<Window>,
+    gl_config:   glutin::config::Config,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
-    state: Option<GlState>,
-    current_w: usize,
-    current_h: usize,
-    scale: u32,
+    state:       Option<GlState>,
+    compositor:  SwCompositor,
+    current_w:   usize,
+    current_h:   usize,
+    scale:       u32,
 }
 
-// Safety: GlRenderer is sent to the refresh thread where it initializes and uses the GL context.
-// The context is never accessed from multiple threads simultaneously or from a thread other than the one it was created on.
+// Safety: GlRenderer is sent to the refresh thread where it owns and uses the GL context.
+// No other thread touches these fields.
 unsafe impl Send for GlRenderer {}
 
 impl GlRenderer {
@@ -83,28 +83,9 @@ impl GlRenderer {
             })
         };
 
-        // Enable VSync
         let _ = gl_surface.set_swap_interval(&gl_context, SwapInterval::Wait(NonZeroU32::new(1).unwrap()));
 
-        let (main_tex, overlay_tex, statusbar_tex, program, viewport_info_loc, scale_factor_loc, vao, main_vbo, status_vbo) = unsafe {
-            // Helper: allocate a 2D texture with NEAREST filtering
-            let make_tex = |w: i32, h: i32| -> glow::Texture {
-                let t = gl.create_texture().unwrap();
-                gl.bind_texture(glow::TEXTURE_2D, Some(t));
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
-                gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32, w, h, 0, glow::RGBA, glow::UNSIGNED_BYTE, None);
-                t
-            };
-
-            let main_tex      = make_tex(2048, 1024);
-            let overlay_tex   = make_tex(2048, 1024);
-            let statusbar_tex = make_tex(2048, STATUS_BAR_HEIGHT as i32);
-
-            // Single shader program used for all passes.
-            // viewport_info[0] = (tex_width, tex_height) — dimensions of the texture region being sampled
-            // viewport_info[1] = (0, window_y_base) — bottom pixel row of this quad in window coords
-            // Y flip: tex_y = (tex_height - 1) - (gl_FragCoord.y - window_y_base)
+        let (program, viewport_info_loc, scale_factor_loc, vao, main_vbo, status_vbo) = unsafe {
             let vs_src = "
                 #version 150
                 in vec2 position;
@@ -157,7 +138,6 @@ impl GlRenderer {
             }
 
             if !linked {
-                // Fallback (UV-based, no texelFetch)
                 gl.shader_source(fs, "
                     #version 150
                     in vec2 v_tex_coord;
@@ -184,31 +164,25 @@ impl GlRenderer {
 
             let vao = gl.create_vertex_array().unwrap();
             gl.bind_vertex_array(Some(vao));
-
             gl.use_program(Some(program));
 
-            // main_vbo: emulator quad
             let main_vbo = gl.create_buffer().unwrap();
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(main_vbo));
             gl.buffer_data_size(glow::ARRAY_BUFFER, VBO_SIZE, glow::DYNAMIC_DRAW);
             Self::bind_vbo_attribs(&gl, program, main_vbo);
 
-            // status_vbo: status bar quad (separate buffer, same attrib layout)
             let status_vbo = gl.create_buffer().unwrap();
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(status_vbo));
             gl.buffer_data_size(glow::ARRAY_BUFFER, VBO_SIZE, glow::DYNAMIC_DRAW);
             Self::bind_vbo_attribs(&gl, program, status_vbo);
 
-            (main_tex, overlay_tex, statusbar_tex, program, viewport_info_loc, scale_factor_loc, vao, main_vbo, status_vbo)
+            (program, viewport_info_loc, scale_factor_loc, vao, main_vbo, status_vbo)
         };
 
         self.state = Some(GlState {
             gl,
             context: gl_context,
             surface: gl_surface,
-            main_tex,
-            overlay_tex,
-            statusbar_tex,
             program,
             viewport_info_loc,
             scale_factor_loc,
@@ -218,17 +192,11 @@ impl GlRenderer {
         });
     }
 
-    // Upload pixel data to a texture (row stride = 2048 in buffer).
-    unsafe fn upload_tex(gl: &glow::Context, tex: glow::Texture, buf: &[u32], w: i32, h: i32) {
-        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 2048);
-        let u8_slice = std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4);
-        gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, w, h, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(u8_slice));
-        gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
-    }
-
-    // Upload quad vertices covering NDC [x0..x1] × [y0..y1], sampling UV [u0..u1] × [v0..v1].
-    unsafe fn upload_quad(gl: &glow::Context, vbo: glow::Buffer, x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, u1: f32, v1: f32) {
+    // Upload a quad covering NDC [x0..x1] × [y0..y1] with UV [u0..u1] × [v0..v1].
+    unsafe fn upload_quad(gl: &glow::Context, vbo: glow::Buffer,
+        x0: f32, y0: f32, x1: f32, y1: f32,
+        u0: f32, v0: f32, u1: f32, v1: f32)
+    {
         let vertices: [f32; 16] = [
             x0, y0,  u0, v1,
             x1, y0,  u1, v1,
@@ -240,20 +208,19 @@ impl GlRenderer {
         gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, u8_slice);
     }
 
-    // Set viewport_info uniform: tex dimensions + window y-base of this quad.
-    unsafe fn set_viewport_info(gl: &glow::Context, loc: Option<&glow::UniformLocation>, tex_w: i32, tex_h: i32, win_y_base: i32) {
+    unsafe fn set_viewport_info(gl: &glow::Context, loc: Option<&glow::UniformLocation>,
+        tex_w: i32, tex_h: i32, win_y_base: i32)
+    {
         let info = [tex_w, tex_h, 0, win_y_base];
         gl.uniform_2_i32_slice(loc, &info);
     }
 
-    // Set scale_factor uniform. Guarded against None so optimized-out uniforms don't panic.
     unsafe fn set_scale_factor(gl: &glow::Context, loc: Option<&glow::UniformLocation>, scale: u32) {
         if let Some(loc) = loc {
             gl.uniform_1_i32(Some(loc), scale as i32);
         }
     }
 
-    // Bind the VAO and set up attribs for a given VBO (both share the same layout).
     unsafe fn bind_vbo_attribs(gl: &glow::Context, program: glow::Program, vbo: glow::Buffer) {
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
         let pos_loc = gl.get_attrib_location(program, "position").unwrap();
@@ -264,16 +231,49 @@ impl GlRenderer {
             gl.vertex_attrib_pointer_f32(tex_loc, 2, glow::FLOAT, false, 16, 8);
         }
     }
+
+    // Draw a texture onto a quad, setting the appropriate viewport_info uniform.
+    unsafe fn draw_tex(
+        gl: &glow::Context,
+        program: glow::Program,
+        vao: glow::VertexArray,
+        vbo: glow::Buffer,
+        viewport_info_loc: Option<&glow::UniformLocation>,
+        scale_factor_loc: Option<&glow::UniformLocation>,
+        tex: glow::Texture,
+        tex_w: i32, tex_h: i32,
+        win_y_base: i32,
+        scale: u32,
+    ) {
+        gl.use_program(Some(program));
+        gl.bind_vertex_array(Some(vao));
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        Self::bind_vbo_attribs(gl, program, vbo);
+        Self::set_viewport_info(gl, viewport_info_loc, tex_w, tex_h, win_y_base);
+        Self::set_scale_factor(gl, scale_factor_loc, scale);
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+    }
 }
 
 impl Renderer for GlRenderer {
-    fn render(&mut self, buffer: &[u32], width: usize, height: usize) {
+    fn present(
+        &mut self,
+        screen:  &mut Rex3Screen,
+        overlay: &mut DebugOverlay,
+        status:  &mut StatusBar,
+        sbtex:   &mut StatusBarTexture,
+        stats:   &BarStats,
+    ) {
         if self.state.is_none() {
             self.init_gl();
         }
 
+        let width  = screen.width;
+        let height = screen.height;
+        if width == 0 || height == 0 { return; }
+
         let state = self.state.as_mut().unwrap();
-        let gl = &state.gl;
+        let gl    = &state.gl;
 
         // Handle window resize
         let win_h = if let Some((w, h)) = self.window_size.lock().take() {
@@ -288,97 +288,77 @@ impl Renderer for GlRenderer {
             (height + STATUS_BAR_HEIGHT) * self.scale as usize
         };
 
-        unsafe {
-            gl.use_program(Some(state.program));
-            gl.bind_vertex_array(Some(state.vao));
-
-            // Recompute quads if emulator resolution changed
-            if width != self.current_w || height != self.current_h {
-                self.current_w = width;
-                self.current_h = height;
-
-                let max_u = width as f32 / 2048.0;
-                let max_v_main = height as f32 / 1024.0;
-                let max_v_sb   = 1.0f32; // status bar texture is exactly STATUS_BAR_HEIGHT tall
-
-                // NDC y of the boundary between emulator display and status bar.
-                // Window: y=0 (bottom) = status bar bottom, y=win_h (top) = display top.
-                // Status bar: bottom STATUS_BAR_HEIGHT*scale px → NDC [-1 .. sb_ndc_top]
-                let sb_ndc_top = -1.0 + 2.0 * (STATUS_BAR_HEIGHT * self.scale as usize) as f32 / win_h as f32;
-
-                // Emulator quad: NDC [sb_ndc_top .. +1], full width
+        // Recompute quads when display resolution changes
+        if width != self.current_w || height != self.current_h {
+            self.current_w = width;
+            self.current_h = height;
+            let max_u      = width  as f32 / 2048.0;
+            let max_v_main = height as f32 / 1024.0;
+            let sb_ndc_top = -1.0 + 2.0 * (STATUS_BAR_HEIGHT * self.scale as usize) as f32 / win_h as f32;
+            unsafe {
                 Self::upload_quad(gl, state.main_vbo,
                     -1.0, sb_ndc_top, 1.0, 1.0,
                     0.0, 0.0, max_u, max_v_main);
-
-                // Status bar quad: NDC [-1 .. sb_ndc_top], full width
                 Self::upload_quad(gl, state.status_vbo,
                     -1.0, -1.0, 1.0, sb_ndc_top,
-                    0.0, 0.0, max_u, max_v_sb);
+                    0.0, 0.0, max_u, 1.0);
+            }
+        }
+
+        unsafe {
+            gl.use_program(Some(state.program));
+            gl.bind_vertex_array(Some(state.vao));
+
+            // ── Pass 1: compositor → main texture (opaque) ──────────────────
+            gl.disable(glow::BLEND);
+            let src      = screen.compositor_source();
+            let main_tex = self.compositor.compose(&src, gl);
+            // Write back CPU pixels for screenshots / CI reads
+            if let Some(pixels) = self.compositor.read_pixels() {
+                screen.rgba.copy_from_slice(pixels);
+            }
+            Self::draw_tex(
+                gl, state.program, state.vao, state.main_vbo,
+                state.viewport_info_loc.as_ref(), state.scale_factor_loc.as_ref(),
+                main_tex,
+                width as i32, height as i32,
+                (STATUS_BAR_HEIGHT as u32 * self.scale) as i32,
+                self.scale,
+            );
+
+            // ── Pass 2: debug overlay (alpha-blended) ────────────────────────
+            if overlay.active() {
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                let ov_src   = screen.overlay_source();
+                let ov_tex   = overlay.render(&ov_src, gl);
+                Self::draw_tex(
+                    gl, state.program, state.vao, state.main_vbo,
+                    state.viewport_info_loc.as_ref(), state.scale_factor_loc.as_ref(),
+                    ov_tex,
+                    width as i32, height as i32,
+                    (STATUS_BAR_HEIGHT as u32 * self.scale) as i32,
+                    self.scale,
+                );
+                gl.disable(glow::BLEND);
             }
 
-            // --- Pass 1: main framebuffer (opaque) ---
-            gl.disable(glow::BLEND);
-            Self::upload_tex(gl, state.main_tex, buffer, width as i32, height as i32);
-            Self::bind_vbo_attribs(gl, state.program, state.main_vbo);
-            // win_y_base for main quad = STATUS_BAR_HEIGHT (bottom of emulator area in window coords)
-            Self::set_viewport_info(gl, state.viewport_info_loc.as_ref(),
-                width as i32, height as i32, (STATUS_BAR_HEIGHT as u32 * self.scale) as i32);
-            Self::set_scale_factor(gl, state.scale_factor_loc.as_ref(), self.scale);
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-
-            // swap_buffers called in render_overlay after all passes
-        }
-    }
-
-    fn render_overlay(&mut self, buffer: &[u32], width: usize, height: usize, _overlay_extra_rows: usize) {
-        if self.state.is_none() { return; }
-        let state = self.state.as_mut().unwrap();
-        let gl = &state.gl;
-
-        unsafe {
-            gl.use_program(Some(state.program));
-            gl.bind_vertex_array(Some(state.vao));
-
-            // --- Pass 2: debug overlay (alpha-blended over main) ---
-            gl.enable(glow::BLEND);
-            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
-            Self::upload_tex(gl, state.overlay_tex, buffer, width as i32, height as i32);
-            Self::bind_vbo_attribs(gl, state.program, state.main_vbo);
-            Self::set_viewport_info(gl, state.viewport_info_loc.as_ref(),
-                width as i32, height as i32, (STATUS_BAR_HEIGHT as u32 * self.scale) as i32);
-            Self::set_scale_factor(gl, state.scale_factor_loc.as_ref(), self.scale);
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-
-            gl.disable(glow::BLEND);
-        }
-    }
-
-    fn render_statusbar(&mut self, buffer: &[u32], width: usize) {
-        if self.state.is_none() { return; }
-        let state = self.state.as_mut().unwrap();
-        let gl = &state.gl;
-
-        unsafe {
-            gl.use_program(Some(state.program));
-            gl.bind_vertex_array(Some(state.vao));
-
-            // --- Pass 3: status bar (opaque, bottom of window) ---
-            gl.disable(glow::BLEND);
-            Self::upload_tex(gl, state.statusbar_tex, buffer, width as i32, STATUS_BAR_HEIGHT as i32);
-            Self::bind_vbo_attribs(gl, state.program, state.status_vbo);
-            // win_y_base = 0: status bar sits at the very bottom of the window
-            Self::set_viewport_info(gl, state.viewport_info_loc.as_ref(),
-                width as i32, STATUS_BAR_HEIGHT as i32, 0);
-            Self::set_scale_factor(gl, state.scale_factor_loc.as_ref(), self.scale);
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            // ── Pass 3: status bar (opaque, bottom of window) ────────────────
+            let sb_tex = sbtex.render_and_upload(status, stats, width, gl);
+            Self::draw_tex(
+                gl, state.program, state.vao, state.status_vbo,
+                state.viewport_info_loc.as_ref(), state.scale_factor_loc.as_ref(),
+                sb_tex,
+                width as i32, STATUS_BAR_HEIGHT as i32,
+                0,
+                self.scale,
+            );
 
             state.surface.swap_buffers(&state.context).unwrap();
         }
     }
 
     fn resize(&mut self, width: usize, height: usize) {
-        // Resize window to display + status bar, scaled for HiDPI
         let _ = self.window.request_inner_size(winit::dpi::PhysicalSize::new(
             width as u32 * self.scale,
             (height + STATUS_BAR_HEIGHT) as u32 * self.scale,
@@ -386,9 +366,15 @@ impl Renderer for GlRenderer {
     }
 
     fn stop(&mut self) {
-        self.state = None;
+        if let Some(state) = self.state.take() {
+            self.compositor.destroy(&state.gl);
+        }
         self.current_w = 0;
         self.current_h = 0;
+    }
+
+    fn screenshot_pixels(&self) -> Option<Vec<u32>> {
+        self.compositor.read_pixels().map(|s| s.to_vec())
     }
 }
 
@@ -429,26 +415,23 @@ impl Ui {
             .build(event_loop, template, |configs| {
                 configs
                     .reduce(|accum, config| {
-                        if config.num_samples() > accum.num_samples() {
-                            config
-                        } else {
-                            accum
-                        }
+                        if config.num_samples() > accum.num_samples() { config } else { accum }
                     })
                     .unwrap()
             })
             .unwrap();
 
-        let window = Arc::new(window.unwrap());
+        let window      = Arc::new(window.unwrap());
         let window_size = Arc::new(Mutex::new(None));
 
         let renderer = GlRenderer {
-            window: window.clone(),
+            window:      window.clone(),
             gl_config,
             window_size: window_size.clone(),
-            state: None,
-            current_w: 0,
-            current_h: 0,
+            state:       None,
+            compositor:  SwCompositor::new(),
+            current_w:   0,
+            current_h:   0,
             scale,
         };
 
@@ -465,9 +448,8 @@ impl Ui {
         let mut rctrl_held = false;
         let mouse_delta = Arc::new(Mutex::new(MouseDelta { accum: (0.0, 0.0), wheel: 0.0, buttons: 0 }));
 
-        // 10ms recurring timer: flush accumulated mouse delta to PS/2.
         {
-            let ps2 = ps2.clone();
+            let ps2   = ps2.clone();
             let delta = mouse_delta.clone();
             timer_manager.add_recurring(
                 Instant::now() + Duration::from_millis(10),
@@ -480,11 +462,6 @@ impl Ui {
             );
         }
 
-        // Wait (not Poll): block the main thread until a real input event
-        // arrives, so an idle desktop doesn't busy-spin a host core. Rendering
-        // is driven by the REX3 refresh thread (RedrawRequested below is a
-        // no-op) and mouse-flush is on timer_manager, so the event loop has no
-        // reason to tick when idle.
         event_loop.set_control_flow(ControlFlow::Wait);
         event_loop.run(move |event, elwt| {
             match event {
@@ -502,21 +479,18 @@ impl Ui {
                         if mouse_grabbed {
                             let pressed = state == ElementState::Pressed;
                             let mask = match button {
-                                MouseButton::Left => 1,
-                                MouseButton::Right => 2,
+                                MouseButton::Left   => 1,
+                                MouseButton::Right  => 2,
                                 MouseButton::Middle => 4,
                                 _ => 0,
                             };
                             if mask != 0 {
-                                // Update button state first, then flush — the flush packet
-                                // carries both the accumulated motion and the new button state.
                                 let mut md = mouse_delta.lock();
                                 if pressed { md.buttons |= mask; } else { md.buttons &= !mask; }
                                 drop(md);
                                 Self::flush_mouse_delta(&ps2, &mouse_delta, false);
                             }
-                        }
-                        else if state == ElementState::Pressed && button == MouseButton::Left {
+                        } else if state == ElementState::Pressed && button == MouseButton::Left {
                             mouse_grabbed = true;
                             if window.set_cursor_grab(winit::window::CursorGrabMode::Locked).is_err() {
                                 let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
@@ -529,7 +503,7 @@ impl Ui {
                         if mouse_grabbed {
                             let lines = match delta {
                                 winit::event::MouseScrollDelta::LineDelta(_, y) => y as f64,
-                                winit::event::MouseScrollDelta::PixelDelta(p) => p.y / scroll_pixels_per_line,
+                                winit::event::MouseScrollDelta::PixelDelta(p)  => p.y / scroll_pixels_per_line,
                             };
                             mouse_delta.lock().wheel += lines;
                         }
@@ -542,13 +516,10 @@ impl Ui {
                         }
                     }
                     WindowEvent::RedrawRequested => {
-                        // Rendering is handled by Rex3 refresh thread
+                        // Rendering is driven by the Rex3 refresh thread
                     }
                     _ => (),
                 },
-                // When CursorGrabMode::Locked is active, winit sends raw mouse
-                // motion as DeviceEvent instead of CursorMoved. This is the
-                // primary motion source on Wayland and for trackpads on X11.
                 Event::DeviceEvent { event: winit::event::DeviceEvent::MouseMotion { delta }, .. } => {
                     if mouse_grabbed {
                         let mut md = mouse_delta.lock();
@@ -561,19 +532,15 @@ impl Ui {
         }).unwrap();
     }
 
-    /// Flush accumulated delta to PS/2. If `require_motion` is true, skips
-    /// sending when there is no accumulated movement (used by the timer).
     fn flush_mouse_delta(ps2: &Ps2Controller, mouse_delta: &Mutex<MouseDelta>, require_motion: bool) {
         let mut md = mouse_delta.lock();
         let dx = md.accum.0 as i32;
         let dy = md.accum.1 as i32;
         let dz = md.wheel as i32;
-        if require_motion && dx == 0 && dy == 0 && dz == 0 {
-            return;
-        }
+        if require_motion && dx == 0 && dy == 0 && dz == 0 { return; }
         md.accum.0 -= dx as f64;
         md.accum.1 -= dy as f64;
-        md.wheel -= dz as f64;
+        md.wheel   -= dz as f64;
         let buttons = md.buttons;
         drop(md);
         ps2.push_mouse_input(buttons, dx, dy, dz);
@@ -584,7 +551,6 @@ impl Ui {
         if let PhysicalKey::Code(keycode) = input.physical_key {
             let pressed = input.state == ElementState::Pressed;
 
-            // Right Ctrl: ungrab mouse — consumed, not forwarded to PS/2.
             if keycode == KeyCode::ControlRight {
                 *rctrl_held = pressed;
                 if pressed && !input.repeat && *grabbed {
@@ -595,15 +561,12 @@ impl Ui {
                 return;
             }
 
-            // RightCtrl+PrintScreen: request screenshot on next frame.
             if keycode == KeyCode::PrintScreen && pressed && !input.repeat && *rctrl_held {
                 rex3.screenshot_pending.store(true, Ordering::Relaxed);
                 return;
             }
 
-            // Pass to PS/2
             ps2.push_kb(keycode, pressed);
         }
     }
-
 }
