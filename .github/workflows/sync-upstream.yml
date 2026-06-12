@@ -10,7 +10,9 @@ name: Sync Upstream
 
 on:
   schedule:
-    - cron: '0 2 * * *'
+    # 10:30 UTC = 06:30 EDT. GitHub cron is always UTC and ignores DST, so
+    # during EST (winter) this fires at 05:30 local.
+    - cron: '30 10 * * *'
   workflow_dispatch:
     inputs:
       build_branch:
@@ -69,21 +71,60 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # notify TITLE BODY — open a deduped GitHub issue, but fall back to a
+          # run annotation + job summary if Issues are disabled on the repo, so
+          # a missing issues feature never hard-fails the workflow.
+          notify() {
+            title="$1"; body="$2"
+            existing=$(gh issue list --state open --search "$title" --json number --jq length 2>/dev/null) || existing=""
+            if [ "$existing" = "0" ]; then
+              gh issue create --title "$title" --body "$body" 2>/dev/null && return 0
+            elif [ -n "$existing" ]; then
+              return 0
+            fi
+            echo "::warning title=${title}::${body}"
+            { printf '### %s\n\n%s\n' "$title" "$body"; } >> "$GITHUB_STEP_SUMMARY"
+          }
+
           BUILD_BRANCH="${{ vars.BUILD_BRANCH || 'build-pipeline-danifunker' }}"
           git fetch origin "$BUILD_BRANCH"
           git checkout "$BUILD_BRANCH"
-          if git rebase main; then
+
+          # main carries the workflow files too (Actions can only schedule them
+          # from the default branch), so replaying the build branch onto main
+          # always hits add/add conflicts under .github/workflows/. The build
+          # branch is canonical for those, so auto-resolve them in its favour
+          # (--theirs = the commit being replayed) and escalate only on a
+          # conflict outside that path.
+          set +e
+          git rebase main
+          rc=$?
+          while [ $rc -ne 0 ] && { [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; }; do
+            escalate=
+            for f in $(git diff --name-only --diff-filter=U); do
+              case "$f" in
+                .github/workflows/*) git checkout --theirs -- "$f" && git add -- "$f" ;;
+                *) escalate=1 ;;
+              esac
+            done
+            if [ -n "$escalate" ]; then
+              git rebase --abort
+              rc=1
+              break
+            fi
+            GIT_EDITOR=true git rebase --continue
+            rc=$?
+          done
+          set -e
+
+          if [ $rc -eq 0 ]; then
             git push origin "$BUILD_BRANCH" --force-with-lease
             echo "Rebased $BUILD_BRANCH onto main."
           else
-            git rebase --abort
-            TITLE="Auto-rebase of ${BUILD_BRANCH} onto main failed"
-            count=$(gh issue list --state open --search "$TITLE" --json number --jq length)
-            if [ "$count" = "0" ]; then
-              gh issue create \
-                --title "$TITLE" \
-                --body "The nightly sync rebased \`main\` but could not automatically rebase \`${BUILD_BRANCH}\` onto it. Manually resolve conflicts:\n\`\`\`\ngit switch ${BUILD_BRANCH}\ngit rebase main\ngit push --force-with-lease\n\`\`\`"
-            fi
+            echo "::error::Auto-rebase of ${BUILD_BRANCH} onto main failed on a non-workflow conflict."
+            notify "Auto-rebase of ${BUILD_BRANCH} onto main failed" \
+              "The nightly sync rebased main but could not automatically rebase ${BUILD_BRANCH} onto it. Resolve manually: git switch ${BUILD_BRANCH} && git rebase main && git push --force-with-lease"
+            exit 1
           fi
 
       - name: Check for new feature flags
@@ -95,16 +136,23 @@ jobs:
           # this list to suppress future issues.
           KNOWN="chd lightning tlbvmap jit rex-jit camera idle-pause r5k r5ksc r5ksc_triton debug_cache developer developer_ip7 developerx ci_clock tlbstats"
 
+          notify() {
+            title="$1"; body="$2"
+            existing=$(gh issue list --state open --search "$title" --json number --jq length 2>/dev/null) || existing=""
+            if [ "$existing" = "0" ]; then
+              gh issue create --title "$title" --body "$body" 2>/dev/null && return 0
+            elif [ -n "$existing" ]; then
+              return 0
+            fi
+            echo "::warning title=${title}::${body}"
+            { printf '### %s\n\n%s\n' "$title" "$body"; } >> "$GITHUB_STEP_SUMMARY"
+          }
+
           while IFS= read -r feature; do
             [ "$feature" = "default" ] && continue
             if ! printf ' %s ' "$KNOWN" | grep -qF " ${feature} "; then
-              TITLE="New upstream feature flag: \`${feature}\`"
-              count=$(gh issue list --state open --search "$TITLE" --json number --jq length)
-              if [ "$count" = "0" ]; then
-                gh issue create \
-                  --title "$TITLE" \
-                  --body "Upstream added a new \`[features]\` entry \`${feature}\` in \`Cargo.toml\`. Review whether to include it in \`.github/workflows/release.yml\`, then add it to the \`KNOWN\` list in \`.github/workflows/sync-upstream.yml\`."
-              fi
+              notify "New upstream feature flag: \`${feature}\`" \
+                "Upstream added a new \`[features]\` entry \`${feature}\` in \`Cargo.toml\`. Review whether to include it in \`.github/workflows/release.yml\`, then add it to the \`KNOWN\` list in \`.github/workflows/sync-upstream.yml\`."
             fi
           done < <(awk '/^\[features\]/{f=1;next} /^\[[a-zA-Z]/{f=0} f && /^[a-zA-Z_-]+ *= *\[/{print $1}' Cargo.toml)
 
