@@ -33,10 +33,17 @@ assets = [
 ]
 
 [features]
-# Mac App Store distribution build. Hides the CI/Automation config tab (the
-# iris-ci socket is a developer automation feature unusable in the sandbox)
-# and any other developer-only affordances. Set by .github/workflows/appstore.yml.
-appstore = []
+# Pre-compiled / distributed build. Hides developer-only affordances that don't
+# make sense for users running an official binary — currently the iris.toml
+# import/export menu items (the GUI's gui.json machine store is the system of
+# record; iris.toml is only useful alongside the standalone `iris` CLI, i.e. a
+# source checkout). Set by the Release and App Store workflows. A no-op for
+# source builds, where the iris.toml workflow stays available.
+bundled = []
+# Mac App Store distribution build. Implies `bundled`, and additionally hides
+# the CI/Automation config tab (the iris-ci socket is a developer automation
+# feature unusable in the sandbox). Set by .github/workflows/appstore.yml.
+appstore = ["bundled"]
 
 [dependencies]
 # Group A (additive) features are always on for iris-gui so the user can
