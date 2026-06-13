@@ -121,13 +121,32 @@ jobs:
           BUILD_BRANCH="${{ vars.BUILD_BRANCH || 'build-pipeline-danifunker' }}"
           git fetch origin "$BUILD_BRANCH"
           git checkout "$BUILD_BRANCH"
+          BUILD_TIP=$(git rev-parse HEAD)   # the build branch as we want it to look after the rebase
 
-          # main carries the workflow files too (Actions can only schedule them
-          # from the default branch), so replaying the build branch onto main
-          # always hits add/add conflicts under .github/workflows/. The build
-          # branch is canonical for those, so auto-resolve them in its favour
-          # (--theirs = the commit being replayed) and escalate only on a
-          # conflict outside that path.
+          # main = the upstream mirror + every fork-only file it carries as a
+          # duplicate of the build branch: the workflow files (Actions can only
+          # schedule them from the default branch) plus the vendored build inputs
+          # (installer/*.entitlements, LICENSE-GPL3.txt — see the vendor step).
+          # Replaying the build branch's own commits that touch any of those onto
+          # a main that already has them is an unavoidable add/add conflict.
+          #
+          # The build branch is canonical for ALL fork-only paths, and a rebase
+          # onto new upstream must leave those files exactly as they are on the
+          # branch tip. So resolve a conflict on any file upstream/main does NOT
+          # track by taking the branch-TIP version (not --theirs, which is the
+          # individual commit being replayed — that can resurrect a superseded
+          # version when a later fix commit is cherry-pick-skipped as already on
+          # main, e.g. the invalid-XML entitlements bug). Escalate only a conflict
+          # on a file upstream also tracks: that is a genuine upstream divergence.
+          # Self-adjusting — it matches whatever the vendor step put on main, so a
+          # newly-vendored build input never reintroduces this break.
+          take_tip() {   # resolve $1 to the build-branch tip (added or removed there)
+            if git cat-file -e "$BUILD_TIP:$1" 2>/dev/null; then
+              git checkout "$BUILD_TIP" -- "$1" && git add -- "$1"
+            else
+              git rm -f -- "$1"
+            fi
+          }
           set +e
           git rebase main
           rc=$?
@@ -135,8 +154,13 @@ jobs:
             escalate=
             for f in $(git diff --name-only --diff-filter=U); do
               case "$f" in
-                .github/workflows/*) git checkout --theirs -- "$f" && git add -- "$f" ;;
-                *) escalate=1 ;;
+                .github/workflows/*) take_tip "$f" ;;
+                *)
+                  if git cat-file -e "upstream/main:$f" 2>/dev/null; then
+                    escalate=1
+                  else
+                    take_tip "$f"
+                  fi ;;
               esac
             done
             if [ -n "$escalate" ]; then
@@ -153,7 +177,7 @@ jobs:
             git push origin "$BUILD_BRANCH" --force-with-lease
             echo "Rebased $BUILD_BRANCH onto main."
           else
-            echo "::error::Auto-rebase of ${BUILD_BRANCH} onto main failed on a non-workflow conflict."
+            echo "::error::Auto-rebase of ${BUILD_BRANCH} onto main failed on an upstream-tracked file (genuine divergence)."
             notify "Auto-rebase of ${BUILD_BRANCH} onto main failed" \
               "The nightly sync rebased main but could not automatically rebase ${BUILD_BRANCH} onto it. Resolve manually: git switch ${BUILD_BRANCH} && git rebase main && git push --force-with-lease"
             exit 1
