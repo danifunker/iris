@@ -64,37 +64,11 @@ jobs:
             echo "had_changes=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Vendor fork-only build files onto main
-        run: |
-          BUILD_BRANCH="${{ vars.BUILD_BRANCH || 'build-pipeline-danifunker' }}"
-          git fetch origin "$BUILD_BRANCH"
-          # The Release workflow runs on main and reads some files that are not
-          # upstream (e.g. LICENSE-GPL3.txt, installer/iris-gui-notarized.entitlements),
-          # so the upstream mirror cannot supply them. Re-stock main with exactly
-          # those: everything the build branch has that upstream/main lacks, minus
-          # the fork-management paths that are intentionally build-branch-only.
-          # This is self-adjusting — a new fork-only build input is picked up
-          # automatically; a file that lands upstream drops out (the mirror then
-          # provides it). To keep a fork-only file OFF main, add it to the grep -vE.
-          mapfile -t FILES < <(
-            comm -23 \
-              <(git ls-tree -r "origin/$BUILD_BRANCH" --name-only | sort) \
-              <(git ls-tree -r upstream/main          --name-only | sort) \
-            | grep -vE '^(\.github/|backup/|docs/|CLAUDE\.md$)'
-          )
-          if [ ${#FILES[@]} -eq 0 ]; then
-            echo "No fork-only build files to vendor."
-          else
-            printf 'Vendoring onto main:\n'; printf '  %s\n' "${FILES[@]}"
-            git checkout "origin/$BUILD_BRANCH" -- "${FILES[@]}"
-            if git diff --cached --quiet; then
-              echo "Vendored files already current on main."
-            else
-              git commit \
-                -m "main: vendor fork-only build files for release packaging" \
-                -m "Auto-maintained by sync-upstream.yml: files release.yml reads (it runs on main) that are not upstream, so the nightly mirror does not carry them. Re-synced from ${BUILD_BRANCH} every night."
-            fi
-          fi
+      # No vendoring onto main: both release.yml and appstore.yml always check
+      # out BUILD_BRANCH (never main), so main needs nothing from the build branch
+      # except the workflow files Actions schedules from the default branch. main
+      # therefore stays a clean upstream mirror + the 3 workflow files, and the
+      # build-branch rebase below only ever conflicts on those workflow files.
 
       - name: Push updated main
         run: git push origin main --force-with-lease
@@ -123,23 +97,19 @@ jobs:
           git checkout "$BUILD_BRANCH"
           BUILD_TIP=$(git rev-parse HEAD)   # the build branch as we want it to look after the rebase
 
-          # main = the upstream mirror + every fork-only file it carries as a
-          # duplicate of the build branch: the workflow files (Actions can only
-          # schedule them from the default branch) plus the vendored build inputs
-          # (installer/*.entitlements, LICENSE-GPL3.txt — see the vendor step).
-          # Replaying the build branch's own commits that touch any of those onto
-          # a main that already has them is an unavoidable add/add conflict.
-          #
-          # The build branch is canonical for ALL fork-only paths, and a rebase
-          # onto new upstream must leave those files exactly as they are on the
-          # branch tip. So resolve a conflict on any file upstream/main does NOT
-          # track by taking the branch-TIP version (not --theirs, which is the
-          # individual commit being replayed — that can resurrect a superseded
-          # version when a later fix commit is cherry-pick-skipped as already on
-          # main, e.g. the invalid-XML entitlements bug). Escalate only a conflict
-          # on a file upstream also tracks: that is a genuine upstream divergence.
-          # Self-adjusting — it matches whatever the vendor step put on main, so a
-          # newly-vendored build input never reintroduces this break.
+          # main carries the workflow files too (Actions can only schedule them
+          # from the default branch), so replaying the build branch's own commits
+          # that touch them onto a main that already has them is an unavoidable
+          # add/add conflict under .github/workflows/. The build branch is
+          # canonical for every fork-only path, and a rebase onto new upstream must
+          # leave those files exactly as they are on the branch tip. So resolve a
+          # conflict on any file upstream/main does NOT track by taking the
+          # branch-TIP version (not --theirs, which is the individual commit being
+          # replayed — that can resurrect a superseded version when a later fix
+          # commit is cherry-pick-skipped as already on main). Escalate only a
+          # conflict on a file upstream also tracks: a genuine upstream divergence.
+          # The rule is intentionally general (not just .github/workflows/) so that
+          # if any fork-only file is ever reintroduced onto main it self-heals.
           take_tip() {   # resolve $1 to the build-branch tip (added or removed there)
             if git cat-file -e "$BUILD_TIP:$1" 2>/dev/null; then
               git checkout "$BUILD_TIP" -- "$1" && git add -- "$1"
